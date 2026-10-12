@@ -82,12 +82,11 @@ it does not change publication destinations or install the CLI on the owner’s 
 
 ## Self-update destination
 
-The fork's updater reads `channels.json` from the `channels` release in
-`vifar/no-mistakes`. Stable, beta, and background checks use this destination;
-an unavailable manifest fails without an upstream fallback. The fork must
-publish its own channel manifest and release assets before release updates
+The [update command reference](/no-mistakes/reference/cli/#no-mistakes-update)
+owns the fork destination, manifest requirements, and refusal behavior. The fork
+must publish its own channel manifest and release assets before release updates
 can succeed.
 
-A dedicated `controller-shipping-<full-source-sha>` build retains the existing
-development-build policy: public update refuses replacement, and automatic
-checks skip it. This source change does not publish a release or install a CLI.
+A dedicated `controller-shipping-<full-source-sha>` build follows that reference's
+development-build policy. This source change does not publish a release or
+install a CLI.

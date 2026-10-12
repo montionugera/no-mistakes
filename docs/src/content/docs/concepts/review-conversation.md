@@ -35,6 +35,10 @@ The independence guarantee `internal/pipeline/steps/review.go` documents is
 unchanged: a reviewer session never spans a code change, so a reviewer never
 certifies its own prescription.
 
+The approve and skip paths described below apply to ordinary runs. The
+[strict shipping contract](/no-mistakes/reference/cli/#strict-shipping-and-review-receipts)
+refuses those shortcuts at Review and requires independent certification.
+
 ## The file protocol
 
 Every run owns a review-conversation directory under the run's evidence
@@ -384,8 +388,8 @@ a finalize turn that covered a file used to take every carried finding in it,
 including ones the answers had no bearing on, and the gate could complete having
 silently dropped a defect nobody fixed, selected or approved.
 
-So an answer round retracts by NAMING. The carried set rides the prompt, the
-turn walks it item by item with the answers in hand, and each finding either
+So an answer round retracts unselected findings by NAMING. The carried set rides
+the prompt, the turn walks it item by item with the answers in hand, and each finding either
 appears again in `findings` because it still holds, or appears in
 `withdrawn_findings` with the reason the answers disproved it. Anything the turn
 leaves out of both is KEPT. Silence never retracts a finding.
@@ -396,15 +400,14 @@ it; without a retraction channel the carry-forward re-injects it anyway, still
 pointing the operator at a question that is already settled, with no way to
 clear it but approving over it.
 
-The coverage rule itself is untouched for every other round type, and a
-withdrawal is a claim the reviewer has to make in its own words, which is
-reviewable after the fact in a way silence never was. Only a finalize turn may
-retract, and two layers keep it that way: the `withdrawn_findings` property is
-declared only for a finalize turn with the conversation on, so an initial review
-or a fix-round rereview is never offered it at all, and the executor applies a
-retraction list only when the round it came from is a finalize turn. Those
-rounds are held to the coverage rule, and a retraction they claimed would clear
-a selected finding nothing positively verified.
+A withdrawal is a claim the reviewer has to make in its own words, which is
+reviewable after the fact in a way silence never was. Answer-based retractions
+are offered only to finalize turns that can read the conversation, and the
+executor excludes every finding previously selected for a fix. Selected fixes
+still need positive verification, even when the finalize turn names them in
+`withdrawn_findings`. Strict review can separately receive that schema for
+human scope dispositions; the [Review resolution contract](/no-mistakes/reference/pipeline-steps/#review)
+owns that independent adjudication and its native restored-anchor proof.
 
 A retraction also has a floor. An operator-authored finding - one the operator
 added with `respond --action fix --add-finding` - is never retractable, whatever

@@ -211,8 +211,8 @@ func forcePushRebaseTargets(branch, defaultBranch string) []string {
 }
 
 // effectivePRBaseBranch resolves the integration and change-scoping base for
-// pipeline steps. Per-run overrides win over repo config; the repository default
-// remains the fallback when neither selects a separate PR target branch.
+// pipeline steps. Strict runs use their persisted target. For ordinary runs,
+// per-run overrides win over repo config, then the repository default applies.
 func effectivePRBaseBranch(sctx *pipeline.StepContext) string {
 	// Strict runs persist their effective target at launch; later config cannot
 	// change comparison identity while the native pipeline owns the run.

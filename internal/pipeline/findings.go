@@ -546,11 +546,14 @@ func normalizeCoveredPath(value string) string {
 // its ReviewedPaths coverage, that path is in the trusted reviewable set, and
 // the round's own output (thisRoundRaw) neither re-reports the defect nor
 // reports anything else at all in that same file. The file-less exception
-// below requires coverage of the entire trusted reviewable set.
+// below requires coverage of the entire trusted reviewable set. Strict restored
+// anchors also require complete coverage and an empty round; review_resolution.go
+// supplies unchangedFindingIDs only after native exact-comparison proof.
 //
 // This is the only way a selected-and-fixed finding leaves the outstanding set
 // besides an explicit operator action (approve/skip/abort). A file the round
-// did not list, a missing coverage record, a round that re-reports the defect,
+// did not list (without the strict restored-anchor proof), a missing coverage
+// record, a round that re-reports the defect,
 // or a round that reports ANY OTHER finding in the same file all leave the
 // item in place. Any file-less finding in the current round also blocks
 // verification of every selected item in that round: silence, or
@@ -846,10 +849,11 @@ func dropReviewQuestionFindingsJSON(raw string) string {
 	return encoded
 }
 
-// dropWithdrawnFindingsJSON removes the findings an answer round explicitly
-// retracted, by the ids it named.
+// dropWithdrawnFindingsJSON applies an independent turn's named retractions.
+// Callers must exclude selected fixes and validate strict scope adjudications
+// before passing the list; this helper enforces the operator-authored floor.
 //
-// This is how a carried finding leaves the outstanding set on an ANSWER round,
+// This is how an unselected carried finding leaves on an ANSWER round,
 // and it replaces clearing-by-coverage there. The coverage rule stays exactly
 // as it is for fix rounds: a fix CHANGES the code, so a rereview that names the
 // file and stops reporting the defect is evidence the change worked. An answer
