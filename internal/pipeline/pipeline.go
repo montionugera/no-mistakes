@@ -56,7 +56,10 @@ type StepContext struct {
 	// the reviewer's own open-question rows (see answerRoundCarriedFindings),
 	// so the finalize turn re-adjudicates by id only findings it made itself.
 	// Empty on every other round type.
-	CarriedFindings  string
+	CarriedFindings string
+	// ScopeFindings contains identity-bound human declines for independent
+	// adjudication, never an automatic waiver or evidence of a code fix.
+	ScopeFindings    string
 	PreviousFindings string // JSON findings selected for the current fix round
 	DeferredFindings string // JSON findings left unselected when the current fix round began
 	// StepResultID is the DB row ID of the current step's step_results record.
@@ -155,10 +158,10 @@ type StepOutcome struct {
 	// ReviewablePaths is the trusted changed-file set this review round can
 	// certify. It is computed from the diff, not supplied by the agent.
 	ReviewablePaths []string
-	// WithdrawnFindings is an answer round's explicit retraction list: the
-	// carried findings the turn says no longer hold, each with the reason it
-	// gave. It is the ONLY way a carried finding leaves the outstanding set on
-	// an answer round, so the reason is the record of why it left.
+	// WithdrawnFindings records explicit independent retractions with reasons.
+	// Answer rounds may retract unselected carried findings; strict review may
+	// adjudicate an identity-bound human scope disposition with full coverage
+	// and an exact comparison. Selected fixes remain subject to verification.
 	WithdrawnFindings []types.WithdrawnFinding
 	ExitCode          int    // process exit code (0 = success)
 	PRURL             string // PR/MR URL if this step created or found one

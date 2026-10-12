@@ -303,11 +303,11 @@ type Findings struct {
 	// that does not list a path has not proven anything about it, so silence is
 	// never read as resolution. Empty on every non-review payload.
 	ReviewedPaths []string `json:"reviewed_paths,omitempty"`
-	// WithdrawnFindings is an answer round's explicit re-adjudication: the
+	// WithdrawnFindings is an independent turn's explicit re-adjudication: the
 	// carried findings the reviewer now says no longer hold, each with its
-	// reason. On an answer round a carried finding leaves the outstanding set
-	// ONLY by appearing here. Silence keeps it, so covering a file can no
-	// longer clear an unrelated finding in it. Empty on every other payload.
+	// reason. Unselected answer-round carry and strict human scope dispositions
+	// require an explicit independent retraction; selected fixes still require
+	// positive verification. Omission does not adjudicate a scope disposition.
 	WithdrawnFindings []WithdrawnFinding `json:"withdrawn_findings,omitempty"`
 	Tested            []string           `json:"tested,omitempty"`
 	TestingSummary    string             `json:"testing_summary,omitempty"`

@@ -571,7 +571,7 @@ func normalizeCoveredPath(value string) string {
 // the recorded-decision review machinery was removed can carry such items (a
 // synthesized decision finding whose source finding had no file), and without
 // this rule a fix selection could never clear them.
-func resolveVerifiedFindingsJSON(outstandingRaw string, pendingIDs []string, reviewedPaths, reviewablePaths []string, thisRoundRaw string) string {
+func resolveVerifiedFindingsJSON(outstandingRaw string, pendingIDs []string, reviewedPaths, reviewablePaths []string, thisRoundRaw string, unchangedFindingIDs ...map[string]bool) string {
 	if outstandingRaw == "" || len(pendingIDs) == 0 || len(reviewedPaths) == 0 {
 		return outstandingRaw
 	}
@@ -609,7 +609,10 @@ func resolveVerifiedFindingsJSON(outstandingRaw string, pendingIDs []string, rev
 		return outstandingRaw
 	}
 	fullyCovered := len(covered) == len(reviewable)
-	thisRound, _ := types.ParseFindingsJSON(thisRoundRaw)
+	thisRound, err := types.ParseFindingsJSON(thisRoundRaw)
+	if err != nil && thisRoundRaw != "" {
+		return outstandingRaw
+	}
 	reported := make(map[types.Finding]bool, len(thisRound.Items))
 	reportedFiles := make(map[string]bool, len(thisRound.Items))
 	hasUnanchoredFinding := false
@@ -626,7 +629,8 @@ func resolveVerifiedFindingsJSON(outstandingRaw string, pendingIDs []string, rev
 	result := types.FindingsMetadata(outstanding)
 	for _, item := range outstanding.Items {
 		file := normalizeCoveredPath(item.File)
-		if pending[item.ID] && !hasUnanchoredFinding && (covered[file] || file == "" && fullyCovered) && !hasFindingMatch(item, reported, outstandingCounts, thisRoundCounts) && !reportedFiles[file] {
+		restored := len(unchangedFindingIDs) == 1 && unchangedFindingIDs[0][item.ID] && fullyCovered && len(thisRound.Items) == 0
+		if pending[item.ID] && !hasUnanchoredFinding && (covered[file] || file == "" && fullyCovered || restored) && !hasFindingMatch(item, reported, outstandingCounts, thisRoundCounts) && !reportedFiles[file] {
 			continue
 		}
 		result.Items = append(result.Items, item)

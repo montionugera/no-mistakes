@@ -1,3 +1,0 @@
-2026-10-12T09:26:54-05:00 lifecycle command=update force=false pid=54602 ppid=6385 parent_cmdline="/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python .test-shipping/drive.py"
-2026-10-12T09:28:11-05:00 lifecycle command=update force=false pid=21409 ppid=14082 parent_cmdline="/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python .test-shipping/drive.py --extra"
-2026-10-12T09:28:12-05:00 lifecycle command=update force=false pid=22162 ppid=14082 parent_cmdline="/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python .test-shipping/drive.py --extra"
