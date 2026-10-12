@@ -1,0 +1,654 @@
+package ipc
+
+import (
+	"encoding/json"
+	"sync/atomic"
+
+	"github.com/kunchenguid/no-mistakes/internal/agentcfg"
+	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/kunchenguid/no-mistakes/internal/verificationplan"
+)
+
+// JSON-RPC 2.0 method names.
+const (
+	MethodPushReceived              = "push_received"
+	MethodResolvePiProfile          = "resolve_pi_profile"
+	MethodProbeOmitIntent           = "probe_omit_intent"
+	MethodReleaseVerificationPlan   = "release_verification_plan"
+	MethodCaptureVerificationPlan   = "capture_verification_plan"
+	MethodStartFreshRun             = "start_fresh_run"
+	MethodProbeShipping             = "probe_shipping"
+	MethodClaimLaunchReceipt        = "claim_launch_receipt"
+	MethodGetRun                    = "get_run"
+	MethodGetStepDiff               = "get_step_diff"
+	MethodGetRuns                   = "get_runs"
+	MethodGetRunsForHead            = "get_runs_for_head"
+	MethodGetActiveRun              = "get_active_run"
+	MethodRerun                     = "rerun"
+	MethodSubscribe                 = "subscribe"
+	MethodRespond                   = "respond"
+	MethodAnswerReview              = "answer_review_question"
+	MethodCancelRun                 = "cancel_run"
+	MethodGateContext               = "gate_context"
+	MethodAdmitPush                 = "admit_push"
+	MethodHealth                    = "health"
+	MethodShutdown                  = "shutdown"
+	MethodUpdateRunClosingIssueRefs = "update_run_closing_issue_refs"
+)
+
+// JSON-RPC 2.0 error codes.
+const (
+	ErrParseError     = -32700
+	ErrInvalidRequest = -32600
+	ErrMethodNotFound = -32601
+	ErrInvalidParams  = -32602
+	ErrInternal       = -32603
+)
+
+// Request is a JSON-RPC 2.0 request.
+type Request struct {
+	JSONRPC string          `json:"jsonrpc"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	ID      int64           `json:"id"`
+}
+
+// Response is a JSON-RPC 2.0 response.
+type Response struct {
+	JSONRPC string          `json:"jsonrpc"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *RPCError       `json:"error,omitempty"`
+	ID      int64           `json:"id"`
+}
+
+// RPCError represents a JSON-RPC 2.0 error object.
+type RPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e *RPCError) Error() string { return e.Message }
+
+// --- Method parameters ---
+
+// PushReceivedParams are sent by the post-receive hook when a push arrives.
+//
+// Intent, when set, is an agent-supplied description of the change. It is
+// stamped onto the run so the intent step uses it verbatim instead of inferring
+// intent from local transcripts. LaunchNonce and ValidationGeneration together
+// opt into a nonce-bound launch proof.
+type PushReceivedParams struct {
+	VerificationPlanID string                 `json:"verification_plan_id,omitempty"`
+	Shipping           *types.ShippingOptions `json:"shipping,omitempty"`
+	PiProfile          *agentcfg.PiProfile    `json:"pi_profile,omitempty"`
+	// Gate is the absolute path to the gate bare repo.
+	Gate                 string           `json:"gate"`
+	Ref                  string           `json:"ref"`
+	Old                  string           `json:"old"`
+	New                  string           `json:"new"`
+	SkipSteps            []types.StepName `json:"skip_steps,omitempty"`
+	Intent               string           `json:"intent,omitempty"`
+	LaunchNonce          string           `json:"launch_nonce,omitempty"`
+	ValidationGeneration string           `json:"validation_generation,omitempty"`
+	PRBaseBranch         string           `json:"pr_base_branch,omitempty"`
+	// OmitIntent carries the caller-side, tighten-only request to keep the
+	// generated Intent section out of the PR body. It never publishes intent
+	// a repository's trusted config disabled.
+	OmitIntent bool `json:"omit_intent,omitempty"`
+	// ReconciledPreviousHead is the head a reconciled private mirror branch
+	// carried before the pusher archived and removed it. The push re-creates the
+	// branch, so the hook reports no previous head of its own. It is a claim the
+	// daemon accepts only against the gate's own archive tag.
+	ReconciledPreviousHead string `json:"reconciled_previous_head,omitempty"`
+	// ClosingIssueRefs are the explicit issues (axi run --closes) the
+	// generated PR should close.
+	ClosingIssueRefs []string `json:"closing_issue_refs,omitempty"`
+}
+
+// StartFreshRunParams requests a nonce-bound fresh launch for one exact gate
+// branch head. The daemon checks the gate while holding the branch lock, so a
+// caller never receives a proof for a drifting creation context.
+type StartFreshRunParams struct {
+	VerificationPlanID string                 `json:"verification_plan_id,omitempty"`
+	Shipping           *types.ShippingOptions `json:"shipping,omitempty"`
+	PiProfile          *agentcfg.PiProfile    `json:"pi_profile,omitempty"`
+
+	RepoID               string           `json:"repo_id"`
+	Branch               string           `json:"branch"`
+	HeadSHA              string           `json:"head_sha"`
+	SkipSteps            []types.StepName `json:"skip_steps,omitempty"`
+	Intent               string           `json:"intent"`
+	LaunchNonce          string           `json:"launch_nonce"`
+	ValidationGeneration string           `json:"validation_generation"`
+	PRBaseBranch         string           `json:"pr_base_branch,omitempty"`
+	OmitIntent           bool             `json:"omit_intent,omitempty"`
+	ClosingIssueRefs     []string         `json:"closing_issue_refs,omitempty"`
+}
+
+// CaptureVerificationPlanParams requests a snapshot before the caller pushes.
+// The distinct RPC also refuses an older daemon before branch custody changes.
+type CaptureVerificationPlanParams struct {
+	SourcePath string `json:"source_path"`
+	RepoID     string `json:"repo_id"`
+	Branch     string `json:"branch"`
+	HeadSHA    string `json:"head_sha"`
+}
+
+// ReleaseVerificationPlanParams identifies an abandoned launch capture.
+type ReleaseVerificationPlanParams struct {
+	CaptureID string `json:"capture_id"`
+	RepoID    string `json:"repo_id"`
+	Branch    string `json:"branch"`
+	HeadSHA   string `json:"head_sha"`
+}
+
+// ProbeOmitIntentParams is the empty request for MethodProbeOmitIntent.
+type ProbeOmitIntentParams struct{}
+
+// ProbeOmitIntentResult answers MethodProbeOmitIntent. The method exists only
+// as a capability check: daemon requests decode JSON permissively, so an older
+// daemon would silently drop the unknown omit_intent field from an existing
+// RPC and publish the intent the caller asked it to withhold. A distinct method
+// is refused by such a daemon (method not found) instead of succeeding
+// silently, so a client that reaches OK=true knows omit_intent is honored.
+type ProbeOmitIntentResult struct {
+	OK bool `json:"ok"`
+}
+
+// ClaimLaunchReceiptParams identifies one exact opaque receipt binding.
+// Generic run/status surfaces never expose launch bindings or intent digests.
+type ClaimLaunchReceiptParams struct {
+	Shipping  *types.ShippingOptions `json:"shipping,omitempty"`
+	PiProfile *agentcfg.PiProfile    `json:"pi_profile,omitempty"`
+
+	RepoID               string `json:"repo_id"`
+	Branch               string `json:"branch"`
+	LaunchNonce          string `json:"launch_nonce"`
+	SubmittedHeadSHA     string `json:"submitted_head_sha"`
+	ValidationGeneration string `json:"validation_generation"`
+	IntentDigest         string `json:"intent_digest"`
+	PRBaseBranch         string `json:"pr_base_branch,omitempty"`
+	OmitIntent           bool   `json:"omit_intent,omitempty"`
+}
+
+// GetRunParams requests a single run by ID.
+type GetRunParams struct {
+	RunID string `json:"run_id"`
+}
+
+// GetStepDiffParams requests the working-tree diff for a run parked at a
+// fix-review gate. The diff is derived on demand from the run's worktree and
+// is never stored, so it is the reconstruction authority for the one piece of
+// gate context that is not persisted.
+type GetStepDiffParams struct {
+	RunID string `json:"run_id"`
+}
+
+// GetStepDiffResult carries a bounded working-tree diff. Truncated reports
+// that the diff exceeded the response budget and was cut, so a very large
+// change degrades to a partial view instead of an oversized frame.
+type GetStepDiffResult struct {
+	Diff      string `json:"diff"`
+	Truncated bool   `json:"truncated,omitempty"`
+}
+
+// GetRunsParams requests all runs for a repo.
+type GetRunsParams struct {
+	RepoID string `json:"repo_id"`
+}
+
+// GetRunsForHeadParams requests the runs for a repo on an exact branch and head
+// SHA. It backs a lightweight lookup that avoids scanning the repo's whole run
+// history, so a caller polling for the run created by a specific push does not
+// re-fetch every run (and its steps) on each poll.
+type GetRunsForHeadParams struct {
+	RepoID  string `json:"repo_id"`
+	Branch  string `json:"branch"`
+	HeadSHA string `json:"head_sha"`
+}
+
+// GetActiveRunParams requests the active run for a repo.
+// When Branch is set, runs on that branch are preferred.
+type GetActiveRunParams struct {
+	RepoID string `json:"repo_id"`
+	Branch string `json:"branch,omitempty"`
+}
+
+// RerunParams requests a new run for the latest recoverable head on a branch.
+// The daemon resolves whether that is the gate branch or a verified unpublished
+// terminal head whose custody remains outstanding.
+// Intent, when set, overrides inherited intent and fresh inference. When empty,
+// the daemon inherits authoritative intent from the selected prior run or
+// leaves the new run to perform fresh inference.
+// ClosingIssueRefs are merged with the selected run's persisted references.
+type RerunParams struct {
+	VerificationPlanID string              `json:"verification_plan_id,omitempty"`
+	PiProfile          *agentcfg.PiProfile `json:"pi_profile,omitempty"`
+
+	RepoID        string           `json:"repo_id"`
+	Branch        string           `json:"branch"`
+	PreviousRunID string           `json:"previous_run_id,omitempty"`
+	SkipSteps     []types.StepName `json:"skip_steps,omitempty"`
+	Intent        string           `json:"intent,omitempty"`
+	PRBaseBranch  string           `json:"pr_base_branch,omitempty"`
+	// OmitIntent requests omission of the public Intent section for the new
+	// run. It is tighten-only: the selected prior run's decision is always
+	// inherited and this can only add to it.
+	OmitIntent bool `json:"omit_intent,omitempty"`
+	// CallerHeadSHA is a clean caller worktree's HEAD, when known. It guards
+	// the daemon's selected head; it never supplies a replacement run head.
+	CallerHeadSHA string `json:"caller_head_sha,omitempty"`
+	// ClosingIssueRefs are added to the references the selected run carried;
+	// a rerun never drops an inherited closing reference.
+	ClosingIssueRefs []string `json:"closing_issue_refs,omitempty"`
+}
+
+// SubscribeParams starts an event stream for a run.
+type SubscribeParams struct {
+	RunID string `json:"run_id"`
+}
+
+// RespondParams sends a user action for a step awaiting approval.
+//
+// Instructions carries optional per-finding notes keyed by finding ID, which
+// the daemon attaches to the corresponding finding before dispatching a fix.
+// AddedFindings carries user-authored findings that are merged into the round
+// alongside agent-produced ones. Instruction and AddedFindings only apply when
+// Action triggers a fix round.
+//
+// IgnoreFindingIDs are the gate's findings the response explicitly declines. A
+// fix response must account for every finding the gate shows: each one must be
+// in FindingIDs or IgnoreFindingIDs unless an earlier round of the same step
+// already decided it, and the daemon refuses the response (leaving the gate
+// parked) when one is left out. An omission is never a decline.
+type RespondParams struct {
+	RunID            string               `json:"run_id"`
+	Step             types.StepName       `json:"step"`
+	Action           types.ApprovalAction `json:"action"`
+	FindingIDs       []string             `json:"finding_ids,omitempty"`
+	IgnoreFindingIDs []string             `json:"ignore_finding_ids,omitempty"`
+	Instructions     map[string]string    `json:"instructions,omitempty"`
+	AddedFindings    []types.Finding      `json:"added_findings,omitempty"`
+	ApprovalReason   string               `json:"approval_reason,omitempty"` // Test approval only
+}
+
+// CancelRunParams cancels an active pipeline run.
+type CancelRunParams struct {
+	RunID string `json:"run_id"`
+}
+
+// GateContextParams asks the daemon to classify the authenticated caller.
+// CWD and MarkerPresent are evidence only; peer PID comes from the transport.
+type GateContextParams struct {
+	CWD           string `json:"cwd,omitempty"`
+	MarkerPresent bool   `json:"marker_present,omitempty"`
+}
+
+// AdmitPushParams asks whether a local receive hook's authenticated process
+// ancestry is allowed to mutate a managed gate ref.
+type AdmitPushParams struct {
+	Gate string `json:"gate"`
+}
+
+// HealthParams has no fields but exists for consistency.
+type HealthParams struct{}
+
+// ShutdownParams has no fields but exists for consistency.
+type ShutdownParams struct{}
+
+// UpdateRunClosingIssueRefsParams updates the closing issue references on an existing run.
+type UpdateRunClosingIssueRefsParams struct {
+	RunID            string   `json:"run_id"`
+	ClosingIssueRefs []string `json:"closing_issue_refs"`
+}
+
+// ClosingIssueRefsRejectedPRBodyComposed is the Reason reported when the run's PR
+// body was already composed, so the closing issue references could no longer reach its
+// Issues section. It is a rejection rather than a transport error because retrying
+// cannot help: the caller must edit the PR or start a fresh run.
+const ClosingIssueRefsRejectedPRBodyComposed = "pr_body_already_composed"
+
+// UpdateRunClosingIssueRefsResult is the result of UpdateRunClosingIssueRefs. OK is false
+// for a refused update, with Reason naming why so the caller can give advice
+// that fits instead of matching on error prose.
+type UpdateRunClosingIssueRefsResult struct {
+	OK     bool   `json:"ok"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// --- Method results ---
+
+// PushReceivedResult confirms the push was accepted. Receipt observation is a
+// separate atomic claim so a push-created row remains unclaimed until its first
+// automation observer.
+type PushReceivedResult struct {
+	RunID string `json:"run_id"`
+}
+
+// LaunchReceipt is the machine-readable, privacy-safe proof that the daemon
+// selected one durable run before the caller drives it. The validation
+// generation and intent digest are persisted; raw intent is never included.
+type LaunchReceipt struct {
+	PiProfile *agentcfg.PiProfile `json:"pi_profile,omitempty"`
+
+	RunID                string `json:"run_id"`
+	Disposition          string `json:"disposition"`
+	LaunchNonce          string `json:"launch_nonce"`
+	ValidationGeneration string `json:"validation_generation"`
+	Branch               string `json:"branch"`
+	HeadSHA              string `json:"head_sha"`
+	SubmittedHeadSHA     string `json:"submitted_head_sha"`
+	IntentDigest         string `json:"intent_digest"`
+}
+
+type StartFreshRunResult struct {
+	Receipt LaunchReceipt `json:"receipt"`
+}
+
+type ClaimLaunchReceiptResult struct {
+	Receipt *LaunchReceipt `json:"receipt,omitempty"`
+}
+
+// GetRunResult wraps a single run.
+type GetRunResult struct {
+	Run *RunInfo `json:"run"`
+}
+
+// GetRunsResult wraps a list of runs.
+type GetRunsResult struct {
+	Runs []RunInfo `json:"runs"`
+}
+
+// GetActiveRunResult wraps the active run (nil if none).
+type GetActiveRunResult struct {
+	Run *RunInfo `json:"run,omitempty"`
+}
+
+// RerunResult confirms a rerun was created.
+type RerunResult struct {
+	RunID string `json:"run_id"`
+}
+
+// RespondResult confirms the action was accepted, or reports the dispositions
+// the response recorded and why a response was refused.
+//
+// The disposition fields are the daemon's echo of what it actually recorded, so
+// a driver sees a partial or inverted decision in the same call that made it
+// instead of two rounds later. Kept names the findings the response omitted
+// that an earlier round of the same step had already decided.
+//
+// A refusal is a result rather than a transport error because it is not a
+// transport failure: the gate is intact, the caller's response was wrong, and
+// the caller can correct it. Refusal is non-empty exactly when OK is false.
+type RespondResult struct {
+	OK      bool     `json:"ok"`
+	Fixed   []string `json:"fixed,omitempty"`
+	Ignored []string `json:"ignored,omitempty"`
+	Kept    []string `json:"kept,omitempty"`
+	Refusal string   `json:"refusal,omitempty"`
+	Missing []string `json:"missing,omitempty"`
+	// DeclinedEarlierFix names the findings the response tried to decline that
+	// an earlier round of the same step already chose to fix. Reverting an
+	// applied fix is out of scope for a gate response, so the response was
+	// refused; a machine caller corrects it by omitting those findings to keep
+	// the earlier decision.
+	DeclinedEarlierFix []string `json:"declined_earlier_fix,omitempty"`
+	Help               string   `json:"help,omitempty"`
+}
+
+// AnswerReviewQuestionParams records one operator answer to a question the
+// run's reviewer asked. It is not a gate response: the daemon appends it to
+// the run's review conversation and releases the review gate only once no
+// question is left open (see docs concepts/review-conversation).
+type AnswerReviewQuestionParams struct {
+	RunID      string `json:"run_id"`
+	QuestionID string `json:"question_id"`
+	Answer     string `json:"answer"`
+	AnsweredBy string `json:"answered_by,omitempty"`
+}
+
+// AnswerReviewQuestionResult reports what the recorded answer did. Open counts
+// the questions still unanswered after it, and Resumed is true when that count
+// reached zero and the reviewer's own session was resumed to finish its pass.
+// Resumed false with Open zero covers TWO cases, and Note distinguishes them:
+// the reviewer is still working and reads the answer at its next checkpoint, so
+// there is no gate to release; or this answer closed no question that was open
+// before it was appended - an id nobody asked, or a correction sent after the
+// last question was already answered - in which case it is recorded durably and
+// deliberately releases nothing, because the gate may be parked on ordinary
+// findings that are the operator's to answer.
+type AnswerReviewQuestionResult struct {
+	OK      bool     `json:"ok"`
+	Open    int      `json:"open"`
+	OpenIDs []string `json:"open_ids,omitempty"`
+	Resumed bool     `json:"resumed"`
+	// ClosedLast is true when this answer closed the last question that was
+	// open before it, whether or not a parked gate was there to release yet.
+	// It tells the caller the run is moving again because of this answer, so
+	// the caller follows it to the next decision point exactly as
+	// `axi respond` does. Resumed alone cannot say that: an answer that lands
+	// before the park registers resumes nothing itself, and the gate's own
+	// resumer releases that park when it registers.
+	ClosedLast bool   `json:"closed_last,omitempty"`
+	Note       string `json:"note,omitempty"`
+}
+
+// CancelRunResult confirms the run cancellation request was accepted.
+type CancelRunResult struct {
+	OK bool `json:"ok"`
+}
+
+// GateContextResult is the privacy-safe execution-context classification.
+type GateContextResult struct {
+	Nested           bool           `json:"nested"`
+	ManagedGit       bool           `json:"managed_git,omitempty"`
+	AgentDescendant  bool           `json:"agent_descendant,omitempty"`
+	DaemonDescendant bool           `json:"daemon_descendant,omitempty"`
+	MarkerPresent    bool           `json:"marker_present,omitempty"`
+	RunID            string         `json:"run_id,omitempty"`
+	Phase            types.StepName `json:"phase,omitempty"`
+}
+
+// AdmitPushResult is returned before a receive hook permits ref mutation.
+type AdmitPushResult struct {
+	Context GateContextResult `json:"context"`
+}
+
+// HealthResult confirms the daemon is alive.
+type HealthResult struct {
+	Status string `json:"status"`
+}
+
+// ShutdownResult confirms shutdown was initiated.
+type ShutdownResult struct {
+	OK bool `json:"ok"`
+}
+
+// --- Wire types ---
+
+// RunInfo is the IPC representation of a pipeline run.
+type RunInfo struct {
+	VerificationPlan *verificationplan.Snapshot `json:"verification_plan"`
+	Shipping         *types.ShippingOptions     `json:"shipping,omitempty"`
+	ReviewGeneration int64                      `json:"review_generation,omitempty"`
+	SourceRepo       string                     `json:"source_repo,omitempty"`
+	SourceBranch     string                     `json:"source_branch,omitempty"`
+	TargetBranch     string                     `json:"target_branch,omitempty"`
+	TargetSHA        string                     `json:"target_sha,omitempty"`
+	PiProfile        *agentcfg.PiProfile        `json:"pi_profile,omitempty"`
+
+	ID               string          `json:"id"`
+	RepoID           string          `json:"repo_id"`
+	Branch           string          `json:"branch"`
+	HeadSHA          string          `json:"head_sha"`
+	SubmittedHeadSHA *string         `json:"submitted_head_sha,omitempty"`
+	BaseSHA          string          `json:"base_sha"`
+	Status           types.RunStatus `json:"status"`
+	PRURL            *string         `json:"pr_url,omitempty"`
+	Error            *string         `json:"error,omitempty"`
+	CIReady          bool            `json:"ci_ready,omitempty"`
+	CIReadyNoCI      bool            `json:"ci_ready_no_ci,omitempty"`
+	// PRBaseBranch is the per-run PR target override, if the operator set
+	// --base-branch when starting this run.
+	PRBaseBranch *string `json:"pr_base_branch,omitempty"`
+	// OmitIntent is true when this run was started with the caller-side,
+	// tighten-only request to keep the generated Intent section out of the
+	// PR body (see runs.omit_intent).
+	OmitIntent bool `json:"omit_intent,omitempty"`
+	// AwaitingAgent is true while the run is parked at a gate awaiting the
+	// driving agent's response. AwaitingAgentSince is the unix-seconds time it
+	// parked, so a supervisor can read "parked for N seconds" in one call. Both
+	// are observability only and clear the moment the agent responds.
+	AwaitingAgent      bool             `json:"awaiting_agent,omitempty"`
+	AwaitingAgentSince *int64           `json:"awaiting_agent_since,omitempty"`
+	Steps              []StepResultInfo `json:"steps,omitempty"`
+	// CIOverrideReason is non-empty when the CI step in Steps carries an
+	// OverrideReason (see StepResultInfo.OverrideReason). It is derived from
+	// Steps rather than a separate DB column, so a run-level consumer such as
+	// axi's outcome wording does not need to inspect every step itself.
+	CIOverrideReason   string `json:"ci_override_reason,omitempty"`
+	TestOverrideReason string `json:"test_override_reason,omitempty"`
+	// StateRev is the monotonic run-state revision this snapshot is at least
+	// as new as. It is sampled before the database read, so every event at or
+	// below it is already reflected here and every event above it still
+	// applies on top.
+	StateRev  int64 `json:"state_rev,omitempty"`
+	CreatedAt int64 `json:"created_at"`
+	UpdatedAt int64 `json:"updated_at"`
+}
+
+// WorkScopeDocumentLintHousekeeping identifies the one agent invocation that
+// performs both duties while its wall time is stored on the document step.
+const WorkScopeDocumentLintHousekeeping = "document+lint housekeeping"
+
+// StepResultInfo is the IPC representation of a step result.
+type StepResultInfo struct {
+	ID         string           `json:"id"`
+	RunID      string           `json:"run_id"`
+	StepName   types.StepName   `json:"step_name"`
+	StepOrder  int              `json:"step_order"`
+	Status     types.StepStatus `json:"status"`
+	ExitCode   *int             `json:"exit_code,omitempty"`
+	DurationMS *int64           `json:"duration_ms,omitempty"`
+	// WorkScope names shared work whose wall time is recorded on this logical
+	// step. For example, the document step can own one combined document+lint
+	// housekeeping invocation while lint only records the cached handoff.
+	WorkScope        string  `json:"work_scope,omitempty"`
+	FindingsJSON     *string `json:"findings_json,omitempty"`
+	ReportedFindings int     `json:"reported_findings,omitempty"`
+	FixedFindings    int     `json:"fixed_findings,omitempty"`
+	// FixSummaries holds one entry per fix round the pipeline ran for this
+	// step, in round order: the agent's one-line fix summary, or "" when the
+	// round recorded none. Agent surfaces use it to report applied fixes.
+	FixSummaries     []string `json:"fix_summaries,omitempty"`
+	RoundCount       int      `json:"round_count,omitempty"`
+	FixRoundCount    int      `json:"fix_round_count,omitempty"`
+	AutoFixLimit     int      `json:"auto_fix_limit,omitempty"`
+	PendingFixSource string   `json:"pending_fix_source,omitempty"`
+	Error            *string  `json:"error,omitempty"`
+	StartedAt        *int64   `json:"started_at,omitempty"`
+	RoundStartedAt   *int64   `json:"round_started_at,omitempty"`
+	CompletedAt      *int64   `json:"completed_at,omitempty"`
+	LastActivityAt   *int64   `json:"last_activity_at,omitempty"`
+	LastActivity     *string  `json:"last_activity,omitempty"`
+	AgentPID         *int     `json:"agent_pid,omitempty"`
+	// OverrideReason is non-empty when a human answered ActionApprove on this
+	// step's gate despite an unresolved external condition (currently: the CI
+	// step's live checks were still failing). See
+	// pipeline.ApprovalOverrideVerifier and db.StepResult.OverrideReason.
+	OverrideReason string `json:"override_reason,omitempty"`
+	SkipReason     string `json:"skip_reason,omitempty"`
+}
+
+// --- Events (for subscribe stream) ---
+
+// EventType identifies the kind of event.
+type EventType string
+
+const (
+	EventRunCreated         EventType = "run_created"
+	EventRunUpdated         EventType = "run_updated"
+	EventRunCompleted       EventType = "run_completed"
+	EventCIReadinessChanged EventType = "ci_readiness_changed"
+	EventStepStarted        EventType = "step_started"
+	EventStepCompleted      EventType = "step_completed"
+	EventLogChunk           EventType = "log_chunk"
+	// EventStreamGap tells a subscriber that the daemon coalesced at least
+	// one state transition away under buffer pressure. StateRev is the
+	// highest revision folded into it. The subscriber must read authoritative
+	// state once; the frame carries no payload of its own.
+	EventStreamGap EventType = "stream_gap"
+)
+
+// Event is a real-time update sent to subscribers.
+type Event struct {
+	Type             EventType       `json:"type"`
+	RunID            string          `json:"run_id"`
+	RepoID           string          `json:"repo_id"`
+	StepName         *types.StepName `json:"step_name,omitempty"`
+	Status           *string         `json:"status,omitempty"`
+	Error            *string         `json:"error,omitempty"`
+	Stream           *string         `json:"stream,omitempty"`
+	Content          *string         `json:"content,omitempty"`
+	Branch           *string         `json:"branch,omitempty"`
+	Findings         *string         `json:"findings,omitempty"` // JSON-encoded findings for step_completed events
+	ReportedFindings *int            `json:"reported_findings,omitempty"`
+	FixedFindings    *int            `json:"fixed_findings,omitempty"`
+	DurationMS       *int64          `json:"duration_ms,omitempty"` // execution-only duration for step events
+	WorkScope        string          `json:"work_scope,omitempty"`  // shared work attributed to this step
+	PRURL            *string         `json:"pr_url,omitempty"`      // PR URL for run_updated/run_completed events
+	// StateRev is the daemon-assigned monotonic revision of the run state
+	// this event reflects, or zero for activity. A consumer applies a state
+	// delta only when StateRev exceeds the revision it has already applied,
+	// which makes a delta queued before an authoritative snapshot an
+	// idempotent no-op after it.
+	StateRev    int64 `json:"state_rev,omitempty"`
+	CIReady     *bool `json:"ci_ready,omitempty"`
+	CIReadyNoCI *bool `json:"ci_ready_no_ci,omitempty"`
+	// CIOverrideReason rides run_completed so the live TUI banner can show a
+	// passed-with-override run without a snapshot read. It is derived from the
+	// CI step's OverrideReason the same way RunInfo.CIOverrideReason is, and is
+	// set only on completion (the only event whose banner reads it).
+	CIOverrideReason   *string `json:"ci_override_reason,omitempty"`
+	TestOverrideReason *string `json:"test_override_reason,omitempty"`
+}
+
+// --- Helpers ---
+
+var reqID atomic.Int64
+
+// NewRequest creates a JSON-RPC 2.0 request with an auto-incremented ID.
+func NewRequest(method string, params interface{}) (*Request, error) {
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return nil, err
+	}
+	return &Request{
+		JSONRPC: "2.0",
+		Method:  method,
+		Params:  raw,
+		ID:      reqID.Add(1),
+	}, nil
+}
+
+// NewResponse creates a successful JSON-RPC 2.0 response.
+func NewResponse(id int64, result interface{}) (*Response, error) {
+	raw, err := json.Marshal(result)
+	if err != nil {
+		return nil, err
+	}
+	return &Response{
+		JSONRPC: "2.0",
+		Result:  raw,
+		ID:      id,
+	}, nil
+}
+
+// NewErrorResponse creates an error JSON-RPC 2.0 response.
+func NewErrorResponse(id int64, code int, message string) *Response {
+	return &Response{
+		JSONRPC: "2.0",
+		Error:   &RPCError{Code: code, Message: message},
+		ID:      id,
+	}
+}

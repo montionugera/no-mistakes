@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +17,108 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+// The independent oracle is the trusted-config contract: both branch starts
+// must execute the fresh maintainer command, not the pushed or tracking tree.
+// A production repository gate parks before any later base-branch fetch; no
+// agent turn or delivery step is invoked. Separate connections preserve concurrency.
+func TestTrustedConfigConcurrentStartupLive(t *testing.T) {
+	for _, agentName := range []string{"claude", "pi"} {
+		t.Run(agentName, func(t *testing.T) {
+			p, d := startTestDaemonWithSteps(t, nil)
+			repo, _ := setupTestGitRepo(t, p, d, "concurrent-live")
+			bare := p.RepoDir(repo.ID)
+			head := commitDefaultBranchConfig(t, repo.WorkingPath, "commands:\n  test: echo untrusted-pushed-command\n")
+			gitCmd(t, bare, "fetch", "origin", "main:refs/remotes/origin/main")
+			fetchHead := filepath.Join(bare, "FETCH_HEAD")
+			before, err := os.ReadFile(fetchHead)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(fetchHead+".lock", nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			fresh := commitDefaultBranchConfig(t, repo.WorkingPath, "agent: "+agentName+"\ngates:\n  - name: observe\n    after: rebase\n    command: 'printf fresh-trusted > trusted-observed.txt; exit 1'\n")
+			if agentName == "pi" {
+				adapter := writeMockClaude(t, t.TempDir())
+				if err := os.WriteFile(p.ConfigFile(), []byte("agent: pi\nagent_path_override:\n  pi: "+adapter+"\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := git.IsolateHooksPath(context.Background(), bare); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(bare, "refs", "remotes", "origin", "main.lock"), nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			branches := []string{"feature/one", "feature/two"}
+			errs := make([]error, len(branches))
+			var wg sync.WaitGroup
+			for i, branch := range branches {
+				wg.Add(1)
+				go func(i int, branch string) {
+					defer wg.Done()
+					client, err := ipc.Dial(p.Socket())
+					if err != nil {
+						errs[i] = err
+						return
+					}
+					defer client.Close()
+					params := &ipc.PushReceivedParams{
+						Gate:      bare,
+						Ref:       "refs/heads/" + branch,
+						Old:       strings.Repeat("0", 40),
+						New:       head,
+						SkipSteps: []types.StepName{types.StepIntent, types.StepRebase, types.StepReview, types.StepTest, types.StepDocument, types.StepLint, types.StepPush, types.StepPR, types.StepCI},
+					}
+					if agentName == "pi" {
+						params.PiProfile = &agentcfg.PiProfile{Model: "openai-codex/gpt-5.4", Effort: agentcfg.EffortHigh}
+					}
+					var result ipc.PushReceivedResult
+					errs[i] = client.Call(ipc.MethodPushReceived, params, &result)
+				}(i, branch)
+			}
+			wg.Wait()
+			for i, branch := range branches {
+				if errs[i] != nil {
+					t.Fatalf("concurrent startup for %s: %v", branch, errs[i])
+				}
+				run, err := d.GetActiveRun(repo.ID, branch)
+				if err != nil || run == nil || run.Status != types.RunRunning {
+					t.Fatalf("active run for %s: %+v, %v", branch, run, err)
+				}
+				if agentName == "pi" && (run.PiProfile == nil || run.PiProfile.Model != "openai-codex/gpt-5.4" || run.PiProfile.Effort != agentcfg.EffortHigh) {
+					t.Fatalf("accepted Pi profile was not persisted: %+v", run.PiProfile)
+				}
+				marker := filepath.Join(p.WorktreeDir(repo.ID, run.ID), "trusted-observed.txt")
+				deadline := time.Now().Add(10 * time.Second)
+				for {
+					data, err := os.ReadFile(marker)
+					if err == nil && string(data) == "fresh-trusted" {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("trusted command did not execute for %s: %q, %v", branch, data, err)
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+				t.Logf("IPC accepted branch=%s agent=%s run=%s; production repository gate emitted fresh-trusted from default SHA=%s (pushed SHA=%s)", branch, agentName, run.ID, fresh, head)
+			}
+			if got := gitOutput(t, bare, "rev-parse", "refs/remotes/origin/main"); got != head {
+				t.Fatalf("shared tracking ref moved: %s, want %s", got, head)
+			}
+			after, err := os.ReadFile(fetchHead)
+			if err != nil || string(after) != string(before) {
+				t.Fatalf("FETCH_HEAD changed: %q, %v", after, err)
+			}
+			refs, err := git.Run(context.Background(), bare, "for-each-ref", "--format=%(refname)", "refs/no-mistakes/trusted-config/")
+			if err != nil || strings.TrimSpace(refs) != "" {
+				t.Fatalf("private refs leaked: %q, %v", refs, err)
+			}
+			t.Log("locked tracking ref and FETCH_HEAD preserved; per-call private refs removed")
+		})
+	}
+}
 
 // Drive startup recovery through the running daemon and its IPC interface.
 // The oracle is the trust contract: a parked run survives a sibling's tracking

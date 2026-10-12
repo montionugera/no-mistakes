@@ -1,0 +1,581 @@
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/ipc"
+	"github.com/kunchenguid/no-mistakes/internal/logstore"
+	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/types"
+)
+
+func TestMain(m *testing.M) {
+	switch os.Getenv("NM_DAEMON_HELPER_PROCESS") {
+	case "1":
+		if capturePath := os.Getenv("NM_CAPTURE_NM_HOME_FILE"); capturePath != "" {
+			// Atomic rename so a poller that treats "file exists" as "content
+			// ready" cannot observe the empty create-before-write window that
+			// os.WriteFile leaves open (TestStartDetachedDaemonUsesProvidedRootViaNMHome).
+			_ = writeFileAtomic(capturePath, []byte(os.Getenv("NM_HOME")), 0o644)
+		}
+		// Stay alive long enough for tests with a synthetic health transition
+		// to distinguish launch from readiness. The production exit regression
+		// uses the explicit "exit" mode below.
+		time.Sleep(500 * time.Millisecond)
+		os.Exit(0)
+	case "exit":
+		os.Exit(23)
+	case "block":
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
+	case "daemon":
+		if err := Run(); err != nil {
+			_, _ = os.Stderr.WriteString(err.Error() + "\n")
+			os.Exit(2)
+		}
+		os.Exit(0)
+	case "bootstrap-sink":
+		if err := RunBootstrapLogSink(); err != nil {
+			_, _ = os.Stderr.WriteString(err.Error() + "\n")
+			os.Exit(2)
+		}
+		os.Exit(0)
+	case "capture-output":
+		p := paths.WithRoot(os.Getenv("NM_HOME"))
+		if err := p.EnsureDirs(); err != nil {
+			os.Exit(2)
+		}
+		capture, err := startBootstrapCapture(p)
+		if err != nil {
+			os.Exit(2)
+		}
+		payload := strings.Repeat("x", int(logstore.BootstrapPolicy().MaxBytes*3+17))
+		_, writeErr := os.Stderr.WriteString(payload)
+		closeErr := capture.Close()
+		if writeErr != nil || closeErr != nil {
+			os.Exit(2)
+		}
+		os.Exit(0)
+	}
+	// The post-receive hook embeds os.Executable() as NM_BIN. In tests that
+	// path is the test binary itself, so every `git push` to a bare gate
+	// would re-enter TestMain and run the whole daemon test suite inside
+	// the hook. Short-circuit: when we're being invoked as the hook's
+	// notifier, exit 0 immediately. Tests that care about the daemon seeing
+	// the push call push_received via IPC directly.
+	if os.Getenv("NM_HOOK_HELPER") == "1" {
+		os.Exit(0)
+	}
+	// Agent harnesses inject git config (e.g. safe.bareRepository=explicit)
+	// via GIT_CONFIG_COUNT/KEY_n/VALUE_n; tests that need it re-set it with
+	// t.Setenv (issue #362).
+	os.Unsetenv("GIT_CONFIG_COUNT")
+	// Fixtures must not depend on the machine's system git config: some
+	// distributions ship safe.bareRepository=explicit there, which refuses
+	// the in-directory use of the bare fixture repositories these tests
+	// create. Mirrors internal/git's TestMain.
+	os.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	// Fixtures must not inherit the developer's global git config: a
+	// commit.gpgsign=true there makes every fixture commit ask gpg to sign.
+	globalConfigDir, err := os.MkdirTemp("", "no-mistakes-daemon-tests-")
+	if err != nil {
+		panic(err)
+	}
+	globalConfig := filepath.Join(globalConfigDir, "gitconfig")
+	os.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
+	code := m.Run()
+	os.RemoveAll(globalConfigDir)
+	os.Exit(code)
+}
+
+// startTestDaemon starts a daemon with a temp root and registers shutdown cleanup.
+func startTestDaemon(t *testing.T) (*paths.Paths, *db.DB) {
+	t.Helper()
+
+	// Use short temp dir to avoid macOS 104-byte Unix socket path limit.
+	tmpDir, err := os.MkdirTemp("", "dtest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(tmpDir) })
+
+	p := paths.WithRoot(tmpDir)
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+
+	runTestDaemon(t, p, d, nil, 3*time.Second)
+	return p, d
+}
+
+// TestRunTestDaemonStartupError exercises the helper through a failed daemon
+// startup in a child test process, so its fatal diagnostic can be asserted.
+func TestRunTestDaemonStartupError(t *testing.T) {
+	const childEnv = "NM_TEST_DAEMON_STARTUP_ERROR"
+	if os.Getenv(childEnv) == "1" {
+		p := paths.WithRoot(t.TempDir())
+		if err := p.EnsureDirs(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p.ConfigFile(), []byte("agent: [invalid\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		d, err := db.Open(p.DB())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = d.Close() })
+		runTestDaemon(t, p, d, nil, time.Second)
+		t.Fatal("daemon unexpectedly became ready")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRunTestDaemonStartupError$")
+	cmd.Env = append(os.Environ(), childEnv+"=1")
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("failed startup did not stop the readiness wait: %v", ctx.Err())
+	}
+	if err == nil {
+		t.Fatalf("expected failed daemon startup, got success: %s", output)
+	}
+	if !strings.Contains(string(output), "load config:") {
+		t.Fatalf("startup error was not surfaced: %s", output)
+	}
+}
+
+// runTestDaemon runs RunWithOptions for the rest of the test and returns only
+// once the daemon answers a health probe. Startup recovery (stale runs, orphan
+// processes, orphan worktrees) completes before the IPC socket is bound, so a
+// returned call is a barrier after which recovery results can be asserted, and
+// the registered cleanup can reach a daemon that is still serving. The
+// cleanup asks the daemon to shut down when reachable and waits for
+// RunWithOptions to return. stopWithin only bounds how long a daemon that
+// never exits can stall the test. Register cleanup for resources that must
+// outlive the daemon (d and its root) before calling this.
+func runTestDaemon(t *testing.T, p *paths.Paths, d *db.DB, sf StepFactory, stopWithin time.Duration) {
+	t.Helper()
+
+	stopped := make(chan struct{})
+	exited := make(chan error, 1)
+	go func() {
+		exited <- RunWithOptions(p, d, sf)
+		close(stopped)
+	}()
+
+	t.Cleanup(func() {
+		if client, err := ipc.Dial(p.Socket()); err == nil {
+			_ = client.Call(ipc.MethodShutdown, &ipc.ShutdownParams{}, nil)
+			client.Close()
+		}
+		select {
+		case <-stopped:
+		case <-time.After(stopWithin):
+			t.Errorf("daemon did not stop within %s", stopWithin)
+		}
+	})
+
+	waitForDaemonReadyOrExit(t, p, exited)
+}
+
+// --- Mock steps and helpers for RunManager tests ---
+
+// mockPassStep is a step that completes immediately without needing approval.
+type mockPassStep struct {
+	name    types.StepName
+	execCnt atomic.Int32
+}
+
+func (s *mockPassStep) Name() types.StepName { return s.name }
+func (s *mockPassStep) Execute(_ *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	s.execCnt.Add(1)
+	return &pipeline.StepOutcome{}, nil
+}
+
+// mockApprovalStep pauses for approval every time.
+type mockApprovalStep struct {
+	name types.StepName
+}
+
+func (s *mockApprovalStep) Name() types.StepName { return s.name }
+func (s *mockApprovalStep) Execute(_ *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	return &pipeline.StepOutcome{NeedsApproval: true, Findings: `{"findings":[],"summary":"needs review"}`}, nil
+}
+
+// mockSlowStep blocks until context is cancelled.
+type mockSlowStep struct {
+	name    types.StepName
+	started chan struct{}
+}
+
+func (s *mockSlowStep) Name() types.StepName { return s.name }
+func (s *mockSlowStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	if s.started != nil {
+		close(s.started)
+	}
+	<-sctx.Ctx.Done()
+	return nil, sctx.Ctx.Err()
+}
+
+type mockPanicStep struct {
+	name types.StepName
+}
+
+func (s *mockPanicStep) Name() types.StepName { return s.name }
+func (s *mockPanicStep) Execute(_ *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	panic("boom")
+}
+
+// startTestDaemonWithSteps starts a daemon with a custom step factory.
+func startTestDaemonWithSteps(t *testing.T, sf StepFactory) (*paths.Paths, *db.DB) {
+	t.Helper()
+
+	tmpDir, err := os.MkdirTemp("", "dtest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(tmpDir) })
+
+	p := paths.WithRoot(tmpDir)
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Keep daemon tests hermetic now that the default config auto-detects agents.
+	mockClaude := writeMockClaude(t, t.TempDir())
+	configYAML := "agent: claude\nagent_path_override:\n  claude: " + mockClaude + "\n"
+	if err := os.WriteFile(p.ConfigFile(), []byte(configYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+
+	// A run reaches its terminal DB state before its goroutine finishes git
+	// worktree cleanup. On process-spawn-bound Windows that cleanup can take
+	// longer than three seconds, so give graceful shutdown its own budget.
+	runTestDaemon(t, p, d, sf, 15*time.Second)
+	return p, d
+}
+
+// setupTestGitRepo creates a git repo with one commit, pushes to a bare repo
+// under p.RepoDir(repoID), and registers the repo in the DB.
+// Returns the repo record and the head SHA.
+func setupTestGitRepo(t *testing.T, p *paths.Paths, d *db.DB, repoID string) (*db.Repo, string) {
+	t.Helper()
+	ctx := context.Background()
+
+	// Create a work repo with an initial commit.
+	workDir := filepath.Join(t.TempDir(), "work")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, workDir, "init")
+	gitCmd(t, workDir, "config", "user.email", "test@test.com")
+	gitCmd(t, workDir, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(workDir, "test.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Disable auto-fix so approval-based tests pause immediately.
+	if err := os.WriteFile(filepath.Join(workDir, ".no-mistakes.yaml"), []byte("auto_fix:\n  lint: 0\n  test: 0\n  review: 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, workDir, "add", ".")
+	gitCmd(t, workDir, "commit", "-m", "initial")
+
+	headSHA := gitOutput(t, workDir, "rev-parse", "HEAD")
+
+	// Create bare repo at the expected gate path.
+	bareDir := p.RepoDir(repoID)
+	gitCmd(t, "", "init", "--bare", bareDir)
+
+	// Push from work to bare so it has refs.
+	gitCmd(t, workDir, "remote", "add", "gate", bareDir)
+	gitCmd(t, workDir, "push", "gate", "HEAD:refs/heads/main")
+
+	// Point the gate bare repo's origin at itself so a run worktree can fetch
+	// and resolve the trusted default branch (as a real init-configured gate
+	// does). Without this the trusted-config fetch fails, which now aborts the
+	// run (the disable_project_settings security boundary).
+	gitCmd(t, bareDir, "remote", "add", "origin", bareDir)
+
+	// Register repo in DB.
+	repo, err := d.InsertRepoWithID(repoID, workDir, "https://github.com/test/repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ctx
+
+	return repo, headSHA
+}
+
+func gitCmd(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, out)
+	}
+}
+
+func gitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %v failed: %v", args, err)
+	}
+	return string(out[:len(out)-1]) // trim trailing newline
+}
+
+// testJSONString quotes s as a JSON string for embedding into transcript
+// fixtures.
+func testJSONString(t *testing.T, s string) string {
+	t.Helper()
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// testClaudeProjectDirName mirrors the Claude transcript layout's path
+// encoding: every '/', '\\', and ':' becomes '-'.
+func testClaudeProjectDirName(cwd string) string {
+	replacer := strings.NewReplacer("/", "-", `\`, "-", ":", "-")
+	return replacer.Replace(cwd)
+}
+
+func writeMockClaude(t *testing.T, dir string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(dir, "claude.bat")
+		script := "@echo off\r\necho {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"structured_output\":{\"findings\":[],\"summary\":\"clean\"}}\r\n"
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	path := filepath.Join(dir, "claude")
+	script := `#!/bin/sh
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"structured_output":{"findings":[],"summary":"clean"}}'
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeMockGHState(t *testing.T, dir, state string) (string, string) {
+	t.Helper()
+	logPath := filepath.Join(dir, "gh.log")
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(dir, "gh.bat")
+		script := "@echo off\r\nset TOKENSTATE=\r\nif defined GH_TOKEN set TOKENSTATE=set\r\necho env:%GH_CONFIG_DIR% token:%TOKENSTATE%>>\"" + logPath + "\"\r\necho %*>>\"" + logPath + "\"\r\necho %* | findstr /C:\"auth status\" >nul && exit /b 0\r\necho %* | findstr /C:\"pr view 42\" >nul && (echo " + state + "& exit /b 0)\r\nexit /b 1\r\n"
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return dir, logPath
+	}
+	path := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+printf 'env:%s token:%s\n' "$GH_CONFIG_DIR" "${GH_TOKEN:+set}" >>` + shellQuoteForTest(logPath) + `
+printf '%s\n' "$*" >>` + shellQuoteForTest(logPath) + `
+case "$*" in
+  "auth status"*|"auth status --hostname "*) exit 0 ;;
+  "pr view 42 "*) printf '%s\n' ` + shellQuoteForTest(state) + `; exit 0 ;;
+esac
+exit 1
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir, logPath
+}
+
+// writeMockGHNoPR puts a gh on PATH that authenticates and reports that the
+// branch has no open pull request.
+//
+// Every push now writes a pipeline attestation for the head it is about to
+// publish, which asks the forge whether a PR exists (see the Pre-Push Pipeline
+// Attestation contract). Without a stub, that lookup leaves the test process:
+// on a developer machine with an authenticated gh it reaches github.com and
+// fails against the placeholder test/repo slug, so a push-behaviour test would
+// pass or fail depending on whose machine ran it. An empty PR list is the
+// honest answer for a repository this test never opened a PR on.
+func writeMockGHNoPR(t *testing.T, dir string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(dir, "gh.bat")
+		script := "@echo off\r\necho %* | findstr /C:\"auth status\" >nul && exit /b 0\r\necho %* | findstr /C:\"pr list\" >nul && (echo []& exit /b 0)\r\nexit /b 1\r\n"
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	path := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+case "$*" in
+  "auth status"*) exit 0 ;;
+  "pr list"*) printf '%s\n' '[]'; exit 0 ;;
+esac
+exit 1
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func shellQuoteForTest(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func writeSlowMockClaude(t *testing.T, dir string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(dir, "claude.bat")
+		script := "@echo off\r\ntimeout /t 3 /nobreak >nul\r\necho {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"structured_output\":{\"summary\":\"slow intent\"}}\r\n"
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	path := filepath.Join(dir, "claude")
+	script := `#!/bin/sh
+sleep 3
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"structured_output":{"summary":"slow intent"}}'
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func waitForRunTerminalState(t *testing.T, d *db.DB, runID string) *db.Run {
+	t.Helper()
+
+	timeout := 5 * time.Second
+	if runtime.GOOS == "windows" {
+		// Git-backed daemon runs routinely take about 10x longer on Windows,
+		// especially while the git-heavy CI shard runs several packages at once.
+		// Keep the assertion bounded without treating normal process-spawn load as
+		// a pipeline failure.
+		timeout = time.Minute
+	}
+	return waitForRunTerminalStateWithTimeout(t, d, runID, timeout)
+}
+
+func waitForRunTerminalStateWithTimeout(t *testing.T, d *db.DB, runID string, timeout time.Duration) *db.Run {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		run, err := d.GetRun(runID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if run != nil && (run.Status == types.RunCompleted || run.Status == types.RunFailed) {
+			return run
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("run %s did not reach terminal state", runID)
+	return nil
+}
+
+// waitForDaemonReady blocks until the daemon started by RunWithOptions answers a
+// health probe. The singleton lock orders stale-run recovery (which performs
+// startup PR reconciliation) strictly before the socket bind and the first
+// health response, so a healthy daemon has already finished reconciling. Tests
+// that launch RunWithOptions in a goroutine and then wait for a recovered run to
+// go terminal must gate on this first: otherwise their terminal-state deadline
+// has to absorb the entire cold daemon startup, which is far slower on the
+// process-spawn-bound Windows runner and made the wait flaky.
+func waitForDaemonReady(t *testing.T, p *paths.Paths) {
+	t.Helper()
+	waitForDaemonReadyOrExit(t, p, nil)
+}
+
+func waitForDaemonReadyOrExit(t *testing.T, p *paths.Paths, exited <-chan error) {
+	t.Helper()
+
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		client, err := ipc.Dial(p.Socket())
+		if err == nil {
+			var result ipc.HealthResult
+			callErr := client.Call(ipc.MethodHealth, &ipc.HealthParams{}, &result)
+			_ = client.Close()
+			if callErr == nil && result.Status == "ok" {
+				return
+			}
+		}
+		select {
+		case err := <-exited:
+			if err != nil {
+				t.Fatalf("daemon at %s exited before ready: %v", p.Socket(), err)
+			}
+			t.Fatalf("daemon at %s exited before ready without error", p.Socket())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	t.Fatalf("daemon at %s never became ready", p.Socket())
+}
+
+// shutdownTestDaemonAndWaitForCleanup turns daemon shutdown into a lifecycle
+// barrier for tests that inspect its filesystem. A run's terminal DB status is
+// persisted before its owner goroutine removes the worktree, while shutdown
+// waits for every run goroutine before removing the socket.
+func shutdownTestDaemonAndWaitForCleanup(t *testing.T, p *paths.Paths) {
+	t.Helper()
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatalf("dial daemon for shutdown: %v", err)
+	}
+	if err := client.Call(ipc.MethodShutdown, &ipc.ShutdownParams{}, nil); err != nil {
+		client.Close()
+		t.Fatalf("shut down daemon: %v", err)
+	}
+	client.Close()
+
+	// Worktree removal is process-spawn-bound and runs before the socket
+	// disappears, so match the graceful-shutdown budget the run-goroutine
+	// cleanup above already needs on Windows.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(p.Socket()); os.IsNotExist(err) {
+			return
+		} else if err != nil {
+			t.Fatalf("stat daemon socket during shutdown: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("daemon did not finish cleanup within 15s")
+}

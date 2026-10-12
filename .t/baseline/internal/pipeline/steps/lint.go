@@ -1,0 +1,258 @@
+package steps
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/kunchenguid/no-mistakes/internal/agent"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/types"
+)
+
+// LintStep runs linters and asks the agent to fix issues.
+type LintStep struct{}
+
+func (s *LintStep) Name() types.StepName { return types.StepLint }
+
+func (s *LintStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	outcome, err := s.executeRepositoryLint(sctx)
+	if err != nil || len(sctx.Config.CommandOverrides["lint"].Additional) == 0 {
+		return outcome, err
+	}
+	if err := ensurePrepared(sctx, s.Name()); err != nil {
+		return nil, fmt.Errorf("prepare local lint dependencies: %w", err)
+	}
+	if sctx.Config.Commands.Lint == "" {
+		declareStepCommandOverrides(sctx, "lint")
+	}
+	output, results, err := runConfiguredChecks(sctx, "lint", "")
+	projectedOutput := logConfiguredCommandOutput(sctx, output, types.StepLint)
+	if err != nil {
+		return nil, fmt.Errorf("run local lint checks: %w", err)
+	}
+	failed := failedChecks(results)
+	if len(failed) == 0 {
+		return outcome, nil
+	}
+	findings := Findings{}
+	if outcome.Findings != "" {
+		findings, err = types.ParseFindingsJSON(outcome.Findings)
+		if err != nil {
+			return nil, fmt.Errorf("parse lint findings: %w", err)
+		}
+	}
+	for _, result := range failed {
+		findings.Items = append(findings.Items, Finding{
+			Severity: "error", Action: types.ActionAutoFix,
+			Description: result.description("lint"),
+		})
+	}
+	findings.Summary += "\n" + projectedOutput
+	payload, err := json.Marshal(findings)
+	if err != nil {
+		return nil, err
+	}
+	outcome.Findings = string(payload)
+	outcome.NeedsApproval = true
+	outcome.AutoFixable = true
+	if outcome.ExitCode == 0 {
+		outcome.ExitCode = failed[0].ExitCode
+	}
+	return outcome, nil
+}
+
+func (s *LintStep) executeRepositoryLint(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	if err := assertPipelineHeadContinuity(sctx, s.Name()); err != nil {
+		return nil, err
+	}
+	ctx := sctx.Ctx
+	baseBranch := effectivePRBaseBranch(sctx)
+	baseSHA, err := resolveBranchBaseSHA(ctx, sctx, sctx.Run.BaseSHA, baseBranch)
+	if err != nil {
+		return nil, err
+	}
+	lintCmd := sctx.Config.Commands.Lint
+
+	if lintCmd == "" {
+		// The combined document+lint housekeeping pass already performed the
+		// agent-driven lint duty for this round; consume its result instead
+		// of paying a second cold agent invocation. Fix rounds and any round
+		// without a stashed result fall through to a full agent pass, so the
+		// lint responsibility is never silently skipped.
+		if !sctx.Fixing {
+			if stash, ok := sctx.Shared.TakeHousekeepingLint(); ok {
+				return lintOutcomeFromHousekeeping(sctx, stash)
+			}
+		}
+		sctx.Log("no lint command configured, asking agent to lint and fix...")
+		reassessHistory := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx)
+		prompt := fmt.Sprintf(
+			`Detect the linting and formatting tools for this project, run the relevant checks yourself, apply safe fixes, and verify the result.
+
+Context:
+- branch: %s
+- base commit: %s
+- target commit: %s
+
+Task:
+- Discover the configured linters and formatters for this repository.
+- Only lint or format the relevant changed files when possible.
+- Apply safe formatter, linter, and static-analysis fixes yourself.
+- Re-run the relevant checks after fixing.
+- Report only unresolved lint, format, or static-analysis issues as structured findings.
+- If everything is clean or fixed, return an empty findings array.
+
+Rules:
+- Do not run tests or broader behavioral validation.
+- Focus on lint, format, and static-analysis issues only.
+- Do not report issues you already fixed.
+- The summary must be one concise sentence fragment suitable for a git commit subject.
+- Keep the summary under 10 words.%s`,
+			sctx.Run.Branch,
+			baseSHA,
+			sctx.Run.HeadSHA,
+			reassessHistory,
+		)
+		if sctx.PreviousFindings != "" {
+			prompt += `
+
+Previous lint findings to address:
+` + sanitizedPreviousFindingsForPrompt(sctx.PreviousFindings)
+		}
+		result, err := sctx.RunAgentContext(ctx, agent.RunOpts{
+			Prompt:     fixerPrompt(prompt),
+			CWD:        sctx.WorkDir,
+			JSONSchema: findingsSchema,
+			OnChunk:    sctx.LogChunk,
+			Purpose:    "lint",
+		})
+		if err != nil {
+			return nil, fmt.Errorf("agent lint: %w", err)
+		}
+
+		var findings Findings
+		if result.Output == nil {
+			return nil, errors.New("lint analyzer returned no structured findings")
+		}
+		if err := unmarshalRequiredFindings(result.Output, &findings, true); err != nil {
+			return nil, fmt.Errorf("validate lint analyzer findings: %w", err)
+		}
+		summary, err := extractCommitSummary(result)
+		if err != nil {
+			if errors.Is(err, errRejectedCommitSummary) {
+				return nil, fmt.Errorf("validate lint summary: %w", err)
+			}
+			sctx.Log(fmt.Sprintf("warning: could not parse lint summary: %v", err))
+		}
+		committed, err := commitAgentFixesWithResult(sctx, s.Name(), summary, "fix lint issues", result)
+		if err != nil {
+			return nil, err
+		}
+
+		needsApproval := hasBlockingFindings(findings.Items)
+		findingsJSON, _ := json.Marshal(findings)
+		return &pipeline.StepOutcome{
+			NeedsApproval: needsApproval,
+			AutoFixable:   false,
+			Findings:      string(findingsJSON),
+			FixSummary:    fixResultSummary(committed),
+		}, nil
+	}
+
+	// In fix mode, ask agent to fix lint issues first
+	var fixSummary string
+	if sctx.Fixing {
+		historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx)
+		fixPrompt := fmt.Sprintf(
+			`Fix the lint issues in this repository. Run the linter, identify all issues, and fix them.
+
+Context:
+- branch: %s
+- base commit: %s
+- target commit: %s
+
+Rules:
+- Make the smallest correct root-cause fix.
+- Do not refactor beyond what is needed for that root-cause fix.
+- Do not run tests or broader behavioral validation.
+- Re-run the relevant lint or format commands before finishing.
+- Return JSON with a single "summary" field when you are done.
+- The summary must be one concise sentence fragment suitable for a git commit subject.
+- Keep the summary under 10 words.%s`,
+			sctx.Run.Branch,
+			baseSHA,
+			sctx.Run.HeadSHA,
+			historySection,
+		)
+		if sctx.PreviousFindings != "" {
+			fixPrompt += `
+
+Previous lint findings to address:
+` + sanitizedPreviousFindingsForPrompt(sctx.PreviousFindings)
+		}
+		summary, err := executeFixMode(sctx, s.Name(), fixExecutionOptions{
+			LogMessage:      "asking agent to fix lint issues...",
+			Prompt:          fixPrompt,
+			ErrorPrefix:     "agent fix lint",
+			FallbackSummary: "fix lint issues",
+		})
+		if err != nil {
+			return nil, err
+		}
+		fixSummary = summary
+	}
+
+	// Run configured lint command after the run-scoped dependency preparation.
+	if err := ensurePrepared(sctx, s.Name()); err != nil {
+		return nil, fmt.Errorf("prepare lint dependencies: %w", err)
+	}
+	declareStepCommandOverrides(sctx, "lint")
+	sctx.Log(fmt.Sprintf("running linter: %s", lintCmd))
+	output, exitCode, err := executeRepositoryCommand(sctx, "lint", lintCmd)
+	if err != nil {
+		logConfiguredCommandOutput(sctx, output, types.StepLint)
+		return nil, fmt.Errorf("run lint command: %w", err)
+	}
+
+	projectedOutput := logConfiguredCommandOutput(sctx, output, types.StepLint)
+
+	if exitCode != 0 {
+		findings := Findings{
+			Items: []Finding{{
+				Severity:    "warning",
+				Description: fmt.Sprintf("linter found issues (exit code %d)", exitCode),
+			}},
+			Summary: projectedOutput,
+		}
+		findingsJSON, _ := json.Marshal(findings)
+		return &pipeline.StepOutcome{
+			NeedsApproval: true,
+			AutoFixable:   true,
+			Findings:      string(findingsJSON),
+			ExitCode:      exitCode,
+			FixSummary:    fixSummary,
+		}, nil
+	}
+
+	sctx.Log("lint passed")
+	return &pipeline.StepOutcome{FixSummary: fixSummary}, nil
+}
+
+// lintOutcomeFromHousekeeping reports the lint findings the combined
+// document+lint pass produced, with the same gate semantics as the lint
+// step's own agent path: blocking (error/warning) findings park for a
+// decision, info findings pass through.
+func lintOutcomeFromHousekeeping(sctx *pipeline.StepContext, stash pipeline.HousekeepingLintResult) (*pipeline.StepOutcome, error) {
+	findings, err := types.ParseFindingsJSON(stash.FindingsJSON)
+	if err != nil {
+		return nil, fmt.Errorf("validate combined housekeeping lint result: %w", err)
+	}
+	sctx.Log(fmt.Sprintf("lint assessed in the combined document+lint housekeeping pass: %d unresolved items", len(findings.Items)))
+	return &pipeline.StepOutcome{
+		NeedsApproval: hasBlockingFindings(findings.Items),
+		AutoFixable:   false,
+		Findings:      stash.FindingsJSON,
+		FixSummary:    stash.Summary,
+	}, nil
+}

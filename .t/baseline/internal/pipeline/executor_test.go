@@ -1,0 +1,762 @@
+package pipeline
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/ipc"
+	"github.com/kunchenguid/no-mistakes/internal/shellenv"
+	"github.com/kunchenguid/no-mistakes/internal/telemetry"
+	"github.com/kunchenguid/no-mistakes/internal/types"
+)
+
+func TestExecutorAutomaticSkipReasonRedactsCredentials(t *testing.T) {
+	database, p, r, repo := setupTest(t)
+	executor := NewExecutor(database, p, nil, nil, []Step{&mockStep{
+		name:    types.StepCI,
+		outcome: &StepOutcome{Skipped: true, SkipReason: "unavailable https://operator:secret@forge.example/repo"},
+	}}, nil)
+	if err := executor.Execute(context.Background(), r, repo, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	results, err := database.GetStepsByRun(r.ID)
+	if err != nil || len(results) != 1 {
+		t.Fatalf("steps = %+v, %v", results, err)
+	}
+	reason := results[0].SkipReason
+	if reason == nil || strings.Contains(*reason, "secret") || !strings.Contains(*reason, "forge.example") {
+		t.Fatalf("skip cause should retain the host and redact credentials: %v", reason)
+	}
+}
+
+// TestExecutor_StepLifecycleEvents verifies the executor emits step_started
+// and step_completed IPC events for every step in order. The broader
+// happy-path orchestration (DB persistence, run/step status transitions,
+// timestamp + duration recording across all 8 real steps) is exercised by
+// the e2e journey suite (internal/e2e), so this test focuses solely on
+// the IPC event contract that the TUI subscribes to.
+func TestExecutor_StepLifecycleEvents(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	stepNames := []types.StepName{types.StepReview, types.StepTest, types.StepLint}
+	steps := make([]Step, len(stepNames))
+	for i, name := range stepNames {
+		steps[i] = newPassStep(name)
+	}
+
+	exec := NewExecutor(database, p, nil, nil, steps, nil)
+	events := collectEvents(exec)
+
+	if err := exec.Execute(context.Background(), run, repo, workDir); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	for _, name := range stepNames {
+		if e := events.find(ipc.EventStepStarted, name); e == nil {
+			t.Errorf("missing step_started event for %s", name)
+		}
+		if e := events.find(ipc.EventStepCompleted, name); e == nil {
+			t.Errorf("missing step_completed event for %s", name)
+		}
+	}
+}
+
+func TestExecutor_SuccessfulStepsDoNotEmitTelemetry(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	recorder := &telemetryRecorder{}
+	restore := telemetry.SetDefaultForTesting(recorder)
+	defer restore()
+
+	exec := NewExecutor(database, p, nil, nil, []Step{
+		newPassStep(types.StepReview),
+		newPassStep(types.StepTest),
+	}, nil)
+
+	if err := exec.Execute(context.Background(), run, repo, workDir); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if event := recorder.find("step", "", nil); event != nil {
+		t.Fatalf("successful steps should not emit step telemetry, got %v", event.fields)
+	}
+}
+
+func TestExecutor_RestartsValidationFromRequestedStep(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	var order []types.StepName
+	pass := func(name types.StepName) Step {
+		return &adaptiveCallStep{name: name, fn: func(*StepContext) (*StepOutcome, error) {
+			order = append(order, name)
+			return &StepOutcome{}, nil
+		}}
+	}
+	// The CI step behaves like the real one: its first observation reports an
+	// auto-fix finding, the executor's fix round repairs it and asks for
+	// revalidation, and the observation after the restart is green.
+	ciCalls := 0
+	ci := &adaptiveCallStep{name: types.StepCI, fn: func(sctx *StepContext) (*StepOutcome, error) {
+		order = append(order, types.StepCI)
+		ciCalls++
+		switch {
+		case ciCalls == 1:
+			return &StepOutcome{
+				NeedsApproval: true,
+				AutoFixable:   true,
+				Findings:      `{"findings":[{"severity":"error","description":"CI check failing: test","action":"auto-fix","category":"ci-check","check":"test"}],"summary":"1 CI check failing"}`,
+			}, nil
+		case ciCalls == 2:
+			if !sctx.Fixing || sctx.PreviousFindings == "" {
+				t.Errorf("fix round: Fixing=%v PreviousFindings=%q, want the auto-fix findings handed over", sctx.Fixing, sctx.PreviousFindings)
+			}
+			return &StepOutcome{RestartFrom: types.StepReview}, nil
+		default:
+			if sctx.Fixing {
+				t.Error("post-restart observation must not run as a fix round")
+			}
+			return &StepOutcome{}, nil
+		}
+	}}
+	cycle := []types.StepName{types.StepReview, types.StepTest, types.StepDocument, types.StepLint, types.StepPush, types.StepPR}
+	steps := make([]Step, 0, len(cycle)+1)
+	for _, name := range cycle {
+		steps = append(steps, pass(name))
+	}
+	steps = append(steps, ci)
+	exec := NewExecutor(database, p, &config.Config{AutoFix: config.AutoFix{CI: 1}}, nil, steps, nil)
+
+	if err := exec.Execute(context.Background(), run, repo, workDir); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if ciCalls != 3 {
+		t.Fatalf("CI executions = %d, want 3 (observation, fix round, post-restart observation)", ciCalls)
+	}
+	want := append(append([]types.StepName{}, cycle...), types.StepCI, types.StepCI)
+	want = append(want, cycle...)
+	want = append(want, types.StepCI)
+	if !slices.Equal(order, want) {
+		t.Fatalf("execution order = %v, want %v", order, want)
+	}
+	results, err := database.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetStepsByRun() error = %v", err)
+	}
+	for _, result := range results {
+		rounds, err := database.GetRoundsByStep(result.ID)
+		if err != nil {
+			t.Fatalf("GetRoundsByStep(%s) error = %v", result.StepName, err)
+		}
+		if result.StepName == types.StepCI {
+			// The observation, the fix round that restarted validation, and
+			// the post-restart observation: the auto-fix trigger comes from
+			// the executor driving the round, not from a CI special case.
+			if len(rounds) != 3 || rounds[0].Round != 1 || rounds[1].Round != 2 || rounds[2].Round != 3 {
+				t.Errorf("CI rounds = %v, want [1 2 3]", roundNumbers(rounds))
+				continue
+			}
+			if rounds[0].Trigger != "initial" || rounds[1].Trigger != "auto_fix" || rounds[2].Trigger != "initial" {
+				t.Errorf("CI round triggers = [%s %s %s], want [initial auto_fix initial]", rounds[0].Trigger, rounds[1].Trigger, rounds[2].Trigger)
+			}
+			if rounds[0].SelectionSource == nil || *rounds[0].SelectionSource != db.RoundSelectionSourceAutoFix {
+				t.Errorf("observation round selection source = %v, want auto_fix so the attempt survives the restart", rounds[0].SelectionSource)
+			}
+			// The spent attempt is what a restarted or recovered executor
+			// restores: ResetStepsFrom leaves the round history alone.
+			state, err := exec.durableExecutionState(result.ID)
+			if err != nil {
+				t.Fatalf("durableExecutionState() error = %v", err)
+			}
+			if state.autoFixAttempts != 1 {
+				t.Errorf("durable auto-fix attempts after the restart = %d, want 1", state.autoFixAttempts)
+			}
+			continue
+		}
+		if len(rounds) != 2 {
+			t.Errorf("%s rounds = %v, want [1 2]", result.StepName, roundNumbers(rounds))
+			continue
+		}
+		if rounds[0].Round != 1 || rounds[1].Round != 2 {
+			t.Errorf("%s rounds = %v, want [1 2]", result.StepName, roundNumbers(rounds))
+		}
+	}
+}
+
+func TestExecutor_RevalidationClearsReviewCarry(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	reviewCalls := 0
+	review := &adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) {
+		reviewCalls++
+		if reviewCalls == 1 {
+			return &StepOutcome{
+				NeedsApproval: true,
+				Findings:      `{"findings":[{"id":"review-1","severity":"warning","description":"review needed","action":"ask-user"}],"summary":"review needed"}`,
+			}, nil
+		}
+		return &StepOutcome{}, nil
+	}}
+	ciCalls := 0
+	ci := &adaptiveCallStep{name: types.StepCI, fn: func(*StepContext) (*StepOutcome, error) {
+		ciCalls++
+		if ciCalls == 1 {
+			return &StepOutcome{RestartFrom: types.StepReview}, nil
+		}
+		return &StepOutcome{}, nil
+	}}
+
+	exec := NewExecutor(database, p, nil, nil, []Step{review, ci}, nil)
+	done, _ := startExecutor(t, exec, run, repo, workDir)
+	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+	if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+		t.Fatalf("approve initial review: %v", err)
+	}
+	waitExecutorDone(t, done)
+
+	if reviewCalls != 2 || ciCalls != 2 {
+		t.Fatalf("calls = review %d, ci %d; want two each", reviewCalls, ciCalls)
+	}
+	completed, err := database.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != types.RunCompleted {
+		t.Fatalf("run status = %s, want %s", completed.Status, types.RunCompleted)
+	}
+}
+
+func TestExecutor_RevalidationGateRemainsRecoverable(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	reviewCalls := 0
+	review := &adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) {
+		reviewCalls++
+		if reviewCalls == 2 {
+			return &StepOutcome{
+				NeedsApproval: true,
+				Findings:      `{"findings":[{"id":"review-1","severity":"warning","description":"review needed","action":"ask-user"}],"summary":"review needed"}`,
+			}, nil
+		}
+		return &StepOutcome{}, nil
+	}}
+	ciCalls := 0
+	ci := &adaptiveCallStep{name: types.StepCI, fn: func(*StepContext) (*StepOutcome, error) {
+		ciCalls++
+		if ciCalls == 1 {
+			return &StepOutcome{RestartFrom: types.StepReview}, nil
+		}
+		return &StepOutcome{}, nil
+	}}
+	steps := []Step{review, newPassStep(types.StepTest), newPassStep(types.StepPush), ci}
+	exec := NewExecutor(database, p, nil, nil, steps, nil)
+	exec.SetSkippedSteps([]types.StepName{types.StepPush})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- exec.Execute(ctx, run, repo, workDir) }()
+	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+
+	parkedRun, err := database.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateRecoveredRun(database, parkedRun, steps); err != nil {
+		t.Errorf("ValidateRecoveredRun() error = %v", err)
+	}
+	results, err := database.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results[2].Status != types.StepStatusSkipped {
+		t.Fatalf("push status = %s, want %s", results[2].Status, types.StepStatusSkipped)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("executor did not stop after cancellation")
+	}
+}
+
+func TestExecutor_RecoveredRevalidationPreservesSkippedStep(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	review := newPassStep(types.StepReview)
+	push := newPassStep(types.StepPush)
+	steps := []Step{review, push}
+
+	_, err := database.InsertStepResult(run.ID, types.StepReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pushResult, err := database.InsertStepResult(run.ID, types.StepPush)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CompleteStepWithStatus(pushResult.ID, types.StepStatusSkipped, 0, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewExecutor(database, p, nil, nil, steps, nil)
+	exec.initializeRunScopes(run.ID)
+
+	if err := exec.executeRecoveredRemainder(context.Background(), run, repo, t.TempDir(), t.TempDir(), 0, types.StepPush); err != nil {
+		t.Fatalf("executeRecoveredRemainder() error = %v", err)
+	}
+	if got := review.callCount(); got != 1 {
+		t.Fatalf("review executed %d times, want 1", got)
+	}
+	if got := push.callCount(); got != 0 {
+		t.Fatalf("skipped push executed %d times, want 0", got)
+	}
+	gotPush, err := database.GetStepResult(pushResult.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPush.Status != types.StepStatusSkipped {
+		t.Fatalf("push status = %s, want %s", gotPush.Status, types.StepStatusSkipped)
+	}
+}
+
+func roundNumbers(rounds []*db.StepRound) []int {
+	numbers := make([]int, len(rounds))
+	for index, round := range rounds {
+		numbers[index] = round.Round
+	}
+	return numbers
+}
+
+func TestExecutor_SkippedStepsDoNotEmitTelemetry(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	recorder := &telemetryRecorder{}
+	restore := telemetry.SetDefaultForTesting(recorder)
+	defer restore()
+
+	skipStep := &mockStep{
+		name:    types.StepRebase,
+		outcome: &StepOutcome{ExitCode: 0, SkipRemaining: true},
+	}
+	exec := NewExecutor(database, p, nil, nil, []Step{
+		skipStep,
+		newPassStep(types.StepReview),
+	}, nil)
+
+	if err := exec.Execute(context.Background(), run, repo, workDir); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if event := recorder.find("step", "status", string(types.StepStatusSkipped)); event != nil {
+		t.Fatalf("skipped steps should not emit step telemetry, got %v", event.fields)
+	}
+}
+
+func TestExecutor_RunEventStatusCorrectOnSuccess(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	exec := NewExecutor(database, p, nil, nil, []Step{newPassStep(types.StepReview)}, nil)
+	events := collectEvents(exec)
+
+	err := exec.Execute(context.Background(), run, repo, workDir)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// run_updated event should carry "running" status (not stale "pending")
+	updatedEvent := events.findRunEvent(ipc.EventRunUpdated)
+	if updatedEvent == nil {
+		t.Fatal("expected run_updated event")
+	}
+	if updatedEvent.Status == nil || *updatedEvent.Status != string(types.RunRunning) {
+		got := "<nil>"
+		if updatedEvent.Status != nil {
+			got = *updatedEvent.Status
+		}
+		t.Errorf("run_updated event: expected status %q, got %q", types.RunRunning, got)
+	}
+
+	// run_completed event should carry "completed" status (not stale "running")
+	completedEvent := events.findRunEvent(ipc.EventRunCompleted)
+	if completedEvent == nil {
+		t.Fatal("expected run_completed event")
+	}
+	if completedEvent.Status == nil || *completedEvent.Status != string(types.RunCompleted) {
+		got := "<nil>"
+		if completedEvent.Status != nil {
+			got = *completedEvent.Status
+		}
+		t.Errorf("run_completed event: expected status %q, got %q", types.RunCompleted, got)
+	}
+}
+
+func TestExecutor_RunEventStatusCorrectOnFailure(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	exec := NewExecutor(database, p, nil, nil, []Step{newFailStep(types.StepReview, fmt.Errorf("boom"))}, nil)
+	events := collectEvents(exec)
+
+	err := exec.Execute(context.Background(), run, repo, workDir)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	// run_completed event should carry "failed" status (not stale "running")
+	completedEvent := events.findRunEvent(ipc.EventRunCompleted)
+	if completedEvent == nil {
+		t.Fatal("expected run_completed event")
+	}
+	if completedEvent.Status == nil || *completedEvent.Status != string(types.RunFailed) {
+		got := "<nil>"
+		if completedEvent.Status != nil {
+			got = *completedEvent.Status
+		}
+		t.Errorf("run_completed event: expected status %q, got %q", types.RunFailed, got)
+	}
+}
+
+func TestExecutor_StepError_FailsRun(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	steps := []Step{
+		newPassStep(types.StepReview),
+		newFailStep(types.StepTest, fmt.Errorf("tests crashed")),
+		newPassStep(types.StepLint), // should not run
+	}
+
+	exec := NewExecutor(database, p, nil, nil, steps, nil)
+
+	err := exec.Execute(context.Background(), run, repo, workDir)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	// Run should be failed
+	updated, _ := database.GetRun(run.ID)
+	if updated.Status != types.RunFailed {
+		t.Errorf("expected run status %q, got %q", types.RunFailed, updated.Status)
+	}
+
+	// Second step should be failed, third should be pending
+	dbSteps, _ := database.GetStepsByRun(run.ID)
+	if dbSteps[1].Status != types.StepStatusFailed {
+		t.Errorf("step test: expected %q, got %q", types.StepStatusFailed, dbSteps[1].Status)
+	}
+	if dbSteps[2].Status != types.StepStatusPending {
+		t.Errorf("step lint: expected %q, got %q", types.StepStatusPending, dbSteps[2].Status)
+	}
+}
+
+func TestExecutor_OutOfMemoryFailureReasonKeepsRestorationDetail(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	const snapshot = "/tmp/nm-recovery-snapshot"
+	stepErr := errors.Join(
+		fmt.Errorf("run prepare command: %w", shellenv.ErrOutOfMemory),
+		fmt.Errorf("restore pre-preparation changes; recovery snapshot retained at %s: %w", snapshot, errors.New("git stash apply failed")),
+	)
+
+	exec := NewExecutor(database, p, nil, nil, []Step{newFailStep(types.StepTest, stepErr)}, nil)
+	err := exec.Execute(context.Background(), run, repo, t.TempDir())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	dbSteps, _ := database.GetStepsByRun(run.ID)
+	if dbSteps[0].Error == nil {
+		t.Fatal("failed step has no recorded reason")
+	}
+	reason := *dbSteps[0].Error
+	for _, want := range []string{"git stash apply failed", snapshot, shellenv.ErrOutOfMemory.Error()} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("step failure reason %q is missing %q", reason, want)
+		}
+	}
+}
+
+func TestExecutor_FailedStepEmitsTelemetry(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	recorder := &telemetryRecorder{}
+	restore := telemetry.SetDefaultForTesting(recorder)
+	defer restore()
+
+	exec := NewExecutor(database, p, nil, nil, []Step{
+		newFailStep(types.StepReview, fmt.Errorf("review crashed")),
+	}, nil)
+
+	if err := exec.Execute(context.Background(), run, repo, workDir); err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	event := recorder.find("step", "status", string(types.StepStatusFailed))
+	if event == nil {
+		t.Fatal("expected failed step telemetry event")
+	}
+	if got := event.fields["step"]; got != string(types.StepReview) {
+		t.Fatalf("step telemetry step = %v, want %q", got, types.StepReview)
+	}
+}
+
+func TestExecutor_FailedStepRecordsDuration(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	steps := []Step{
+		newFailStep(types.StepReview, fmt.Errorf("review crashed")),
+	}
+
+	exec := NewExecutor(database, p, nil, nil, steps, nil)
+
+	err := exec.Execute(context.Background(), run, repo, workDir)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	// Failed step should still have duration_ms recorded.
+	dbSteps, _ := database.GetStepsByRun(run.ID)
+	if dbSteps[0].DurationMS == nil {
+		t.Error("expected failed step to have duration_ms recorded, got nil")
+	}
+}
+
+func TestExecutor_EmptySteps(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	exec := NewExecutor(database, p, nil, nil, nil, nil)
+
+	err := exec.Execute(context.Background(), run, repo, workDir)
+	if err != nil {
+		t.Fatalf("expected no error for empty steps, got: %v", err)
+	}
+
+	updated, _ := database.GetRun(run.ID)
+	if updated.Status != types.RunCompleted {
+		t.Errorf("expected run status %q, got %q", types.RunCompleted, updated.Status)
+	}
+}
+
+func TestExecutor_StepResultUsesDurationOverride(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	step := &mockStep{
+		name: types.StepReview,
+		outcome: &StepOutcome{
+			ExitCode:           0,
+			DurationOverrideMS: 45000,
+		},
+	}
+
+	exec := NewExecutor(database, p, nil, nil, []Step{step}, nil)
+	exec.Execute(context.Background(), run, repo, workDir)
+
+	dbSteps, _ := database.GetStepsByRun(run.ID)
+	if len(dbSteps) != 1 {
+		t.Fatalf("expected 1 step, got %d", len(dbSteps))
+	}
+	if dbSteps[0].DurationMS == nil {
+		t.Fatal("expected duration_ms to be set")
+	}
+	if got := *dbSteps[0].DurationMS; got != 45000 {
+		t.Fatalf("duration_ms = %d, want %d", got, 45000)
+	}
+}
+
+func TestExecutor_StepOutcomePRURL_EmitsRunUpdated(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	prURL := "https://github.com/test/repo/pull/99"
+	prStep := &mockStep{
+		name:    types.StepPR,
+		outcome: &StepOutcome{ExitCode: 0, PRURL: prURL},
+	}
+	steps := []Step{newPassStep(types.StepReview), prStep}
+
+	exec := NewExecutor(database, p, nil, nil, steps, nil)
+	events := collectEvents(exec)
+
+	err := exec.Execute(context.Background(), run, repo, workDir)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Should have a run_updated event with the PRURL after the PR step.
+	found := false
+	for _, e := range events.all() {
+		if e.Type == ipc.EventRunUpdated && e.PRURL != nil && *e.PRURL == prURL {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected a run_updated event with PRURL after PR step")
+	}
+
+	// The run_completed event should also carry the PRURL.
+	completedEvent := events.findRunEvent(ipc.EventRunCompleted)
+	if completedEvent == nil {
+		t.Fatal("expected run_completed event")
+	}
+	if completedEvent.PRURL == nil || *completedEvent.PRURL != prURL {
+		t.Errorf("expected run_completed PRURL %q, got %v", prURL, completedEvent.PRURL)
+	}
+}
+
+func TestExecutor_SkippedOutcome_EmitsSkippedEvent(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	step := &mockStep{
+		name:    types.StepPR,
+		outcome: &StepOutcome{Skipped: true},
+	}
+
+	exec := NewExecutor(database, p, nil, nil, []Step{step}, nil)
+	events := collectEvents(exec)
+
+	if err := exec.Execute(context.Background(), run, repo, workDir); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	event := events.find(ipc.EventStepCompleted, types.StepPR)
+	if event == nil {
+		t.Fatal("expected step_completed event")
+	}
+	if event.Status == nil || *event.Status != string(types.StepStatusSkipped) {
+		got := "<nil>"
+		if event.Status != nil {
+			got = *event.Status
+		}
+		t.Fatalf("expected skipped event status, got %q", got)
+	}
+}
+
+func TestExecutor_ConfiguredSkippedStepDoesNotExecuteAndContinues(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	review := newPassStep(types.StepReview)
+	testStep := newPassStep(types.StepTest)
+	exec := NewExecutor(database, p, nil, nil, []Step{review, testStep}, nil)
+	exec.SetSkippedSteps([]types.StepName{types.StepReview})
+	events := collectEvents(exec)
+
+	if err := exec.Execute(context.Background(), run, repo, workDir); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := review.callCount(); got != 0 {
+		t.Fatalf("skipped step executed %d times, want 0", got)
+	}
+	if got := testStep.callCount(); got != 1 {
+		t.Fatalf("next step executed %d times, want 1", got)
+	}
+	if event := events.find(ipc.EventStepStarted, types.StepReview); event != nil {
+		t.Fatal("configured skipped step should not emit step_started")
+	}
+	event := events.find(ipc.EventStepCompleted, types.StepReview)
+	if event == nil || event.Status == nil || *event.Status != string(types.StepStatusSkipped) {
+		t.Fatalf("expected skipped completion event, got %+v", event)
+	}
+
+	steps, err := database.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range steps {
+		if step.StepName == types.StepReview && step.Status != types.StepStatusSkipped {
+			t.Fatalf("review status = %s, want %s", step.Status, types.StepStatusSkipped)
+		}
+	}
+}
+
+func TestExecutor_SkippedPRStepWithClosingIssueRefsFails(t *testing.T) {
+	for _, refs := range [][]string{nil, {"95"}} {
+		t.Run(fmt.Sprintf("closes=%v", refs), func(t *testing.T) {
+			database, p, run, repo := setupTest(t)
+			if refs != nil {
+				if err := database.UpdateRunClosingIssueRefs(run.ID, refs); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pr := newPassStep(types.StepPR)
+			exec := NewExecutor(database, p, nil, nil, []Step{pr}, nil)
+			exec.SetSkippedSteps([]types.StepName{types.StepPR})
+
+			err := exec.Execute(context.Background(), run, repo, t.TempDir())
+			if got := pr.callCount(); got != 0 {
+				t.Fatalf("skipped PR step executed %d times, want 0", got)
+			}
+			steps, stepsErr := database.GetStepsByRun(run.ID)
+			if stepsErr != nil || len(steps) != 1 {
+				t.Fatalf("steps = %+v, err = %v", steps, stepsErr)
+			}
+			if refs == nil {
+				if err != nil || steps[0].Status != types.StepStatusSkipped {
+					t.Fatalf("err = %v, status = %s; want skipped", err, steps[0].Status)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "--closes requires publishing a pull request") {
+				t.Fatalf("err = %v; want --closes refusal", err)
+			}
+			if steps[0].Status != types.StepStatusFailed {
+				t.Fatalf("status = %s, want %s", steps[0].Status, types.StepStatusFailed)
+			}
+			if err := database.UpdateRunClosingIssueRefs(run.ID, []string{"95", "96"}); err == nil {
+				t.Fatal("reattach after the skipped PR step must be refused")
+			}
+		})
+	}
+}
+
+func TestExecutor_SkipRemainingPastPRStepWithClosingIssueRefsFails(t *testing.T) {
+	for _, refs := range [][]string{nil, {"95"}} {
+		t.Run(fmt.Sprintf("closes=%v", refs), func(t *testing.T) {
+			database, p, run, repo := setupTest(t)
+			if refs != nil {
+				if err := database.UpdateRunClosingIssueRefs(run.ID, refs); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rebase := &mockStep{name: types.StepRebase, outcome: &StepOutcome{ExitCode: 0, SkipRemaining: true}}
+			pr := newPassStep(types.StepPR)
+			exec := NewExecutor(database, p, nil, nil, []Step{rebase, pr}, nil)
+
+			err := exec.Execute(context.Background(), run, repo, t.TempDir())
+			if got := pr.callCount(); got != 0 {
+				t.Fatalf("PR step executed %d times, want 0", got)
+			}
+			steps, stepsErr := database.GetStepsByRun(run.ID)
+			if stepsErr != nil || len(steps) != 2 {
+				t.Fatalf("steps = %+v, err = %v", steps, stepsErr)
+			}
+			if refs == nil {
+				if err != nil || steps[1].Status != types.StepStatusSkipped {
+					t.Fatalf("err = %v, status = %s; want skipped", err, steps[1].Status)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "--closes requires publishing a pull request") {
+				t.Fatalf("err = %v; want --closes refusal", err)
+			}
+			if steps[1].Status != types.StepStatusFailed {
+				t.Fatalf("status = %s, want %s", steps[1].Status, types.StepStatusFailed)
+			}
+		})
+	}
+}
