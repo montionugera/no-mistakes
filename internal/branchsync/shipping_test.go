@@ -1,8 +1,10 @@
 package branchsync
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -53,5 +55,38 @@ func TestImmutableSourceRefreshRefusesMovedTarget(t *testing.T) {
 	state := f.service.Refresh(f.ctx)
 	if state.State != StateTargetChanged || state.Safety != "immutable_source_moved" {
 		t.Fatalf("moved target refresh state = %+v", state)
+	}
+}
+
+func TestImmutableSourceRefreshBoundsSourceAndTargetReads(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ref  string
+	}{
+		{name: "source", ref: "refs/heads/feature/sync"},
+		{name: "target", ref: "refs/heads/main"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSyncFixture(t)
+			if _, err := f.db.InsertRunWithShipping(f.repo.ID, "feature/sync", f.pushed, f.base, nil, "", "", "", "main", false, nil, &types.ShippingOptions{
+				Mode: types.ShippingImmutableSource, TargetBranch: "main", TargetSHA: f.base,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			f.service.RemoteTimeout = 40 * time.Millisecond
+			var deadline time.Time
+			f.service.lsRemote = func(ctx context.Context, dir, remote, ref string) (string, error) {
+				if ref == tc.ref {
+					deadline, _ = ctx.Deadline()
+					<-ctx.Done()
+					return "", ctx.Err()
+				}
+				return f.pushed, nil
+			}
+			state := f.service.Refresh(f.ctx)
+			if state.State != StateTargetChanged || deadline.IsZero() {
+				t.Fatalf("bounded immutable refresh = %+v, deadline=%v", state, deadline)
+			}
+		})
 	}
 }
