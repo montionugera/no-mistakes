@@ -293,3 +293,104 @@ func TestExportFullRefusesUnintegratedCurrentTarget(t *testing.T) {
 		t.Fatal("full proof admitted target absent from reviewed head")
 	}
 }
+
+func TestExportNoSurfaceAcknowledgment(t *testing.T) {
+	const evidence = `{"findings":[{"id":"test-1","severity":"warning","action":"ask-user","description":"this change has no live-validatable surface; proceed without live validation? (0 of 1 scenarios were driven live against the product); documentation: Markdown has no running product surface"}],"verdict":"no-surface","scenarios":[{"name":"documentation","result":"untested","live":false,"reason":"Markdown has no running product surface"}]}`
+	for _, reason := range []string{"", "Documentation correctness confirmed"} {
+		for _, kind := range []string{"genuine", "unacknowledged", "no-go", "inconclusive", "live", "pass", "fail", "empty", "missing-reason", "missing-finding", "lookalike", "unrelated", "budget", "command-finding", "command-exit", "override", "malformed"} {
+			t.Run(kind+"/"+reason, func(t *testing.T) {
+				f := newExportFixture(t)
+				rows, err := f.database.GetStepsByRun(f.run.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				sr := rows[3]
+				findings, err := types.ParseFindingsJSON(evidence)
+				if err != nil {
+					t.Fatal(err)
+				}
+				exit := 0
+				switch kind {
+				case "no-go":
+					findings.Verdict = types.TestVerdictNoGo
+					findings.Items = nil
+				case "inconclusive":
+					findings.Verdict = types.TestVerdictInconclusive
+					findings.Items = nil
+				case "live":
+					findings.Scenarios[0].Live = true
+				case "pass":
+					findings.Scenarios[0].Result = types.ScenarioResultPass
+				case "fail":
+					findings.Scenarios[0].Result = types.ScenarioResultFail
+				case "empty":
+					findings.Scenarios = nil
+				case "missing-reason":
+					findings.Scenarios[0].Reason = ""
+				case "missing-finding":
+					findings.Items = nil
+				case "lookalike":
+					findings.Items[0].Source = types.FindingSourceUser
+				case "unrelated":
+					findings.Items = append(findings.Items, types.Finding{ID: "other", Severity: "error", Action: "ask-user", Description: "Unresolved defect"})
+				case "budget":
+					findings.Items = append(findings.Items, types.Finding{ID: types.FindingIDTestAgentTimeout, Severity: "warning", Action: "no-op", Description: "Invocation cut"})
+				case "command-finding":
+					findings.Items = append(findings.Items, types.Finding{ID: "command", Severity: "error", Category: types.FindingCategoryTestCommand, Action: "no-op", Description: "Failed command"})
+				case "command-exit":
+					exit = 1
+				}
+				raw, err := types.MarshalFindingsJSON(findings)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if kind == "malformed" {
+					raw = "{"
+				}
+				if err := f.database.ParkStepForApproval(f.run.ID, sr.ID, types.StepStatusAwaitingApproval, exit, 1, &raw); err != nil {
+					t.Fatal(err)
+				}
+				if kind != "unacknowledged" {
+					if err := f.database.SetTestApprovalReason(sr.ID, reason); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if kind == "override" {
+					if err := f.database.SetStepOverrideReason(sr.ID, "Recorded override"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := f.database.CompleteStep(sr.ID, exit, 1, ""); err != nil {
+					t.Fatal(err)
+				}
+				exported, err := Export(context.Background(), f.database, f.repo, f.run.ID, "review", f.forge)
+				if kind != "genuine" {
+					if err == nil {
+						t.Fatal("invalid Test completion received a strict receipt")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("acknowledged no-surface refused receipt: %v", err)
+				}
+				var payload Payload
+				if err := json.Unmarshal(exported, &payload); err != nil {
+					t.Fatal(err)
+				}
+				if payload.Steps[3].Status != "completed" || payload.Steps[3].Execution != "performed" {
+					t.Fatalf("Test misrepresented in receipt: %+v", payload.Steps[3])
+				}
+				got, err := f.database.GetStepResult(sr.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.ApprovalReason == nil || *got.ApprovalReason != reason || got.FindingsJSON == nil || *got.FindingsJSON != raw {
+					t.Fatalf("receipt export changed acknowledgment evidence: %+v", got)
+				}
+				if _, err := Export(context.Background(), f.database, f.repo, f.run.ID, "ci-ready", f.forge); err == nil {
+					t.Fatal("Test acknowledgment waived required hosted CI")
+				}
+			})
+		}
+	}
+}

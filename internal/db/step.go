@@ -477,3 +477,43 @@ func (d *DB) ClearStepFindings(id string) error {
 	}
 	return nil
 }
+
+func (s *StepResult) NoSurfaceTestAcknowledgmentEligible() bool {
+	if s.StepName != types.StepTest || s.ExitCode == nil || *s.ExitCode != 0 || s.OverrideReason != nil || s.SkipReason != nil || s.FindingsJSON == nil {
+		return false
+	}
+	findings, err := types.ParseFindingsJSON(*s.FindingsJSON)
+	return err == nil && types.IsNoSurfaceTestAcknowledgment(findings)
+}
+
+func (s *StepResult) StrictApprovalRefusal(reason string) string {
+	if s.StepName == types.StepReview {
+		return "strict Review requires a complete independent review; fix or rerun the review"
+	}
+	if s.ExitCode != nil && *s.ExitCode != 0 {
+		return "strict shipping forbids passing command overrides"
+	}
+	if s.OverrideReason != nil || s.SkipReason != nil {
+		return "strict shipping forbids recorded overrides or skips"
+	}
+	if s.NoSurfaceTestAcknowledgmentEligible() {
+		return ""
+	}
+	if reason != "" || s.ApprovalReason != nil {
+		return "strict shipping forbids Test exceptions"
+	}
+	if s.FindingsJSON != nil {
+		findings, err := types.ParseFindingsJSON(*s.FindingsJSON)
+		if s.StepName == types.StepTest {
+			for _, item := range findings.Items {
+				if item.ID == types.FindingIDTestAgentTimeout || item.ID == types.FindingIDTestAgentUnvalidatedWork || item.Category == types.FindingCategoryTestCommand {
+					return "strict shipping forbids Test exceptions"
+				}
+			}
+		}
+		if err != nil || types.HasActionableFindings(findings) || s.StepName == types.StepTest && (findings.Verdict == types.TestVerdictNoSurface || findings.Verdict == types.TestVerdictNoGo || findings.Verdict == types.TestVerdictInconclusive) {
+			return "strict shipping cannot approve unresolved actionable findings"
+		}
+	}
+	return ""
+}

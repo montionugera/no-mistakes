@@ -239,6 +239,17 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 			return RespondDispositions{}, fmt.Errorf("immutable source forbids repairs")
 		}
 	}
+	if action == types.ActionApprove && e.waitingShipping != nil {
+		row, err := e.db.GetStepResult(e.waitingStepResultID)
+		if err != nil || row == nil {
+			e.mu.Unlock()
+			return RespondDispositions{}, fmt.Errorf("strict shipping cannot read the parked step")
+		}
+		if refusal := row.StrictApprovalRefusal(approvalReason); refusal != "" {
+			e.mu.Unlock()
+			return RespondDispositions{}, errors.New(refusal)
+		}
+	}
 	if action == types.ActionApprove && e.waitingApprovalRefusal != "" {
 		refusal := e.waitingApprovalRefusal
 		e.mu.Unlock()
@@ -671,7 +682,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	e.waiting = true
 	e.waitingStep = gate.step.Name()
 	e.waitingShipping = run.Shipping
-	e.waitingApprovalRefusal = shippingApprovalRefusal(run, gate.step.Name(), gate.findings, recoveredExitCode(gate.stepResult))
+	e.waitingApprovalRefusal = approvalRefusal(gate.step.Name(), gate.findings)
 	e.waitingFindings = gate.findings
 	e.waitingStepResultID = gate.stepResult.ID
 	e.waitingRoundID = gate.lastRoundID
@@ -1556,7 +1567,7 @@ rounds:
 			e.waiting = true
 			e.waitingStep = stepName
 			e.waitingShipping = run.Shipping
-			e.waitingApprovalRefusal = shippingApprovalRefusal(run, stepName, effectiveFindings, finalExitCode)
+			e.waitingApprovalRefusal = approvalRefusal(stepName, effectiveFindings)
 			e.waitingFindings = effectiveFindings
 			e.waitingStepResultID = sr.ID
 			e.waitingRoundID = currentRoundID
@@ -1797,6 +1808,9 @@ func (e *Executor) applyApprovalOverride(step Step, sctx *StepContext, stepResul
 	}
 	if unresolved == "" {
 		return nil
+	}
+	if sctx.Run.Shipping != nil {
+		return fmt.Errorf("strict shipping forbids approval overrides: %s", unresolved)
 	}
 	if dbErr := e.db.SetStepOverrideReason(stepResultID, unresolved); dbErr != nil {
 		return fmt.Errorf("record approval override reason for step %s: %w", step.Name(), dbErr)
@@ -2618,20 +2632,4 @@ func normalizeFixSelection(gate string, response approvalResponse, review bool) 
 		persisted = remapFindingIDsJSON(outstanding, merged)
 	}
 	return
-}
-
-func shippingApprovalRefusal(run *db.Run, step types.StepName, findings string, exitCode int) string {
-	if run.Shipping != nil {
-		if step == types.StepReview {
-			return "strict Review requires a complete independent review; fix or rerun the review"
-		}
-		if exitCode != 0 {
-			return "strict shipping forbids passing command overrides"
-		}
-		parsed, err := types.ParseFindingsJSON(findings)
-		if err != nil || types.HasActionableFindings(parsed) {
-			return "strict shipping cannot approve unresolved actionable findings"
-		}
-	}
-	return approvalRefusal(step, findings)
 }

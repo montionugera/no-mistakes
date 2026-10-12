@@ -655,3 +655,58 @@ func (f Finding) ActionOrDefault() string {
 	}
 	return f.Action
 }
+
+func NoSurfaceTestFinding(scenarios []TestScenario) Finding {
+	live, total := LiveScenarioCounts(scenarios)
+	var parts []string
+	for _, scenario := range scenarios {
+		if scenario.Result != ScenarioResultUntested {
+			continue
+		}
+		name, reason := strings.TrimSpace(scenario.Name), strings.TrimSpace(scenario.Reason)
+		switch {
+		case name != "" && reason != "":
+			parts = append(parts, name+": "+reason)
+		case name != "":
+			parts = append(parts, name)
+		case reason != "":
+			parts = append(parts, reason)
+		}
+	}
+	suffix := ""
+	if len(parts) > 0 {
+		suffix = "; " + strings.Join(parts, "; ")
+	}
+	return Finding{
+		Severity:    FindingSeverityWarning,
+		Action:      ActionAskUser,
+		Description: fmt.Sprintf("this change has no live-validatable surface; proceed without live validation? (%d of %d scenarios were driven live against the product)%s", live, total, suffix),
+	}
+}
+
+func IsNoSurfaceTestAcknowledgment(findings Findings) bool {
+	if findings.Verdict != TestVerdictNoSurface || !NoLiveExercisableScenarios(findings.Scenarios) || findings.UnvalidatedSinceSHA != "" {
+		return false
+	}
+	for _, scenario := range findings.Scenarios {
+		if strings.TrimSpace(scenario.Name) == "" || strings.TrimSpace(scenario.Reason) == "" {
+			return false
+		}
+	}
+	want := NoSurfaceTestFinding(findings.Scenarios)
+	count := 0
+	for _, item := range findings.Items {
+		if item.ID == FindingIDTestAgentTimeout || item.ID == FindingIDTestAgentUnvalidatedWork || item.Category == FindingCategoryTestCommand {
+			return false
+		}
+		if item.ActionOrDefault() == ActionNoOp {
+			continue
+		}
+		item.ID = ""
+		if item != want {
+			return false
+		}
+		count++
+	}
+	return count == 1
+}

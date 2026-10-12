@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -2088,30 +2089,14 @@ func (m *RunManager) HandleRespondWithOverrides(runID string, step types.StepNam
 			return pipeline.RespondDispositions{}, fmt.Errorf("immutable source forbids repairs")
 		}
 		if action == types.ActionApprove {
-			if step == types.StepReview {
-				return pipeline.RespondDispositions{}, fmt.Errorf("strict Review requires a complete independent review; fix or rerun the review")
-			}
-			if approvalReason != "" {
-				return pipeline.RespondDispositions{}, fmt.Errorf("strict shipping forbids Test exceptions")
-			}
 			rows, err := m.db.GetStepsByRun(runID)
 			if err != nil {
 				return pipeline.RespondDispositions{}, err
 			}
 			for _, row := range rows {
-				if row.StepName != step {
-					continue
-				}
-				if row.ExitCode != nil && *row.ExitCode != 0 {
-					return pipeline.RespondDispositions{}, fmt.Errorf("strict shipping forbids passing command overrides")
-				}
-				if row.OverrideReason != nil {
-					return pipeline.RespondDispositions{}, fmt.Errorf("strict shipping forbids recorded overrides")
-				}
-				if row.FindingsJSON != nil {
-					f, err := types.ParseFindingsJSON(*row.FindingsJSON)
-					if err != nil || types.HasActionableFindings(f) {
-						return pipeline.RespondDispositions{}, fmt.Errorf("strict shipping cannot approve unresolved actionable findings")
+				if row.StepName == step {
+					if refusal := row.StrictApprovalRefusal(approvalReason); refusal != "" {
+						return pipeline.RespondDispositions{}, errors.New(refusal)
 					}
 				}
 			}

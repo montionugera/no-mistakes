@@ -272,7 +272,8 @@ func durablePayload(database *db.DB, runID, phase string) (Payload, error) {
 		if row.StepName == types.StepCI {
 			want = types.StepStatusRunning
 		}
-		if row.StepName != sequence[i] || row.Status != want || row.SkipReason != nil || row.OverrideReason != nil || row.ApprovalReason != nil || row.ExitCode != nil && *row.ExitCode != 0 {
+		noSurfaceAcknowledged := row.ApprovalReason != nil && row.NoSurfaceTestAcknowledgmentEligible()
+		if row.StepName != sequence[i] || row.Status != want || row.StepName == types.StepTest && row.StrictApprovalRefusal("") != "" || row.SkipReason != nil || row.OverrideReason != nil || row.ApprovalReason != nil && !noSurfaceAcknowledged || row.ExitCode != nil && *row.ExitCode != 0 {
 			return p, fmt.Errorf("shipping step is incomplete, skipped, or overridden: %s", row.StepName)
 		}
 		execution := "performed"
@@ -285,7 +286,10 @@ func durablePayload(database *db.DB, runID, phase string) (Payload, error) {
 			if err != nil {
 				return p, fmt.Errorf("invalid durable shipping findings")
 			}
-			if types.HasActionableFindings(findings) {
+			if row.StepName == types.StepTest && findings.Verdict == types.TestVerdictNoSurface && !noSurfaceAcknowledged {
+				return p, fmt.Errorf("shipping no-surface Test lacks a valid acknowledgment")
+			}
+			if types.HasActionableFindings(findings) && !noSurfaceAcknowledged {
 				return p, fmt.Errorf("shipping findings remain actionable: %s", row.StepName)
 			}
 			if row.StepName == types.StepReview {
