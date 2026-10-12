@@ -1,8 +1,8 @@
 name: Nix flake
 
 # A path-filtered PR run is safe here: this workflow backs no required check,
-# and the filter omits every release-please output, so release PRs create no
-# run. The push trigger covers what the filter misses after merge.
+# and the filter omits the retained upstream release-please outputs.
+# The push trigger covers what the filter misses after merge.
 on:
   pull_request:
     branches:
@@ -29,7 +29,8 @@ concurrency:
 
 jobs:
   nix:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, king-server, no-mistakes]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6

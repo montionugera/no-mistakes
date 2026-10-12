@@ -23,9 +23,13 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, king-server, no-mistakes]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - if: github.event_name != 'pull_request'
         uses: actions/configure-pages@v5
       - uses: actions/setup-node@v4
@@ -44,8 +48,11 @@ jobs:
 
   deploy:
     needs: build
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Linux, X64, king-server, no-mistakes]
+    timeout-minutes: 15
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

@@ -110,7 +110,9 @@ func TestNoMistakesRequiredWorkflowExemptsReleaseAutomation(t *testing.T) {
 		{login: "unlisted-automation[bot]", wantRun: true},
 	} {
 		t.Run(tc.login, func(t *testing.T) {
-			got, err := evaluateRequiredWorkflowAuthorCondition(condition, tc.login)
+			got, err := evaluateWorkflowCondition(condition, workflowConditionContext{
+				EventName: "pull_request", Repository: "owner/repo", HeadRepo: "owner/repo", Author: tc.login,
+			})
 			if err != nil {
 				t.Fatalf("evaluate check job condition: %v", err)
 			}
@@ -119,24 +121,6 @@ func TestNoMistakesRequiredWorkflowExemptsReleaseAutomation(t *testing.T) {
 			}
 		})
 	}
-}
-
-func evaluateRequiredWorkflowAuthorCondition(condition, author string) (bool, error) {
-	terms := strings.Split(condition, "&&")
-	if len(terms) == 0 {
-		return false, fmt.Errorf("empty author condition")
-	}
-	termPattern := regexp.MustCompile(`^github\.event\.pull_request\.user\.login\s*!=\s*'([^']+)'$`)
-	for _, term := range terms {
-		matches := termPattern.FindStringSubmatch(strings.TrimSpace(term))
-		if matches == nil {
-			return false, fmt.Errorf("unsupported author condition term %q", strings.TrimSpace(term))
-		}
-		if author == matches[1] {
-			return false, nil
-		}
-	}
-	return true, nil
 }
 
 // TestNoMistakesRequiredWorkflowTriggersOnRelevantPREvents ensures the check
@@ -622,4 +606,14 @@ func renderRequiredWorkflowTemplate(t *testing.T, template string, event require
 		t.Fatalf("fixture cannot evaluate workflow expression in %q", template)
 	}
 	return strings.Join(strings.Fields(template), " ")
+}
+
+// TestNoMistakesRequiredWorkflowRefusesForkCodeBeforeSelfHostedAdmission pins
+// the same-repository admission the self-hosted runner needs: an external fork
+// PR never reaches the runner, whatever its author.
+func TestNoMistakesRequiredWorkflowRefusesForkCodeBeforeSelfHostedAdmission(t *testing.T) {
+	condition := loadRequiredWorkflow(t).Jobs["check"].If
+	if err := workflowAdmissionError(condition); err != nil {
+		t.Fatal(err)
+	}
 }

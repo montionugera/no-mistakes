@@ -54,7 +54,7 @@ Safest local verification sequence after non-trivial changes:
 - `runs.awaiting_agent_since` is set exactly while a gate is parked. Owner: `.agents/skills/pipeline-review-and-agents/SKILL.md`.
 - The daemon's effective environment comes from the login-shell probe at startup, never from the service definition's bootstrap `PATH`; only a missing shell binary is waited for, and only at startup. The probe runs in its own session (Setsid); do not fold it into `ConfigureShellCommand` (Setpgid and Setsid cannot be combined). Owner: `daemon-runtime` skill.
 - Telemetry: read-only surfaces (`axi` home/status/logs, `status`, `runs`) emit no remote telemetry. Performance detail stays local; prompts, outputs, diffs, and raw command arguments are never stored (`TestAgentInvocations_PrivacySafeShape`), and run IDs, paths, and session identities are never sent remotely; a not-reported metric is stored as NULL, never a fabricated zero. Owner: `reference/environment.md`.
-- `no-mistakes update` reads only `channels.json` from the release-asset CDN, never `api.github.com`, and `release.yml` must call the channel publisher after `finalize`. Owner: `release-signing` skill.
+- `no-mistakes update` reads only `channels.json` from the release-asset CDN, never `api.github.com`. This fork has no release or channel-publishing workflow, and every workflow job runs only on the self-hosted king-server runner (`TestEveryWorkflowJobRunsOnTheKingServer`); never reintroduce a hosted runner. Owner: `release-signing` skill, `docs/src/content/docs/guides/fork-ci.md`.
 - The retired `jev` config key stays a parse-only tombstone; do not repurpose it.
 
 ## Test and CI conventions
