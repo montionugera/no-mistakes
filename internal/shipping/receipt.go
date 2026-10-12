@@ -304,7 +304,7 @@ func durablePayload(database *db.DB, runID, phase string) (Payload, error) {
 		}
 	}
 	findingBytes, _ := json.Marshal(reviewFindings)
-	p = Payload{SchemaVersion: 1, RunID: runID, Phase: phase, SourceRepo: c.SourceRepo, SourceBranch: c.SourceBranch, SubmittedHeadSHA: *r.SubmittedHeadSHA, LocalHeadSHA: r.HeadSHA, ForgeHeadSHA: r.HeadSHA, PRURL: *r.PRURL, TargetBranch: c.TargetBranch, TargetSHA: c.TargetSHA, MergeBaseSHA: c.MergeBaseSHA, DiffDigest: c.DiffDigest, Generation: c.Generation, IntentDigest: Digest([]byte(*r.Intent)), ShippingMode: r.Shipping.Mode, Review: Review{"completed", r.HeadSHA, Digest(findingBytes), reviewFindings}, Steps: proofSteps}
+	p = Payload{SchemaVersion: 1, RunID: runID, Phase: phase, SourceRepo: c.SourceRepo, SourceBranch: c.SourceBranch, SubmittedHeadSHA: *r.SubmittedHeadSHA, LocalHeadSHA: r.HeadSHA, ForgeHeadSHA: r.HeadSHA, PRURL: *r.PRURL, TargetBranch: c.TargetBranch, TargetSHA: c.TargetSHA, MergeBaseSHA: c.MergeBaseSHA, DiffDigest: c.DiffDigest, Generation: c.Generation, IntentDigest: Digest([]byte(*r.Intent)), ShippingMode: r.Shipping.Mode, Draft: p.Draft, Review: Review{"completed", r.HeadSHA, Digest(findingBytes), reviewFindings}, Steps: proofSteps}
 	return p, nil
 }
 
