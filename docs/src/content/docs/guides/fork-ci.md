@@ -35,8 +35,8 @@ head. A local POSIX-shell run does not establish Git for Windows coverage.
 The runner needs Git, Make, a C compiler with libc development headers (for
 the race detector), and the `sqlite3` CLI used by the Pi-profile journeys.
 Administrators install these dependencies; the runner account does not gain
-sudo access. The 104-journey end-to-end package has a 25-minute deadline inside
-the 30-minute job bound. Each run retains the temporary-daemon inventory and
+sudo access. The default end-to-end package deadline is 40 minutes inside
+the 45-minute job bound. Each run retains the temporary-daemon inventory and
 cleanup trap.
 
 ## Required execution policy

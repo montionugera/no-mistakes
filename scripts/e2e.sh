@@ -61,9 +61,11 @@ if [[ "$#" -eq 0 ]]; then
   # The user-journey matrix runs native backends serially because each case
   # owns process-wide environment. The combined fork/upstream suite has 104
   # journeys; king-server reached journey 67 while still advancing at 720s.
-  # Keep the package deadline inside the 30m CI job bound and allow the full
+  # Keep the package deadline inside the 45m CI job bound and allow the full
   # serial journey matrix to finish, including the fork's Pi/Omp coverage.
-  set -- -tags=e2e -count=1 -timeout 1500s ./internal/e2e/... ./internal/pipeline/steps/...
+  # The matrix takes ~30m locally and hit the old 25m deadline in its last
+  # journeys on CI.
+  set -- -tags=e2e -count=1 -timeout 2400s ./internal/e2e/... ./internal/pipeline/steps/...
 fi
 
 go test "$@"
