@@ -30,6 +30,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 	"github.com/kunchenguid/no-mistakes/internal/verificationplan"
+	"github.com/oklog/ulid/v2"
 	"github.com/spf13/cobra"
 )
 
@@ -138,6 +139,8 @@ func outcomeForRun(rv runView) string {
 }
 
 func newAxiRunCmd() *cobra.Command {
+	var shippingMode string
+	var shippingDraft bool
 	var autoYes bool
 	var skipValue string
 	var intent, intentFile string
@@ -231,11 +234,26 @@ func newAxiRunCmd() *cobra.Command {
 				if err != nil {
 					return emitError(cmd, 2, err.Error())
 				}
+				if shippingMode != "" || cmd.Flags().Changed("draft") {
+					s := &types.ShippingOptions{Mode: shippingMode}
+					if cmd.Flags().Changed("draft") {
+						s.Draft = &shippingDraft
+					}
+					if err := s.Validate(); err != nil {
+						return emitError(cmd, 2, err.Error())
+					}
+					if len(skipSteps) > 0 {
+						return emitError(cmd, 2, "strict shipping forbids skipped steps")
+					}
+					cmd.SetContext(types.WithShippingOptions(cmd.Context(), s))
+				}
 				return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, resolvedIntent, baseBranch, noPublishIntent, launchNonce, validationGeneration, wait, profile)
 			})
 		},
 	}
 	cmd.Flags().BoolVarP(&autoYes, "yes", "y", false, "auto-resolve eligible gates (fix findings, then accept) until a decision point or outcome; protected-path and Test unvalidated-work refusals require an explicit response, and an open review question requires `axi answer`")
+	cmd.Flags().StringVar(&shippingMode, "shipping-mode", "", "strict shipping mode: full or immutable-source")
+	cmd.Flags().BoolVar(&shippingDraft, "draft", false, "pin draft PR creation for a strict shipping run; explicit false is supported")
 	cmd.Flags().StringVar(&skipValue, "skip", "", "comma-separated pipeline steps to skip")
 	cmd.Flags().StringVar(&intent, "intent", "", "what the user set out to accomplish; '-' reads stdin to EOF (exclusive with --intent-file)")
 	cmd.Flags().StringVar(&intentFile, "intent-file", "", "read intent from this file, relative to the current directory (exclusive with --intent)")
@@ -306,6 +324,13 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 	if err := requireDaemonHonorsClosingIssueRefs(env.client, closesIssues); err != nil {
 		return emitError(cmd, 2, err.Error())
 	}
+	shipping := types.ShippingFromContext(ctx)
+	if shipping != nil {
+		var result ipc.ProbeOmitIntentResult
+		if err := env.client.Call(ipc.MethodProbeShipping, nil, &result); err != nil || !result.OK {
+			return emitError(cmd, 2, "running daemon does not support strict shipping")
+		}
+	}
 
 	branch, err := git.CurrentBranch(ctx, ".")
 	if err != nil {
@@ -333,7 +358,7 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		if strings.TrimSpace(validationGeneration) == "" {
 			return emitError(cmd, 2, "--validation-generation is required with --launch-nonce")
 		}
-		receipt, err := claimLaunchReceipt(env.client, env.repo.ID, branch, launchNonce, headSHA, validationGeneration, digestLaunchIntent(intent), baseBranch, omitIntent, profile)
+		receipt, err := claimShippingLaunchReceipt(types.ShippingFromContext(ctx), env.client, env.repo.ID, branch, launchNonce, headSHA, validationGeneration, digestLaunchIntent(intent), baseBranch, omitIntent, profile)
 		if err != nil {
 			return emitError(cmd, 1, fmt.Sprintf("claim launch receipt: %v", err))
 		}
@@ -353,6 +378,9 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 			return emitError(cmd, 1, fmt.Sprintf("get active run: %v", err))
 		}
 		if active != nil {
+			if !active.Shipping.Matches(shipping) {
+				return emitError(cmd, 2, "active run has a different shipping pin")
+			}
 			if !active.PiProfile.Matches(profile) {
 				return emitError(cmd, 2, "active run has a different Pi profile; omit --model/--effort to reattach")
 			}
@@ -371,6 +399,10 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		return emitError(cmd, 2, "--verification-plan is accepted only when starting a new run; omit it to reattach")
 	}
 	if runID == "" {
+		if shipping != nil && launchNonce == "" {
+			launchNonce = ulid.Make().String()
+			validationGeneration = "shipping-" + ulid.Make().String()
+		}
 		if err := configErrorForFreshAxiRun(env, runID); err != nil {
 			return emitError(cmd, 1, err.Error(), repoInitHelp(err)...)
 		}
@@ -401,7 +433,19 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		// silent auto-branching/auto-committing. The gate validates committed
 		// history, so a wrong branch or uncommitted work would otherwise be
 		// validated incorrectly or not at all.
-		if guard := preflightGuard(ctx, env, branch); guard != nil {
+		var guard func(*cobra.Command) error
+		if shipping != nil && shipping.Mode == types.ShippingImmutableSource {
+			dirty, err := git.Run(ctx, ".", "status", "--porcelain")
+			if err != nil {
+				return emitError(cmd, 1, fmt.Sprintf("check immutable source checkout: %v", err))
+			}
+			if strings.TrimSpace(dirty) != "" {
+				return emitError(cmd, 1, "immutable source requires a clean checkout")
+			}
+		} else {
+			guard = preflightGuard(ctx, env, branch)
+		}
+		if guard != nil {
 			return guard(cmd)
 		}
 		planID := ""
@@ -461,6 +505,15 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 			"Retry once the daemon is healthy; the PR will not include --closes unless this update succeeds.")
 	}
 
+	if shipping != nil {
+		selected, err := getRunInfo(driveCtx, env.p.Socket(), runID)
+		if err != nil {
+			return err
+		}
+		if selected == nil || !selected.Shipping.Matches(shipping) {
+			return emitError(cmd, 2, "selected launch has a conflicting shipping pin")
+		}
+	}
 	run, ciReady, err := driveRun(driveCtx, cmd.ErrOrStderr(), env.client, env.p.Socket(), runID, autoYes)
 	if err != nil {
 		if isAxiWaitElapsed(ctx, driveCtx, err) {
@@ -918,9 +971,13 @@ func (e *staleMirrorError) Summary() string {
 }
 
 func claimLaunchReceipt(client *ipc.Client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, baseBranch string, omitIntent bool, profiles ...*agentcfg.PiProfile) (*ipc.LaunchReceipt, error) {
+	return claimShippingLaunchReceipt(nil, client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, baseBranch, omitIntent, profiles...)
+}
+
+func claimShippingLaunchReceipt(shipping *types.ShippingOptions, client *ipc.Client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, baseBranch string, omitIntent bool, profiles ...*agentcfg.PiProfile) (*ipc.LaunchReceipt, error) {
 	var result ipc.ClaimLaunchReceiptResult
 	if err := client.Call(ipc.MethodClaimLaunchReceipt, &ipc.ClaimLaunchReceiptParams{
-		RepoID: repoID, Branch: branch, LaunchNonce: launchNonce, PiProfile: agentcfg.OptionalPiProfile(profiles),
+		Shipping: shipping, RepoID: repoID, Branch: branch, LaunchNonce: launchNonce, PiProfile: agentcfg.OptionalPiProfile(profiles),
 		SubmittedHeadSHA: submittedHeadSHA, ValidationGeneration: validationGeneration, IntentDigest: intentDigest, PRBaseBranch: baseBranch, OmitIntent: omitIntent,
 	}, &result); err != nil {
 		return nil, err
@@ -936,9 +993,25 @@ func claimLaunchReceipt(client *ipc.Client, repoID, branch, launchNonce, submitt
 // strict launch identity.
 func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent, baseBranch string, omitIntent bool, launchNonce, validationGeneration, planID string, closesIssues []string, profiles ...*agentcfg.PiProfile) (*ipc.LaunchReceipt, error) {
 	profile := agentcfg.OptionalPiProfile(profiles)
+	shipping := types.ShippingFromContext(ctx)
+	if shipping != nil && shipping.Mode == types.ShippingImmutableSource {
+		var result ipc.StartFreshRunResult
+		if err := env.client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
+			RepoID: env.repo.ID, Branch: branch, HeadSHA: headSHA, SkipSteps: skipSteps,
+			Intent: intent, LaunchNonce: launchNonce, ValidationGeneration: validationGeneration,
+			PRBaseBranch: baseBranch, OmitIntent: omitIntent, PiProfile: profile, Shipping: shipping,
+			VerificationPlanID: planID, ClosingIssueRefs: closesIssues,
+		}, &result); err != nil {
+			return nil, err
+		}
+		return &result.Receipt, nil
+	}
 	pushOptions := append(formatSkipPushOptions(skipSteps), formatPiProfilePushOptions(profile)...)
 	pushOptions = append(pushOptions, formatVerificationPlanPushOptions(planID)...)
 	pushOptions = append(pushOptions, formatClosingIssueRefsPushOptions(closesIssues)...)
+	if opt := formatShippingPushOption(shipping); opt != "" {
+		pushOptions = append(pushOptions, opt)
+	}
 	pushOptions = append(pushOptions,
 		formatIntentPushOption(intent),
 		formatLaunchNoncePushOption(launchNonce),
@@ -977,9 +1050,11 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 	}
 	var result ipc.StartFreshRunResult
 	if err := env.client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
-		RepoID: env.repo.ID, Branch: branch, HeadSHA: headSHA, SkipSteps: skipSteps,
-		Intent: intent, LaunchNonce: launchNonce, ValidationGeneration: validationGeneration, PRBaseBranch: baseBranch, OmitIntent: omitIntent, PiProfile: profile, VerificationPlanID: planID,
-		ClosingIssueRefs: closesIssues,
+		Shipping: shipping,
+		RepoID:   env.repo.ID, Branch: branch, HeadSHA: headSHA, SkipSteps: skipSteps,
+		Intent: intent, LaunchNonce: launchNonce, ValidationGeneration: validationGeneration, PRBaseBranch: baseBranch, OmitIntent: omitIntent, PiProfile: profile,
+		VerificationPlanID: planID,
+		ClosingIssueRefs:   closesIssues,
 	}, &result); err != nil {
 		return nil, fmt.Errorf("start fresh run: %w", err)
 	}
@@ -992,7 +1067,7 @@ func waitForLaunchReceipt(ctx context.Context, client *ipc.Client, repoID, branc
 	poll := time.NewTicker(150 * time.Millisecond)
 	defer poll.Stop()
 	for {
-		receipt, err := claimLaunchReceipt(client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, digestLaunchIntent(intent), baseBranch, omitIntent, profiles...)
+		receipt, err := claimShippingLaunchReceipt(types.ShippingFromContext(ctx), client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, digestLaunchIntent(intent), baseBranch, omitIntent, profiles...)
 		if err != nil {
 			return nil, err
 		}
@@ -1224,6 +1299,15 @@ func driveRunScoped(ctx context.Context, progress io.Writer, client *ipc.Client,
 				continue
 			}
 			action, findingIDs := gateResolution(gate, fixedSteps[gate.Name])
+			if run.Shipping != nil {
+				parsed, parseErr := types.ParseFindingsJSON(gate.FindingsJSON)
+				if action == types.ActionApprove && (parseErr != nil || types.HasActionableFindings(parsed)) {
+					return run, false, nil
+				}
+				if action == types.ActionFix && run.Shipping.Mode == types.ShippingImmutableSource {
+					return run, false, nil
+				}
+			}
 			if action == types.ActionFix {
 				fixedSteps[gate.Name] = true
 			}

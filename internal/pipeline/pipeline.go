@@ -56,7 +56,10 @@ type StepContext struct {
 	// the reviewer's own open-question rows (see answerRoundCarriedFindings),
 	// so the finalize turn re-adjudicates by id only findings it made itself.
 	// Empty on every other round type.
-	CarriedFindings  string
+	CarriedFindings string
+	// ScopeFindings contains identity-bound human declines for independent
+	// adjudication, never an automatic waiver or evidence of a code fix.
+	ScopeFindings    string
 	PreviousFindings string // JSON findings selected for the current fix round
 	DeferredFindings string // JSON findings left unselected when the current fix round began
 	// StepResultID is the DB row ID of the current step's step_results record.
@@ -155,10 +158,10 @@ type StepOutcome struct {
 	// ReviewablePaths is the trusted changed-file set this review round can
 	// certify. It is computed from the diff, not supplied by the agent.
 	ReviewablePaths []string
-	// WithdrawnFindings is an answer round's explicit retraction list: the
-	// carried findings the turn says no longer hold, each with the reason it
-	// gave. It is the ONLY way a carried finding leaves the outstanding set on
-	// an answer round, so the reason is the record of why it left.
+	// WithdrawnFindings records explicit independent retractions with reasons.
+	// Answer rounds may retract unselected carried findings; strict review may
+	// adjudicate an identity-bound human scope disposition with full coverage
+	// and an exact comparison. Selected fixes remain subject to verification.
 	WithdrawnFindings []types.WithdrawnFinding
 	ExitCode          int    // process exit code (0 = success)
 	PRURL             string // PR/MR URL if this step created or found one
@@ -175,7 +178,10 @@ type StepOutcome struct {
 	// ReviewApprovedHeadSHA is set only by a successfully executed full review
 	// round. The executor durably records it only when the review step actually
 	// completes, never while that outcome is parked or after a failed round.
-	ReviewApprovedHeadSHA string
+	ReviewApprovedHeadSHA      string
+	ReviewComparisonGeneration int64
+	// MergedHeadSHA is set only after exact CI forge merge verification.
+	MergedHeadSHA string
 
 	// DurationOverrideMS, when positive, replaces the wall-clock duration
 	// reported for this step. Used by demo mode to show realistic durations
@@ -228,9 +234,9 @@ type ApprovalGateResumer interface {
 // failing checks, and the Test step's persisted failing commands.test result).
 // The executor calls it once, synchronously, when a human answers
 // ActionApprove - never for Skip, Abort, or Fix, which do not claim the step
-// passed. A human's approval always proceeds (this never blocks a deliberate
-// operator decision), but when the verifier returns a reason the executor
-// records the completion as an explicit override (StepResult.OverrideReason,
+// passed. For ordinary runs, an admitted approval proceeds, but when the
+// verifier returns a reason the executor records the completion as an
+// explicit override (StepResult.OverrideReason,
 // via db.SetStepOverrideReason) instead of making it indistinguishable from a
 // genuinely green completion. CI re-checks its live condition; Test reads the
 // command result persisted when its gate parked rather than re-running it.
@@ -241,9 +247,9 @@ type ApprovalGateResumer interface {
 // from "still unresolved" (e.g.
 // the provider could not be reached); implementations should fail closed by
 // treating err as if it were an unresolved condition described by err, and
-// callers do the same rather than silently completing on error, but the
-// approval itself still proceeds either way - this interface only decides
-// how the completion is recorded, never whether it happens.
+// callers do the same rather than silently completing on error. Ordinary
+// runs record an override; strict shipping refuses any unresolved condition.
+// Strict approval admission is owned by db.StepResult.StrictApprovalRefusal.
 type ApprovalOverrideVerifier interface {
 	VerifyApprovalOverride(sctx *StepContext) (unresolved string, err error)
 }

@@ -172,14 +172,18 @@ func (s *CIStep) autoFixCI(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR
 	ctx := sctx.Ctx
 	failingNames := targets.checkNames()
 	mergeConflict := targets.MergeConflict
+	baseBranch := effectivePRBaseBranch(sctx)
+	if sctx.Run.Shipping != nil {
+		if err := verifyStrictPRBaseBranch(ctx, sctx, host, pr); err != nil {
+			return ciRepairResult{}, err
+		}
+	} else if pr != nil && strings.TrimSpace(pr.BaseBranch) != "" {
+		baseBranch = strings.TrimSpace(pr.BaseBranch)
+	}
 	if err := sctx.DB.SetRunPushActive(sctx.Run.ID, true); err != nil {
 		return ciRepairResult{}, err
 	}
 	defer func() { _ = sctx.DB.SetRunPushActive(sctx.Run.ID, false) }()
-	baseBranch := effectivePRBaseBranch(sctx)
-	if pr != nil && strings.TrimSpace(pr.BaseBranch) != "" {
-		baseBranch = strings.TrimSpace(pr.BaseBranch)
-	}
 	baseSHA, err := resolveBranchBaseSHA(ctx, sctx, sctx.Run.BaseSHA, baseBranch)
 	if err != nil {
 		return ciRepairResult{}, err
@@ -681,10 +685,11 @@ func ciHeadAwaitsRecording(sctx *pipeline.StepContext, headSHA string) bool {
 // from Review after the CI step repairs a failing check, rather than publishing
 // the repair and continuing to monitor. It is the resolved ci.revalidate_repairs
 // policy (global config, overridden by the repository's trusted default-branch
-// config). The repair recorder uses it to choose immediate publication or
+// config), with mandatory revalidation for strict shipping. The repair recorder
+// uses it to choose immediate publication or
 // revalidation, and the CI monitor logs the resolved policy.
 func ciRevalidatesRepairs(sctx *pipeline.StepContext) bool {
-	return sctx.Config != nil && sctx.Config.CI.RevalidateRepairs
+	return sctx.Run.Shipping != nil || sctx.Config != nil && sctx.Config.CI.RevalidateRepairs
 }
 
 // ciRepairPolicyDescription names the configured policy in the CI step log, so

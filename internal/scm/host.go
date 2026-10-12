@@ -109,6 +109,21 @@ type PRContent struct {
 // PRState is the normalized lifecycle state of a PR.
 type PRState string
 
+type PRFacts struct {
+	URL          string
+	State        PRState
+	Draft        bool
+	SourceRepo   string
+	SourceBranch string
+	HeadSHA      string
+	TargetRepo   string
+	TargetBranch string
+	TargetSHA    string
+}
+type PRFactsReader interface {
+	GetPRFacts(context.Context, *PR) (PRFacts, error)
+}
+
 const (
 	PRStateOpen   PRState = "OPEN"
 	PRStateMerged PRState = "MERGED"

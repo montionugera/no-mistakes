@@ -504,11 +504,7 @@ func verdictFindings(findings Findings) []Finding {
 			Description: fmt.Sprintf("live validation verdict: inconclusive (%s)%s", coverage, untestedScenarioSuffix(findings.Scenarios)),
 		}}
 	case types.TestVerdictNoSurface:
-		return []Finding{{
-			Severity:    types.FindingSeverityWarning,
-			Action:      types.ActionAskUser,
-			Description: fmt.Sprintf("this change has no live-validatable surface; proceed without live validation? (%s)%s", coverage, untestedScenarioReasonSuffix(findings.Scenarios)),
-		}}
+		return []Finding{types.NoSurfaceTestFinding(findings.Scenarios)}
 	default:
 		return nil
 	}
@@ -520,32 +516,6 @@ func failedScenarioSuffix(scenarios []types.TestScenario) string {
 
 func untestedScenarioSuffix(scenarios []types.TestScenario) string {
 	return scenarioNameSuffix(scenarios, types.ScenarioResultUntested, "untested")
-}
-
-// untestedScenarioReasonSuffix names each untested scenario together with the
-// reason it could not be driven, so a no-surface park carries why there is
-// nothing to validate rather than only the scenario titles.
-func untestedScenarioReasonSuffix(scenarios []types.TestScenario) string {
-	var parts []string
-	for _, scenario := range scenarios {
-		if scenario.Result != types.ScenarioResultUntested {
-			continue
-		}
-		name := strings.TrimSpace(scenario.Name)
-		reason := strings.TrimSpace(scenario.Reason)
-		switch {
-		case name != "" && reason != "":
-			parts = append(parts, name+": "+reason)
-		case name != "":
-			parts = append(parts, name)
-		case reason != "":
-			parts = append(parts, reason)
-		}
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return "; " + strings.Join(parts, "; ")
 }
 
 func scenarioNameSuffix(scenarios []types.TestScenario, result, label string) string {

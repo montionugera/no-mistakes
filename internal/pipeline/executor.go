@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/reviewqa"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
+	"github.com/kunchenguid/no-mistakes/internal/shipping"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -84,7 +86,8 @@ type Executor struct {
 	// waitingRoundID is the round the parked gate belongs to. The response path
 	// records the decision against it before the caller is told what was
 	// recorded, so an echo never claims a decision that is not durable.
-	waitingRoundID string
+	waitingRoundID  string
+	waitingShipping *types.ShippingOptions
 
 	gateReconcileInterval time.Duration
 	gateReconcileTimeout  time.Duration
@@ -225,6 +228,27 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 	if step != e.waitingStep {
 		e.mu.Unlock()
 		return RespondDispositions{}, fmt.Errorf("step mismatch: responding to %q but %q is awaiting approval", step, e.waitingStep)
+	}
+	if e.waitingShipping != nil {
+		if action == types.ActionSkip {
+			e.mu.Unlock()
+			return RespondDispositions{}, fmt.Errorf("strict shipping forbids skipped steps")
+		}
+		if action == types.ActionFix && e.waitingShipping.Mode == types.ShippingImmutableSource {
+			e.mu.Unlock()
+			return RespondDispositions{}, fmt.Errorf("immutable source forbids repairs")
+		}
+	}
+	if action == types.ActionApprove && e.waitingShipping != nil {
+		row, err := e.db.GetStepResult(e.waitingStepResultID)
+		if err != nil || row == nil {
+			e.mu.Unlock()
+			return RespondDispositions{}, fmt.Errorf("strict shipping cannot read the parked step")
+		}
+		if refusal := row.StrictApprovalRefusal(approvalReason); refusal != "" {
+			e.mu.Unlock()
+			return RespondDispositions{}, errors.New(refusal)
+		}
 	}
 	if action == types.ActionApprove && e.waitingApprovalRefusal != "" {
 		refusal := e.waitingApprovalRefusal
@@ -397,6 +421,9 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 			if err := e.refuseSkippedPRWithClosingIssues(run, repo, step.Name(), sr.ID); err != nil {
 				return e.failRun(run, repo, err, ctx)
 			}
+			if run.Shipping != nil {
+				return e.failRun(run, repo, fmt.Errorf("strict shipping forbids skipped steps"), ctx)
+			}
 			if err := e.db.CompleteStepWithStatus(sr.ID, types.StepStatusSkipped, 0, 0, ""); err != nil {
 				return e.failRun(run, repo, fmt.Errorf("skip step %s: %w", step.Name(), err), ctx)
 			}
@@ -430,7 +457,7 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 			break
 		}
 		if restartFrom != "" {
-			restartIndex, err := e.prepareRestart(run.ID, restartFrom, i)
+			restartIndex, err := e.prepareRestart(run, repo, restartFrom, i)
 			if err != nil {
 				return e.failRun(run, repo, fmt.Errorf("step %s requested invalid restart from %s", step.Name(), restartFrom), ctx)
 			}
@@ -456,13 +483,21 @@ func (e *Executor) stepIndex(name types.StepName) (int, error) {
 	return 0, fmt.Errorf("step %s is not in the pipeline", name)
 }
 
-func (e *Executor) prepareRestart(runID string, name types.StepName, currentIndex int) (int, error) {
+func (e *Executor) prepareRestart(run *db.Run, repo *db.Repo, name types.StepName, currentIndex int) (int, error) {
 	index, err := e.stepIndex(name)
 	if err != nil || index >= currentIndex {
 		return 0, fmt.Errorf("invalid restart boundary")
 	}
-	if err := e.db.ResetStepsFrom(runID, e.steps[index].Name().Order()); err != nil {
+	if err := e.db.ResetStepsFrom(run.ID, e.steps[index].Name().Order()); err != nil {
 		return 0, err
+	}
+	if run.Shipping != nil {
+		e.shared = &RunShared{}
+		if name.Order() <= types.StepReview.Order() {
+			run.CIReadyAt = nil
+			run.CIReadyNoCI = false
+			e.emitCIReadinessEvent(run, repo, false, false)
+		}
 	}
 	return index, nil
 }
@@ -576,6 +611,9 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	duration := recoveredStepDuration(gate.stepResult)
 	completeRecoveredGate := func() error {
 		if gate.step.Name() == types.StepReview {
+			if run.Shipping != nil {
+				return fmt.Errorf("strict recovered review must rerun to capture a fresh generation")
+			}
 			if gate.reviewedHeadSHA == "" {
 				return fmt.Errorf("recovered review has no durable reviewed head candidate")
 			}
@@ -643,6 +681,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	e.mu.Lock()
 	e.waiting = true
 	e.waitingStep = gate.step.Name()
+	e.waitingShipping = run.Shipping
 	e.waitingApprovalRefusal = approvalRefusal(gate.step.Name(), gate.findings)
 	e.waitingFindings = gate.findings
 	e.waitingStepResultID = gate.stepResult.ID
@@ -786,7 +825,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 			return e.skipRecoveredRemainder(run, repo, gate.index+1)
 		}
 		if restartFrom != "" {
-			restartIndex, indexErr := e.prepareRestart(run.ID, restartFrom, gate.index)
+			restartIndex, indexErr := e.prepareRestart(run, repo, restartFrom, gate.index)
 			if indexErr != nil {
 				return e.failRun(run, repo, fmt.Errorf("step %s requested invalid restart from %s", gate.step.Name(), restartFrom), ctx)
 			}
@@ -904,7 +943,7 @@ func (e *Executor) executeRecoveredRemainder(ctx context.Context, run *db.Run, r
 			return e.skipRecoveredRemainder(run, repo, index+1)
 		}
 		if restartFrom != "" {
-			restartIndex, indexErr := e.prepareRestart(run.ID, restartFrom, index)
+			restartIndex, indexErr := e.prepareRestart(run, repo, restartFrom, index)
 			if indexErr != nil {
 				return e.failRun(run, repo, fmt.Errorf("step %s requested invalid restart from %s", e.steps[index].Name(), restartFrom), ctx)
 			}
@@ -1276,14 +1315,38 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	var skipReason string
 	currentRoundID := state.currentRoundID
 	var reviewApprovedHeadSHA string
+	var reviewComparisonGeneration int64
 	var restartFrom types.StepName
 
 	// Execute with possible fix loop
 rounds:
 	for {
+		if stepName == types.StepReview && run.Shipping != nil {
+			sctx.ScopeFindings = scopeFindingsForReview(sctx, outstandingFindings)
+		}
 		reviewStartingHeadSHA := run.HeadSHA
 		sctx.ReviewStartingHeadSHA = reviewStartingHeadSHA
+		if run.Shipping != nil && run.Shipping.Mode == types.ShippingImmutableSource {
+			if sctx.Fixing {
+				return false, "", fmt.Errorf("immutable source forbids repair rounds")
+			}
+			if err := shipping.CheckImmutable(ctx, run, repo, workDir); err != nil {
+				return false, "", err
+			}
+		}
 		outcome, err := step.Execute(sctx)
+		if err == nil && run.Shipping != nil {
+			if outcome.Skipped || outcome.SkipRemaining {
+				err = fmt.Errorf("strict shipping forbids automatic step skips")
+			}
+			if step.Name() == types.StepCI && outcome.MergedHeadSHA == run.HeadSHA {
+				if immutableErr := shipping.CheckImmutableSource(ctx, run, repo, workDir); immutableErr != nil {
+					err = immutableErr
+				}
+			} else if immutableErr := shipping.CheckImmutable(ctx, run, repo, workDir); immutableErr != nil {
+				err = immutableErr
+			}
+		}
 		if refusal := ProtectedPathOutcome(err); refusal != nil {
 			outcome, err = refusal, nil
 		}
@@ -1310,6 +1373,7 @@ rounds:
 
 		if stepName == types.StepReview {
 			reviewApprovedHeadSHA = outcome.ReviewApprovedHeadSHA
+			reviewComparisonGeneration = outcome.ReviewComparisonGeneration
 		}
 		outcome.Findings = normalizeFindingsJSON(outcome.Findings, string(stepName))
 		finalExitCode = outcome.ExitCode
@@ -1341,13 +1405,18 @@ rounds:
 			// that has nothing to do with it.
 			verificationFindings := dropReviewQuestionFindingsJSON(roundFindings)
 			outstandingFindings = dropReviewQuestionFindingsJSON(outstandingFindings)
-			// An answer round retracts by naming ids, never by silence - and
-			// ONLY an answer round. A fix round is held to the coverage rule,
-			// so a retraction it claimed would clear a selected finding no
-			// round ever positively verified.
+			// Answer rounds may retract unselected carry by name. A selected
+			// fix stays subject to verification; strict scope adjudications
+			// are checked separately against their durable human decisions.
 			var withdrawn []types.WithdrawnFinding
 			if sctx.FinalizingAnswers {
-				outstandingFindings, withdrawn = dropWithdrawnFindingsJSON(outstandingFindings, outcome.WithdrawnFindings)
+				var retractable []types.WithdrawnFinding
+				for _, w := range outcome.WithdrawnFindings {
+					if !slices.Contains(selectedOutstandingIDs, w.ID) {
+						retractable = append(retractable, w)
+					}
+				}
+				outstandingFindings, withdrawn = dropWithdrawnFindingsJSON(outstandingFindings, retractable)
 				for _, w := range withdrawn {
 					reason := w.Reason
 					if reason == "" {
@@ -1356,7 +1425,12 @@ rounds:
 					writeLog(fmt.Sprintf("answers retracted finding %s: %s", w.ID, safeurl.RedactText(reason)))
 				}
 			}
-			outstandingFindings = resolveVerifiedFindingsJSON(outstandingFindings, pendingVerificationIDs, outcome.ReviewedPaths, outcome.ReviewablePaths, verificationFindings)
+			var scopeWithdrawn []types.WithdrawnFinding
+			outstandingFindings, scopeWithdrawn = resolveReviewCarry(sctx, outstandingFindings, pendingVerificationIDs, outcome, verificationFindings)
+			withdrawn = append(withdrawn, scopeWithdrawn...)
+			for _, w := range scopeWithdrawn {
+				writeLog(fmt.Sprintf("independent review accepted scope disposition %s: %s", w.ID, safeurl.RedactText(w.Reason)))
+			}
 			pendingVerificationIDs = retainFindingIDs(outstandingFindings, pendingVerificationIDs)
 			selectedOutstandingIDs = retainFindingIDs(outstandingFindings, selectedOutstandingIDs)
 			effectiveFindings = mergeOutstandingFindingsJSON(outstandingFindings, roundFindings, outcome.ReviewedPaths)
@@ -1366,10 +1440,16 @@ rounds:
 
 		if effectiveFindings != "" {
 			if dbErr := e.db.SetStepFindings(sr.ID, effectiveFindings); dbErr != nil {
+				if run.Shipping != nil {
+					return false, "", fmt.Errorf("persist strict shipping findings: %w", dbErr)
+				}
 				slog.Warn("failed to set step findings in db", "step", stepName, "error", dbErr)
 			}
 		} else {
 			if dbErr := e.db.ClearStepFindings(sr.ID); dbErr != nil {
+				if run.Shipping != nil {
+					return false, "", fmt.Errorf("persist strict shipping findings: %w", dbErr)
+				}
 				slog.Warn("failed to clear step findings in db", "step", stepName, "error", dbErr)
 			}
 		}
@@ -1486,6 +1566,7 @@ rounds:
 			e.mu.Lock()
 			e.waiting = true
 			e.waitingStep = stepName
+			e.waitingShipping = run.Shipping
 			e.waitingApprovalRefusal = approvalRefusal(stepName, effectiveFindings)
 			e.waitingFindings = effectiveFindings
 			e.waitingStepResultID = sr.ID
@@ -1671,7 +1752,7 @@ done:
 	// return earlier, and skipped reviews deliberately leave the binding empty.
 	// Completion and authority replacement are one DB transaction.
 	if stepName == types.StepReview && status == types.StepStatusCompleted && reviewApprovedHeadSHA != "" {
-		if err := e.db.CompleteReviewStep(sr.ID, run.ID, reviewApprovedHeadSHA, finalExitCode, durationMS, logPath); err != nil {
+		if err := e.db.CompleteReviewStep(sr.ID, run.ID, reviewApprovedHeadSHA, finalExitCode, durationMS, logPath, reviewComparisonGeneration); err != nil {
 			return false, "", fmt.Errorf("complete step %s: %w", stepName, err)
 		}
 		reviewedHead := reviewApprovedHeadSHA
@@ -1695,12 +1776,11 @@ done:
 // override (db.SetStepOverrideReason) instead of a silent plain pass. CI
 // re-checks its live condition; Test inspects the configured-command result
 // persisted when its gate parked. See ApprovalOverrideVerifier's doc for the
-// full contract. It never blocks or changes the approval itself: a human's
-// ActionApprove always proceeds, and a step that does not implement the
-// interface (today: every step but CI and Test) is completely unaffected. A
-// verification error fails closed - it is recorded as an unresolved condition,
-// not silently treated as clear - but still never stops
-// the approval, only what it gets recorded as.
+// full contract. For ordinary runs, an admitted ActionApprove proceeds and a
+// verification error is recorded as an unresolved condition rather than
+// silently treated as clear. Strict shipping refuses an unresolved condition.
+// A step without the interface needs no override verification; strict admission
+// still applies through db.StepResult.StrictApprovalRefusal.
 //
 // Persisting that override marker is itself fail-closed: downstream consumers
 // derive each step's override status from its durable override/approval reasons,
@@ -1727,6 +1807,9 @@ func (e *Executor) applyApprovalOverride(step Step, sctx *StepContext, stepResul
 	}
 	if unresolved == "" {
 		return nil
+	}
+	if sctx.Run.Shipping != nil {
+		return fmt.Errorf("strict shipping forbids approval overrides: %s", unresolved)
 	}
 	if dbErr := e.db.SetStepOverrideReason(stepResultID, unresolved); dbErr != nil {
 		return fmt.Errorf("record approval override reason for step %s: %w", step.Name(), dbErr)

@@ -46,6 +46,10 @@ If the home `.claude` links to `.agents`, `.claude/skills` links to `.agents/ski
 If the repo still contains a vendored skill copy written by an older no-mistakes version, `init` leaves it untouched and prints a notice that it is no longer needed and can be removed.
 The gate advertises Git push-option support, so you can skip steps for one push with `git push -o no-mistakes.skip=test,lint no-mistakes <branch>`.
 
+Managed receive hooks pin the canonical native home and the executable used during enrollment or explicit refresh. Ambient `NM_HOME` and a `no-mistakes` executable on `PATH` cannot redirect those helpers. If the pinned executable disappears, admission refuses the push; notification records a failure for an already accepted push.
+
+For an isolated installation, use a separate native home, binary, and independent Git clone. Pass `init --install-skill=false` to leave user-level agent skills unchanged. A linked worktree shares its Git common directory and remotes with its parent checkout, so it is not an isolated enrollment target.
+
 For GitHub fork contributions, keep `origin` pointed at the parent repository and pass `--fork-url` with your fork remote URL.
 The Push step, rebase branch-sync, and CI repair publication use the fork, including when [`ci.revalidate_repairs`](/no-mistakes/reference/repo-config/#cirevalidate_repairs) sends a repair back through Push, while GitHub PR and CI commands stay scoped to the parent repository and create PRs with `--head <fork-owner>:<branch>`.
 Fork routing currently requires both `origin` and `--fork-url` to be GitHub remotes with owner/repo paths.
@@ -96,7 +100,7 @@ Commit and push the generated file to enable the checks.
 
 Agent eXperience Interface for non-interactive agents.
 Most agent workflows use the installed `/no-mistakes` skill, which drives this command surface underneath.
-It prints TOON to stdout, prints progress to stderr, and uses structured stdout errors with exit code `1` for operational failures and `2` for bad usage.
+It prints TOON to stdout (except [`review-receipt`](#strict-shipping-and-review-receipts), which emits JSON), prints progress to stderr, and uses structured stdout errors with exit code `1` for operational failures and `2` for bad usage.
 At the TOON output boundary, unsupported C0 control bytes are rendered as visible `\xNN` escapes while tabs, carriage returns, newlines, printable Unicode, and the underlying durable logs remain unchanged.
 If TOON encoding still fails, AXI prints a structured error instead of returning successful empty stdout.
 The calling agent drives AXI approval gates but does not replace the configured pipeline agent that performs validation.
@@ -138,6 +142,8 @@ no-mistakes axi run --intent "the user's goal" --closes 95 --closes owner/repo#1
 | `-y`, `--yes`   | `bool`   | `false` | Auto-resolve eligible gates until a decision point or outcome                                       |
 | `--skip`        | `string` | (none)  | Comma-separated pipeline steps to skip                                                               |
 | `--base-branch` | `string` | (none)  | Integration branch for this run only; overrides [`pr.base_branch`](/no-mistakes/reference/repo-config/#prbase_branch) |
+| `--shipping-mode` | `string` | (none) | Select `full` or `immutable-source`; see [strict shipping](#strict-shipping-and-review-receipts) |
+| `--draft` | `bool` | (unset) | Pin the GitHub draft choice; requires `--shipping-mode`, supports explicit `false` |
 | `--no-publish-intent` | `bool` | `false` | Keep the generated `## Intent` section out of the PR body for this run; tighten-only, see below |
 | `--closes` | `string`, repeatable | (none) | GitHub issue the PR fully resolves (`95` or `owner/repo#95`); see [Closing issues](#closing-issues) |
 | `--model` | `string` | (none) | Pi provider/model ID for an immutable [per-run profile](/no-mistakes/reference/global-config/#per-run-pi-profiles) |
@@ -149,7 +155,7 @@ no-mistakes axi run --intent "the user's goal" --closes 95 --closes owner/repo#1
 Explicit intent is the user's goal or request, not a description of the diff.
 no-mistakes uses the supplied text instead of transcript inference; see [Intent input](#intent-input) for transports and whitespace handling.
 Err on the side of completeness: include the goal, important decisions and tradeoffs, constraints or approaches ruled in or out, and explicit requests that might otherwise look surprising in the diff.
-When starting a new run, `axi run` refuses the default branch and uncommitted working trees with actionable errors instead of auto-branching or auto-committing.
+When starting an ordinary or `full` run, `axi run` refuses the default branch and uncommitted working trees with actionable errors instead of auto-branching or auto-committing. [`immutable-source`](#strict-shipping-and-review-receipts) permits a default-branch caller but still requires a clean checkout.
 Ordinary reattachment to an in-flight run does not require intent input and never replaces that run's intent, even if new text is supplied. [Strict launch receipts](#strict-launch-receipts) require the original intent bytes on every retry, using any of the input transports below.
 
 ### Intent input
@@ -264,7 +270,7 @@ Raw intent is not included in receipts, and generic run/status output does not e
 
 The nonce is scoped to the repository and branch.
 The first successful receipt claim returns `created`; subsequent matching claims return `reused` for that same run, including after the gate or pipeline head advances.
-A conflicting submitted head, validation generation, intent, or [pinned Pi profile](/no-mistakes/reference/global-config/#per-run-pi-profiles) is refused.
+A conflicting submitted head, validation generation, intent, [pinned Pi profile](/no-mistakes/reference/global-config/#per-run-pi-profiles), or explicit [shipping mode/draft pin](#strict-shipping-and-review-receipts) is refused.
 A different nonce creates a distinct run rather than reattaching to a same-head run; both post-receive creation and the up-to-date-push fallback follow this contract.
 The up-to-date-push fallback preserves the latest same-head run's PR URL unless its recorded PR state is closed or merged, including when an explicit `--base-branch` retargets that PR.
 An explicit `--base-branch` is persisted on creation and must match the stored per-run base on replay; omitting it on replay preserves the stored base.
@@ -294,7 +300,7 @@ no-mistakes axi respond --run <id> --action approve
 | `--findings`     | `string` | (none)        | Comma-separated finding IDs to fix with `--action fix`               |
 | `--ignore`       | `string` | (none)        | Comma-separated finding IDs to decline with `--action fix`; see the accounting rules below |
 | `--instructions` | `string` | (none)        | Guidance applied to selected findings with `--action fix`            |
-| `--reason`       | `string` | (none)        | Operator's exception explanation for Test approval only              |
+| `--reason`       | `string` | (none)        | Operator's explanation for Test acknowledgment or exception approval |
 | `--add-finding`  | `string` | (none)        | JSON finding object to add and fix                                   |
 | `-y`, `--yes`    | `bool`   | `false`       | Auto-resolve subsequent eligible gates until a decision point or outcome |
 | `--wait`         | `duration` | `8m`        | Maximum time for pre-drive reads and post-response driving before the caller must reattach |
@@ -311,6 +317,8 @@ The step retains its findings and exit code, and the reason is durable local evi
 Revalidation, a new fix round, or skipping the step clears that current-step approval so a later result cannot inherit it.
 This is separate from the configured-command waiver and trusted repository opt-in used by [PR enforcement](/no-mistakes/reference/pipeline-steps/#pipeline-step-attestation); neither that policy nor approval authority changes.
 `--instructions` remains fix guidance, not an approval-reason input.
+
+The same approval command acknowledges a genuine strict `no-surface` Test; [strict shipping](#strict-shipping-and-review-receipts) owns its admission requirements.
 
 Without `--run`, the response goes to the active run on the current branch, and `no active run to respond to` is the error when it has none. With `--run <id>`, the response goes to exactly that run, from any directory and without resolving a repository, branch, or worktree; every other flag behaves as it does in context. The call is refused with a nonzero exit when the ID names no run (`no run with id <id>`) or the run is not parked at a gate (`run <id> is not parked at a gate`), and it never answers a different run. [`axi status --run`](#no-mistakes-axi-status) stays inspection-only for bare commands and names `axi respond --run <id>` as the response command. An empty or whitespace-only `--run` value is refused with a nonzero exit and never selects the current branch's run. Every follow-up command a `--run` call prints carries `--run <id>`; a command with no `--run` form (`axi answer`, `axi run`, `axi sync`, `rerun`) is named as one that must run in the clone of that run.
 
@@ -558,6 +566,13 @@ is stale. The command refuses instead of falling back to the gate branch when
 the run-specific recovery ref is conflicting, invalid, or the recorded head is
 unavailable. Use `no-mistakes axi status` and reconcile custody first in that
 case.
+An immutable-source run selects the exact submitted head from the selected run
+only while that commit is still the live published source branch. Rerun does not
+depend on or move a stale or absent local gate branch. It preserves the run's
+shipping target branch, target SHA, and draft choice; a conflicting
+`--base-branch` or a moved live target is refused before superseding a run.
+If the gate lacks the commit, rerun fetches that exact published commit before
+it cancels or creates a replacement run; the fetch does not move a local branch.
 When invoked from a clean worktree, `rerun` also refuses if that worktree's HEAD
 differs from the selected gate or preserved head, before starting or superseding
 any run. The error names both full commit SHAs;
@@ -720,7 +735,7 @@ no-mistakes update --force
 Downloads the latest release, verifies the SHA-256 checksum, atomically replaces the running binary, and resets the daemon when it is running or stale daemon artifacts exist so the new executable is picked up, preferring the managed service path and falling back to a detached daemon if service startup is unavailable or fails.
 By default this installs the latest stable release.
 Pass `--beta` to include prereleases and install the latest beta when one is newer than the current stable release.
-Version discovery reads a `channels.json` manifest from the GitHub release-asset CDN (`releases/download/channels/channels.json`) so it does not consume the unauthenticated REST API rate limit. If the manifest is unavailable or invalid, the update fails without falling back to the REST API.
+Version discovery reads this fork's `channels.json` manifest from `https://github.com/vifar/no-mistakes/releases/download/channels/channels.json` so it does not consume the unauthenticated REST API rate limit. Stable, beta, and background checks use the same fork destination. If the manifest is unavailable or invalid, the update fails without falling back to upstream or the REST API.
 If the daemon is running from a different executable path, update still prompts before replacing it; pass `-y`/`--yes` to answer that prompt non-interactively.
 If the daemon executable path cannot be determined, the update aborts before replacement.
 If the daemon does not come back cleanly after a successful replacement, the command reports that failure.
@@ -796,3 +811,33 @@ no-mistakes daemon status
 ```
 
 Shows the PID if the daemon is running.
+
+## Strict shipping and review receipts
+
+The explicit `axi run --shipping-mode full` mode owns the complete Intent → Rebase → Review → Test → Document → Lint → Push → PR → CI pipeline. It persists its policy on the selected run and refuses launch if the running daemon does not advertise strict-shipping support. It refuses skips, passing command exceptions, and approval of unresolved actionable findings. `--yes` stops at those gates. A genuine `no-surface` Test may complete after an explicit operator acknowledgment, with or without `--reason`, once documentation correctness is confirmed. Every scenario must be named, untested, not live, and carry a reason; an empty scenario list is refused. Only the native no-surface decision finding may remain actionable. The durable record retains the original verdict, scenarios, and acknowledgment through recovery. This is normal completion, not a Test override. Live or pass/fail scenarios, malformed evidence, operator-authored lookalikes, command failures, recorded overrides, invocation-budget cuts, and unrelated actionable findings remain refused. Independent Review, hosted CI, App approval, and merge safeguards still apply. Repairs and changes after Review must pass a fresh independent Review before publication. A changed target comparison invalidates readiness. Periodic CI reads wait at least five minutes; initial reads, explicit receipt exports, and event-driven reads remain immediate.
+
+Existing-PR target checks and readiness invalidation are owned by the [PR and CI step contracts](/no-mistakes/reference/pipeline-steps/#pr).
+
+Use `--shipping-mode immutable-source --base-branch main` for an existing published protected source promotion. It pins the submitted source and current target. Rebase observes the comparison, and Push verifies the already published source; neither writes that source. Validation may inspect it, but source mutation or a repair request refuses the run. A moved source or target requires a new run. Terminal branch synchronization is inspection-only: `axi sync --check` reports `state: immutable_source` and never offers a mutating action. Direct sync, recovery, and adoption mutations refuse this mode.
+
+With `--shipping-mode`, an optional `--draft` or `--draft=false` pins the GitHub draft selection for that run. Receipt export refuses a live draft state that differs from an explicit pin. Without the flag, existing repository/global draft configuration applies and the receipt records the live draft state. Reattach with ordinary `axi run` from the initiating branch; omit pin flags to retain the selected run's policy. An explicit conflicting mode or draft pin refuses. The caller's current head can be the submitted head or the current pipeline head while the daemon owns its run worktree.
+
+```sh
+no-mistakes axi run --shipping-mode full --draft --intent "Validate and ship this change"
+no-mistakes axi review-receipt --run <run-id> --phase review
+no-mistakes axi review-receipt --run <run-id> --phase ci-ready
+```
+
+`review-receipt` emits JSON on success, unlike ordinary TOON AXI output. Errors retain the ordinary structured AXI error format. It reads the recorded run without changing it. `--run` is required; `--phase` defaults to `review`. The `review` phase requires all configured pre-CI validation and publication steps completed, with an active CI monitor and an exact approved Review generation. It is available while CI awaits external approval. `ci-ready` also requires persisted readiness for that comparison and fresh, nonempty, successful applicable live checks (optional skipped hosted lanes retain native provider semantics). Every configured [custom gate](/no-mistakes/reference/repo-config/#gates) must be completed; export never silently omits one. Overrides, skips, dirty worktrees, unsupported providers, unresolved findings, and moved source/target comparisons refuse either phase. An empty check list or a no-CI declaration cannot establish `ci-ready`. The initial exact-forge proof provider is GitHub.
+
+Both phases bracket live PR and Git observations and recompute the merge base and SHA-256 of the exact untrimmed bytes from `git diff --no-ext-diff --no-textconv --binary --full-index TARGET...HEAD`. The payload includes source repository/ref, submitted/local/forge heads, PR URL, target ref/SHA, merge base, diff digest, monotonic per-run review generation, intent digest, mode/draft, final non-actionable findings and their digest, and completed/running step evidence. The eight pre-CI core steps are completed; CI remains running until merge. The receipt grants no merge or cleanup authority.
+
+Receipt export admits an acknowledged genuine `no-surface` Test by checking its retained durable evidence and authorization. The payload records Test as completed and keeps `test_override: null`; it does not export the Test verdict, scenarios, or acknowledgment reason.
+
+`--signing-key-stdin` reads a bounded base64 32-byte Ed25519 seed outside authenticated validation-agent context. The command constructs and verifies its own payload; it never signs caller JSON. No key enters daemon IPC, agents, storage, logs, or errors. Provision and pipe the seed through the outer credential owner. Signed output is `{schema_version:1,algorithm:"Ed25519",key_id,payload,signature}`. `key_id` is SHA-256 of the raw public key; `payload` and `signature` use padded standard base64. The signature covers the UTF-8 bytes `no-mistakes-review-v1`, a NUL, then exact payload bytes. The decoded payload limit is 32 KiB and envelope limit is 49 KiB. Consumers must pin a trusted public key externally, authenticate bytes before parsing, and enforce current repository/PR/comparison identity and freshness.
+
+Strict status adds `submitted_head_sha`, `shipping_mode`, `source_repo`, `source_branch`, `target_branch`, `target_sha`, `review_generation`, `ci_ready`, and `ci_ready_no_ci`. Enrollment supplies source repository/branch and the persisted target branch before Review. Target SHA and review generation remain null before capture. Status readiness is cached observability; use a fresh receipt before a guarded merge. A strict parked Review recovered after daemon restart cannot reconstruct generation authority from its head alone; operator approval cannot complete it.
+
+For a parked `full` shipping Review, revalidate through the existing gate response: `no-mistakes axi respond --run <id> --action fix --findings <selected-ids> --ignore <explicitly-declined-ids> --instructions "Verify the existing fix against the pinned comparison; preserve correct code and prior commits."` Account for the live gate's IDs; previously decided findings may instead be omitted to preserve their decisions. This runs the normal fixer and a fresh independent Review, captures a new comparison generation, and retains the outstanding set until the [Review resolution contract](/no-mistakes/reference/pipeline-steps/#review) is satisfied. This path works for live and recovered gates; it grants no operator override. `immutable-source` still refuses repair responses: use its existing between-runs lifecycle only after the active run has ended, and never bypass its source or target movement checks.
+
+Strict shipping uses the persisted per-run target throughout validation. With no `--base-branch`, that target is the enrolled default branch; ordinary runs retain their configured PR-base behavior.

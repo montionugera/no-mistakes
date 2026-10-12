@@ -197,7 +197,7 @@ Declare that this repository intentionally has no CI.
 | Type | `bool` |
 | Default | `false` |
 
-When `true` and the forge reports **zero** checks on the PR head, the CI monitor treats that empty result as all-checks-passed and `axi run` may return `outcome: checks-passed`. The monitor log names the declaration (`no_ci: true`) so the positive evidence stays inspectable rather than silently equating every empty forge response with green.
+For ordinary runs, when `true` and the forge reports **zero** checks on the PR head, the CI monitor treats that empty result as all-checks-passed and `axi run` may return `outcome: checks-passed`. The monitor log names the declaration (`no_ci: true`) so the positive evidence stays inspectable rather than silently equating every empty forge response with green. [Strict shipping](/no-mistakes/reference/cli/#strict-shipping-and-review-receipts) requires nonempty live checks even with this declaration.
 
 Absence of this field means CI is expected. A zero-length check result then stays not-ready for as long as the forge reports no checks - elapsed time, grace periods, workflow-file presence or absence, prior check history, and branch names are not evidence.
 
@@ -216,13 +216,13 @@ Select the branch that newly created pull requests target.
 | Default | The repository's forge default branch |
 | Trust | Trusted default branch, unless `allow_repo_commands: true` is explicitly enabled there |
 
-Use this when the repository's integration branch differs from its forge default branch, for example `develop` instead of `main`.
+For ordinary runs, use this when the repository's integration branch differs from its forge default branch, for example `develop` instead of `main`.
 The configured branch is used for PR creation and pipeline integration and change scoping; the [Pipeline Steps scope rules](/no-mistakes/reference/pipeline-steps/) describe which steps use it and how the recorded per-run override takes precedence.
 When unset and without a per-run override, no-mistakes targets the repository's forge default branch.
 
 PR lookup matches an existing PR by branch alone, never filtered by base, so a `pr.base_branch` change after a PR was opened updates that PR instead of opening a duplicate against the new base.
-A per-run `--base-branch` override is different: if the run's already-open PR targets another branch, the PR step retargets that PR (GitHub, GitLab, Gitea, and [provider plugins](/no-mistakes/reference/provider-plugin-protocol/) that advertise `set_pr_base_branch`) so title, body, and CI follow the requested integration branch. A discovered PR that is not the run's persisted identity, or a provider that cannot retarget, fails closed rather than moving another review object. See [PR](/no-mistakes/reference/pipeline-steps/#pr).
-Once a PR exists, its actual forge base branch is authoritative over `pr.base_branch` for the CI step's merge-conflict auto-fix and base-branch tip monitoring, protecting a resumed run from a configuration change made after the PR was created.
+A per-run `--base-branch` override is different: for ordinary runs, if the run's already-open PR targets another branch, the PR step retargets that PR (GitHub, GitLab, Gitea, and [provider plugins](/no-mistakes/reference/provider-plugin-protocol/) that advertise `set_pr_base_branch`) so title, body, and CI follow the requested integration branch. A discovered PR that is not the run's persisted identity, or a provider that cannot retarget, fails closed rather than moving another review object. See [PR](/no-mistakes/reference/pipeline-steps/#pr).
+For ordinary runs, once a PR exists, its actual forge base branch is authoritative over `pr.base_branch` for the CI step's merge-conflict auto-fix and base-branch tip monitoring, protecting a resumed run from a configuration change made after the PR was created. [Strict shipping](/no-mistakes/reference/cli/#strict-shipping-and-review-receipts) uses its persisted target selection instead of this setting; the [PR step](/no-mistakes/reference/pipeline-steps/#pr) owns its existing-PR mismatch refusal.
 
 Because this setting controls where a PR lands, a pushed branch cannot redirect its own PR target by changing `pr.base_branch`.
 It is read from the trusted default-branch copy regardless of `allow_repo_commands` by default.
@@ -734,7 +734,7 @@ ci:
   revalidate_repairs: true
 ```
 
-One rule decides how every CI repair is delivered, on every CI-fix path - automatic and manual, CI failure and merge conflict alike:
+For ordinary runs, one rule decides how every CI repair is delivered, on every CI-fix path - automatic and manual, CI failure and merge conflict alike:
 
 > A repair is published without revalidating only when its continuity with the reviewed, published head can be **proven**. When that continuity cannot be proven, the repair revalidates from Review.
 
@@ -771,6 +771,8 @@ A pushed branch cannot turn a maintainer's revalidation requirement off for its 
 
 A value set here always wins over the operator's own [`ci.revalidate_repairs`](/no-mistakes/reference/global-config/#cirevalidate_repairs), in both directions: `true` here enables revalidation even when the global value is `false`, and an explicit `false` here opts out even when the global value is `true`.
 With no trusted copy of this file, the operator's global value applies, then the built-in default of `false`.
+
+[Strict shipping](/no-mistakes/reference/cli/#strict-shipping-and-review-receipts) enforces repair revalidation regardless of this setting; `false` cannot opt a strict run out.
 
 ### ci.review_bot_comments
 
@@ -996,6 +998,8 @@ Override the [global GitHub draft setting](/no-mistakes/reference/global-config/
 |---|---|
 | Type | `bool` |
 | Default | Inherits from global (default `false`) |
+
+The per-run [`--draft`](/no-mistakes/reference/cli/#strict-shipping-and-review-receipts) pin takes precedence for strict shipping.
 
 ### providers.gitlab.draft_pull_requests
 

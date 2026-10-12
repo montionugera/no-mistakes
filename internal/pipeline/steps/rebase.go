@@ -14,6 +14,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/shipping"
 	"github.com/kunchenguid/no-mistakes/internal/testguidance"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -27,6 +28,16 @@ func (s *RebaseStep) Name() types.StepName { return types.StepRebase }
 const forkBranchRefPrefix = "refs/remotes/no-mistakes-push/"
 
 func (s *RebaseStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	if sctx.Run.Shipping != nil && sctx.Run.Shipping.Mode == types.ShippingImmutableSource {
+		if err := shipping.CheckImmutable(sctx.Ctx, sctx.Run, sctx.Repo, sctx.WorkDir); err != nil {
+			return nil, err
+		}
+		if err := fetchRunUpstreamBranch(sctx.Ctx, sctx, effectivePRBaseBranch(sctx)); err != nil {
+			return nil, err
+		}
+		sctx.Log("verified immutable source comparison without integration")
+		return &pipeline.StepOutcome{}, nil
+	}
 	ctx := sctx.Ctx
 	branch := strings.TrimPrefix(sctx.Run.Branch, "refs/heads/")
 	defaultBranch := effectivePRBaseBranch(sctx)
@@ -200,9 +211,14 @@ func forcePushRebaseTargets(branch, defaultBranch string) []string {
 }
 
 // effectivePRBaseBranch resolves the integration and change-scoping base for
-// pipeline steps. Per-run overrides win over repo config; the repository default
-// remains the fallback when neither selects a separate PR target branch.
+// pipeline steps. Strict runs use their persisted target. For ordinary runs,
+// per-run overrides win over repo config, then the repository default applies.
 func effectivePRBaseBranch(sctx *pipeline.StepContext) string {
+	// Strict runs persist their effective target at launch; later config cannot
+	// change comparison identity while the native pipeline owns the run.
+	if sctx.Run != nil && sctx.Run.Shipping != nil && sctx.Run.Shipping.TargetBranch != "" {
+		return sctx.Run.Shipping.TargetBranch
+	}
 	defaultBranch := strings.TrimSpace(sctx.Repo.DefaultBranch)
 	if runBase := runPRBaseBranch(sctx); runBase != "" {
 		defaultBranch = runBase

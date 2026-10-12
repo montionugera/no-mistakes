@@ -303,11 +303,11 @@ type Findings struct {
 	// that does not list a path has not proven anything about it, so silence is
 	// never read as resolution. Empty on every non-review payload.
 	ReviewedPaths []string `json:"reviewed_paths,omitempty"`
-	// WithdrawnFindings is an answer round's explicit re-adjudication: the
+	// WithdrawnFindings is an independent turn's explicit re-adjudication: the
 	// carried findings the reviewer now says no longer hold, each with its
-	// reason. On an answer round a carried finding leaves the outstanding set
-	// ONLY by appearing here. Silence keeps it, so covering a file can no
-	// longer clear an unrelated finding in it. Empty on every other payload.
+	// reason. Unselected answer-round carry and strict human scope dispositions
+	// require an explicit independent retraction; selected fixes still require
+	// positive verification. Omission does not adjudicate a scope disposition.
 	WithdrawnFindings []WithdrawnFinding `json:"withdrawn_findings,omitempty"`
 	Tested            []string           `json:"tested,omitempty"`
 	TestingSummary    string             `json:"testing_summary,omitempty"`
@@ -654,4 +654,59 @@ func (f Finding) ActionOrDefault() string {
 		return ActionAskUser
 	}
 	return f.Action
+}
+
+func NoSurfaceTestFinding(scenarios []TestScenario) Finding {
+	live, total := LiveScenarioCounts(scenarios)
+	var parts []string
+	for _, scenario := range scenarios {
+		if scenario.Result != ScenarioResultUntested {
+			continue
+		}
+		name, reason := strings.TrimSpace(scenario.Name), strings.TrimSpace(scenario.Reason)
+		switch {
+		case name != "" && reason != "":
+			parts = append(parts, name+": "+reason)
+		case name != "":
+			parts = append(parts, name)
+		case reason != "":
+			parts = append(parts, reason)
+		}
+	}
+	suffix := ""
+	if len(parts) > 0 {
+		suffix = "; " + strings.Join(parts, "; ")
+	}
+	return Finding{
+		Severity:    FindingSeverityWarning,
+		Action:      ActionAskUser,
+		Description: fmt.Sprintf("this change has no live-validatable surface; proceed without live validation? (%d of %d scenarios were driven live against the product)%s", live, total, suffix),
+	}
+}
+
+func IsNoSurfaceTestAcknowledgment(findings Findings) bool {
+	if findings.Verdict != TestVerdictNoSurface || !NoLiveExercisableScenarios(findings.Scenarios) || findings.UnvalidatedSinceSHA != "" {
+		return false
+	}
+	for _, scenario := range findings.Scenarios {
+		if strings.TrimSpace(scenario.Name) == "" || strings.TrimSpace(scenario.Reason) == "" {
+			return false
+		}
+	}
+	want := NoSurfaceTestFinding(findings.Scenarios)
+	count := 0
+	for _, item := range findings.Items {
+		if item.ID == FindingIDTestAgentTimeout || item.ID == FindingIDTestAgentUnvalidatedWork || item.Category == FindingCategoryTestCommand {
+			return false
+		}
+		if item.ActionOrDefault() == ActionNoOp {
+			continue
+		}
+		item.ID = ""
+		if item != want {
+			return false
+		}
+		count++
+	}
+	return count == 1
 }

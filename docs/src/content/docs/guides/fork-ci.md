@@ -79,3 +79,14 @@ Runner credentials remain restricted to the runner account.
 The upstream docs, Nix, generated-file, signature, and release workflows retain
 their existing routing. This local workflow restores Go build and test CI;
 it does not change publication destinations or install the CLI on the owner’s Mac.
+
+## Self-update destination
+
+The [update command reference](/no-mistakes/reference/cli/#no-mistakes-update)
+owns the fork destination, manifest requirements, and refusal behavior. The fork
+must publish its own channel manifest and release assets before release updates
+can succeed.
+
+A dedicated `controller-shipping-<full-source-sha>` build follows that reference's
+development-build policy. This source change does not publish a release or
+install a CLI.

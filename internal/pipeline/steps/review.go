@@ -13,6 +13,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/shipping"
 	"github.com/kunchenguid/no-mistakes/internal/testguidance"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -191,6 +192,18 @@ Previous review findings to address:
 		}
 		fixSummary = summary
 	}
+	var reviewGeneration int64
+	if sctx.Run.Shipping != nil {
+		comparison, err := shipping.Capture(ctx, sctx.DB, sctx.Repo, sctx.Run, sctx.WorkDir, effectivePRBaseBranch(sctx))
+		if err != nil {
+			return nil, err
+		}
+		if sctx.Run.Shipping.Mode == types.ShippingFull && comparison.MergeBaseSHA != comparison.TargetSHA {
+			return &pipeline.StepOutcome{RestartFrom: types.StepRebase}, nil
+		}
+		baseSHA = comparison.MergeBaseSHA
+		reviewGeneration = comparison.Generation
+	}
 	reviewTargetSHA := sctx.Run.HeadSHA
 
 	// The changed-file set is read once and viewed two ways on purpose: the
@@ -221,9 +234,10 @@ Previous review findings to address:
 		noChangeFindings.ReviewedPaths = nil
 		findingsJSON, _ := json.Marshal(noChangeFindings)
 		return approvedReviewOutcome(reviewTargetSHA, &pipeline.StepOutcome{
-			Findings:        string(findingsJSON),
-			ReviewablePaths: reviewable,
-			FixSummary:      fixSummary,
+			Findings:                   string(findingsJSON),
+			ReviewablePaths:            reviewable,
+			FixSummary:                 fixSummary,
+			ReviewComparisonGeneration: reviewGeneration,
 		})
 	}
 
@@ -423,6 +437,10 @@ Risk assessment (after listing all findings):
 	// validates. Every other failure returns at once, and so does a rejection
 	// from a turn its deadline or a cancellation cut short.
 	turnPrompt := prompt
+	if sctx.ScopeFindings != "" {
+		prompt += scopeDispositionPromptSection(sctx.ScopeFindings)
+		turnPrompt = prompt
+	}
 	sessionRole := pipeline.SessionRole("")
 	if convDir != "" && !sctx.Fixing {
 		// A fresh identity unless this is the finalize turn of the pass that
@@ -457,7 +475,7 @@ Risk assessment (after listing all findings):
 		Prompt:     turnPrompt,
 		CWD:        sctx.WorkDir,
 		Env:        sctx.Env,
-		JSONSchema: reviewSchemaForFinalize(sctx.FinalizingAnswers && convDir != ""),
+		JSONSchema: reviewSchemaForFinalize(sctx.FinalizingAnswers && convDir != "" || sctx.ScopeFindings != ""),
 		OnChunk:    sctx.LogChunk,
 		Purpose:    "review",
 		Workload:   workload,
@@ -540,13 +558,14 @@ Risk assessment (after listing all findings):
 	findingsJSON, _ := json.Marshal(findings)
 
 	return approvedReviewOutcome(reviewTargetSHA, &pipeline.StepOutcome{
-		NeedsApproval:     needsApproval,
-		AutoFixable:       len(findings.Items) > 0,
-		Findings:          string(findingsJSON),
-		ReviewedPaths:     findings.ReviewedPaths,
-		WithdrawnFindings: withdrawnFindings(findings),
-		ReviewablePaths:   reviewable,
-		FixSummary:        fixSummary,
+		NeedsApproval:              needsApproval,
+		AutoFixable:                len(findings.Items) > 0,
+		Findings:                   string(findingsJSON),
+		ReviewedPaths:              findings.ReviewedPaths,
+		WithdrawnFindings:          withdrawnFindings(findings),
+		ReviewablePaths:            reviewable,
+		FixSummary:                 fixSummary,
+		ReviewComparisonGeneration: reviewGeneration,
 	})
 }
 
@@ -683,6 +702,7 @@ func (s *ReviewStep) completeCoverageGaps(sctx *pipeline.StepContext, basePrompt
 		completion = stripped
 	}
 	findings.Items = append(findings.Items, completion.Items...)
+	findings.WithdrawnFindings = append(findings.WithdrawnFindings, completion.WithdrawnFindings...)
 	findings.ReviewedPaths = mergeReviewedPaths(findings.ReviewedPaths, completion.ReviewedPaths)
 	mergeReviewRisk(&findings, completion)
 	// The completion turn's prompt is the full review prompt, protocol section
@@ -1030,14 +1050,14 @@ func resolveReviewBaseSHA(ctx context.Context, sctx *pipeline.StepContext) (stri
 	return baseSHA, nil
 }
 
-// withdrawnFindings is the answer round's retraction list. A blank id is
+// withdrawnFindings is the independent turn's retraction list. A blank id is
 // dropped: an entry that names nothing cannot retract anything, and letting it
 // through would clear on a typo. The reason travels with the id because a
 // retraction is a claim the reviewer makes, and the executor records it where
 // the finding's disappearance can be read back against it.
 //
 // Whether a round may retract at all is the executor's call, not this one's:
-// it owns the outstanding set and applies this list only on a finalize turn.
+// it owns the outstanding set and validates the turn's authority to retract.
 func withdrawnFindings(findings Findings) []types.WithdrawnFinding {
 	if len(findings.WithdrawnFindings) == 0 {
 		return nil

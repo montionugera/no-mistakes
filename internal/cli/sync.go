@@ -571,6 +571,9 @@ func boundedSyncValue(value string) string {
 }
 
 func syncStateSuccessful(state branchsync.State, check bool) bool {
+	if state.State == branchsync.StateImmutableSource {
+		return check && state.Remote.Freshness == "live"
+	}
 	if state.State == branchsync.StateSynchronized || state.State == branchsync.StateMergedRemoteRemoved {
 		return true
 	}
@@ -676,6 +679,9 @@ func cachedBranchSyncField(ctxCmd *cobra.Command, runID string) *toON.Field {
 }
 
 func relevantCachedSyncState(state branchsync.State) bool {
+	if state.State == branchsync.StateImmutableSource {
+		return true
+	}
 	switch state.State {
 	case branchsync.StatePipelineOwned, branchsync.StatePushInProgress, branchsync.StateBehind,
 		branchsync.StateLocalAhead, branchsync.StateDiverged, branchsync.StateDirty,

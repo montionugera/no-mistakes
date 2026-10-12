@@ -487,6 +487,9 @@ func TestTestStep_NoLiveSurfaceCIWorkflowAsksUser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !types.IsNoSurfaceTestAcknowledgment(findings) {
+		t.Fatalf("native no-surface output cannot be acknowledged: %s", outcome.Findings)
+	}
 	if findings.Verdict != types.TestVerdictNoSurface {
 		t.Fatalf("verdict = %q, want %q", findings.Verdict, types.TestVerdictNoSurface)
 	}

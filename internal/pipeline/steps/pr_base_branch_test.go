@@ -2,6 +2,7 @@ package steps
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 func TestEffectivePRBaseBranch_PerRunOverrideWinsOverRepoConfig(t *testing.T) {
@@ -167,6 +169,104 @@ func TestPRStep_RepoConfigChangeDoesNotRetargetExistingPR(t *testing.T) {
 		t.Fatalf("repo-config pr.base_branch must not retarget an existing PR, got:\n%s", logData)
 	}
 }
+
+func TestPRStep_StrictShippingRejectsExistingPRWithWrongLiveBase(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	env, logFile := fakeGHWithBase(t, "https://github.com/test/repo/pull/42", "develop")
+
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Run.Shipping = &types.ShippingOptions{Mode: types.ShippingFull, TargetBranch: "main"}
+
+	if _, err := (&PRStep{}).Execute(sctx); err == nil || !strings.Contains(err.Error(), "strict shipping target mismatch") {
+		t.Fatalf("PR step error = %v, want strict target mismatch", err)
+	}
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logData), "pr edit") || strings.Contains(string(logData), "pr create") {
+		t.Fatalf("strict target mismatch changed or created a PR:\n%s", logData)
+	}
+}
+
+func TestCIStep_StrictShippingRejectsWrongLiveBaseAndClearsReadiness(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Run.Shipping = &types.ShippingOptions{Mode: types.ShippingFull, TargetBranch: "main"}
+	prURL := "https://github.com/test/repo/pull/42"
+	sctx.Run.PRURL = &prURL
+	if err := sctx.DB.SetRunCIReady(sctx.Run.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	sctx.Env = append(fakeCIGH(t, "OPEN", `[]`), "FAKE_CLI_PR_BASE=develop")
+
+	if _, err := (&CIStep{}).Execute(sctx); err == nil || !strings.Contains(err.Error(), "strict shipping target mismatch") {
+		t.Fatalf("CI step error = %v, want strict target mismatch", err)
+	}
+	got, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CIReadyAt != nil {
+		t.Fatalf("CI mismatch left readiness set at %v", got.CIReadyAt)
+	}
+}
+
+func TestCIStep_AutoFixChecksStrictBaseBeforePushWindow(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ensureLocalBranch(t, dir, "develop", baseSHA)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Run.Shipping = &types.ShippingOptions{Mode: types.ShippingFull, TargetBranch: "main"}
+	pr := &scm.PR{Number: "42", URL: "https://github.com/test/repo/pull/42", BaseBranch: "develop"}
+	host := &strictBaseReadHost{database: sctx.DB, runID: sctx.Run.ID, base: "develop"}
+	agent := &mockAgent{name: "test", runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+		return nil, errors.New("unexpected fixer call")
+	}}
+	sctx.Agent = agent
+
+	_, err := (&CIStep{}).autoFixCI(sctx, host, pr, ciTargetsFor(nil, true))
+	if err == nil || !strings.Contains(err.Error(), "strict shipping target mismatch") {
+		t.Fatalf("autoFixCI error = %v, want strict target mismatch", err)
+	}
+	if host.readCalls != 1 || host.pushActiveAtRead {
+		t.Fatalf("live target reads = %d, push active during read = %t; want one read before push window", host.readCalls, host.pushActiveAtRead)
+	}
+	if len(agent.calls) != 0 {
+		t.Fatalf("strict target mismatch invoked fixer %d times", len(agent.calls))
+	}
+	got, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PushActive {
+		t.Fatal("strict target mismatch left push window active")
+	}
+}
+
+type strictBaseReadHost struct {
+	scm.Host
+	database         *db.DB
+	runID            string
+	base             string
+	readCalls        int
+	pushActiveAtRead bool
+}
+
+func (h *strictBaseReadHost) GetPRBaseBranch(context.Context, *scm.PR) (string, error) {
+	h.readCalls++
+	run, err := h.database.GetRun(h.runID)
+	if err != nil {
+		return "", err
+	}
+	h.pushActiveAtRead = run.PushActive
+	return h.base, nil
+}
+
+func (*strictBaseReadHost) Capabilities() scm.Capabilities { return scm.Capabilities{} }
 
 func TestRetargetExistingPRIfNeeded_MismatchedIdentityFailsClosed(t *testing.T) {
 	t.Parallel()

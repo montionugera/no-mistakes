@@ -28,6 +28,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/procreap"
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
+	"github.com/kunchenguid/no-mistakes/internal/shipping"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 	"github.com/kunchenguid/no-mistakes/internal/verificationplan"
@@ -1338,7 +1339,14 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		if err != nil {
 			return nil, err
 		}
-		run, claimed, err := d.ClaimLaunchReceipt(p.RepoID, p.Branch, p.LaunchNonce, p.SubmittedHeadSHA, p.ValidationGeneration, p.IntentDigest, prBaseBranch, p.OmitIntent, p.PiProfile)
+		existing, err := d.GetRunByLaunchNonce(p.RepoID, p.Branch, p.LaunchNonce)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil && !existing.Shipping.Matches(p.Shipping) {
+			return nil, fmt.Errorf("conflicting launch_nonce: shipping pin differs")
+		}
+		run, claimed, err := d.ClaimLaunchReceipt(p.RepoID, p.Branch, p.LaunchNonce, p.SubmittedHeadSHA, p.ValidationGeneration, p.IntentDigest, prBaseBranch, p.OmitIntent, p.Shipping, p.PiProfile)
 		if err != nil {
 			return nil, fmt.Errorf("claim launch receipt: %w", err)
 		}
@@ -1366,6 +1374,9 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 	})
 
 	// Capability probe for --no-publish-intent: see ipc.ProbeOmitIntentResult.
+	srv.Handle(ipc.MethodProbeShipping, func(context.Context, json.RawMessage) (interface{}, error) {
+		return &ipc.ProbeOmitIntentResult{OK: true}, nil
+	})
 	srv.Handle(ipc.MethodProbeOmitIntent, func(context.Context, json.RawMessage) (interface{}, error) {
 		return &ipc.ProbeOmitIntentResult{OK: true}, nil
 	})
@@ -1591,6 +1602,7 @@ func gateContextResult(result gatecontext.Result) ipc.GateContextResult {
 
 func runToInfo(d *db.DB, r *db.Run, steps []*db.StepResult) *ipc.RunInfo {
 	info := &ipc.RunInfo{
+		Shipping:           r.Shipping,
 		ID:                 r.ID,
 		RepoID:             r.RepoID,
 		Branch:             r.Branch,
@@ -1610,6 +1622,15 @@ func runToInfo(d *db.DB, r *db.Run, steps []*db.StepResult) *ipc.RunInfo {
 		AwaitingAgentSince: r.AwaitingAgentSince,
 		CreatedAt:          r.CreatedAt,
 		UpdatedAt:          r.UpdatedAt,
+	}
+	if r.Shipping != nil {
+		if c := shipping.CachedStatusIdentity(d, r); c != nil {
+			info.ReviewGeneration = c.Generation
+			info.SourceRepo = c.SourceRepo
+			info.SourceBranch = c.SourceBranch
+			info.TargetBranch = c.TargetBranch
+			info.TargetSHA = c.TargetSHA
+		}
 	}
 	if len(steps) > 0 {
 		info.Steps = make([]ipc.StepResultInfo, 0, len(steps))
