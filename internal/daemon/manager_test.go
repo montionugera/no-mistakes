@@ -689,6 +689,16 @@ func TestPushReceivedConcurrentDifferentBranchRunsAvoidSharedConfigLock(t *testi
 	const repoID = "concurrent-config-lock-repo"
 	_, headSHA := setupTestGitRepo(t, p, d, repoID)
 
+	// A sibling fetch may own this shared ref lock. Starting another branch
+	// must fetch its trusted config independently, without updating this ref.
+	trackingDir := filepath.Join(p.RepoDir(repoID), "refs", "remotes", "origin")
+	if err := os.MkdirAll(trackingDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(trackingDir, "main.lock"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	// Mirror a real gate: enable the per-worktree config isolation that
 	// `no-mistakes init` installs, which is what lets identity writes avoid the
 	// shared config.lock.
@@ -754,6 +764,7 @@ func TestPushReceivedConcurrentDifferentBranchRunsAvoidSharedConfigLock(t *testi
 		if active.Status != types.RunRunning {
 			t.Fatalf("active run for %s status = %s, want running (error: %v)", br, active.Status, active.Error)
 		}
+		t.Logf("concurrent startup accepted branch=%s run=%s status=%s", br, active.ID, active.Status)
 	}
 }
 

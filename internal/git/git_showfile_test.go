@@ -71,15 +71,13 @@ func TestShowFile_AtBranchRef(t *testing.T) {
 	if err := InitBare(ctx, bare); err != nil {
 		t.Fatal(err)
 	}
-	// The gate bare repo records the upstream as origin; the linked worktree
-	// shares that config, so the daemon's `git fetch origin <branch>` works.
+	// The linked worktree inherits origin from the bare gate's config.
 	if err := AddRemote(ctx, bare, "origin", bare); err != nil {
 		t.Fatalf("add origin to bare: %v", err)
 	}
 	run(t, src, "git", "remote", "add", "origin", bare)
 	run(t, src, "git", "push", "origin", "HEAD:refs/heads/main")
 
-	// Fetch into a remote-tracking ref like the daemon does for the worktree.
 	wt := filepath.Join(t.TempDir(), "worktree")
 	sha := run(t, src, "git", "rev-parse", "HEAD")
 	if err := WorktreeAdd(ctx, bare, wt, sha); err != nil {

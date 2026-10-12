@@ -43,7 +43,7 @@ type StepFactory func() []pipeline.Step
 
 var recoveredConfigFetchTimeout = 10 * time.Second
 
-var fetchRecoveredRemoteBranch = git.FetchRemoteBranch
+var fetchRecoveredDefaultBranchSHA = fetchTrustedDefaultBranchSHA
 
 // RunManager tracks active pipeline executors and manages run lifecycle.
 type RunManager struct {
@@ -235,10 +235,8 @@ func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo 
 	if repo.DefaultBranch != "" {
 		fetchCtx, cancel := context.WithTimeout(ctx, recoveredConfigFetchTimeout)
 		defer cancel()
-		if err := fetchRecoveredRemoteBranch(fetchCtx, workDir, "origin", repo.DefaultBranch); err != nil {
+		if sha, err := fetchRecoveredDefaultBranchSHA(fetchCtx, workDir, repo); err != nil {
 			slog.Warn("failed to fetch default branch while recovering run; trusted config disabled", "run_id", run.ID, "branch", repo.DefaultBranch, "error", err)
-		} else if sha, err := git.ResolveRef(ctx, workDir, "refs/remotes/origin/"+repo.DefaultBranch); err != nil {
-			slog.Warn("failed to resolve default branch while recovering run; trusted config disabled", "run_id", run.ID, "branch", repo.DefaultBranch, "error", err)
 		} else {
 			trustedSHA = sha
 		}
@@ -1311,29 +1309,16 @@ func resolveRerunHead(ctx context.Context, gateDir, branch string, latest *db.Ru
 	return "", fmt.Errorf("refusing rerun from stale gate head %s: terminal run %s recorded unpublished head %s, but that head is unavailable; inspect with `no-mistakes axi status` and reconcile custody first", gateHead, latest.ID, latest.HeadSHA)
 }
 
-// fetchRunDefaultBranch fetches the trusted branch from the refreshed
-// registration when it differs from the gate worktree's inherited origin. It
-// updates only the run worktree's existing origin tracking ref and never
-// rewrites clone or gate remote configuration. When the values agree after
-// redaction, origin remains authoritative so embedded credentials retained in
-// the gate can still authenticate without ever entering the database.
-func fetchRunDefaultBranch(ctx context.Context, workDir string, repo *db.Repo) error {
-	originURL, err := git.GetRemoteURL(ctx, workDir, "origin")
-	if !repo.URLsVerified || (err == nil && safeurl.Redact(originURL) == repo.UpstreamURL) {
-		return git.FetchRemoteBranch(ctx, workDir, "origin", repo.DefaultBranch)
-	}
-	return git.FetchRemoteBranchToRef(ctx, workDir, repo.UpstreamURL, repo.DefaultBranch, "refs/remotes/origin/"+repo.DefaultBranch)
-}
-
 // fetchTrustedDefaultBranchSHA imports the live default branch into a
-// caller-owned private ref on the gate. It does not rewrite origin tracking
-// refs, FETCH_HEAD, or any shared worktree ref, so a refused Pi pin cannot
-// perturb an in-flight validation that must stay running.
+// caller-owned private ref and pins its SHA before deleting the ref. New runs,
+// recovery, and Pi-profile validation share this boundary so concurrent reads
+// never contend on origin tracking refs or FETCH_HEAD. Refreshed registration
+// URLs apply when verified; otherwise origin retains its authentication.
 func fetchTrustedDefaultBranchSHA(ctx context.Context, gateDir string, repo *db.Repo) (string, error) {
 	if strings.TrimSpace(repo.DefaultBranch) == "" {
-		return "", fmt.Errorf("cannot evaluate Pi run profile: repository has no known default branch to read trusted config from")
+		return "", fmt.Errorf("cannot read trusted config: repository has no known default branch to read trusted config from")
 	}
-	privateRef := fmt.Sprintf("refs/no-mistakes/pi-profile/%d-%d", os.Getpid(), time.Now().UnixNano())
+	privateRef := fmt.Sprintf("refs/no-mistakes/trusted-config/%d-%d", os.Getpid(), time.Now().UnixNano())
 	defer func() {
 		_, _ = git.Run(context.WithoutCancel(ctx), gateDir, "update-ref", "--no-deref", "-d", privateRef)
 	}()
@@ -1345,11 +1330,11 @@ func fetchTrustedDefaultBranchSHA(ctx context.Context, gateDir string, repo *db.
 		fetchErr = git.FetchRemoteBranchToPrivateRef(ctx, gateDir, repo.UpstreamURL, repo.DefaultBranch, privateRef)
 	}
 	if fetchErr != nil {
-		return "", fmt.Errorf("cannot evaluate Pi run profile: failed to fetch trusted default branch %q: %w", repo.DefaultBranch, fetchErr)
+		return "", fmt.Errorf("cannot read trusted config: failed to fetch trusted default branch %q: %w", repo.DefaultBranch, fetchErr)
 	}
 	sha, err := git.ResolveRef(ctx, gateDir, privateRef)
 	if err != nil {
-		return "", fmt.Errorf("cannot evaluate Pi run profile: failed to resolve trusted default branch %q: %w", repo.DefaultBranch, err)
+		return "", fmt.Errorf("cannot read trusted config: failed to resolve trusted default branch %q: %w", repo.DefaultBranch, err)
 	}
 	return sha, nil
 }
@@ -1649,22 +1634,11 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 			return "", err
 		}
 	}
-	// Fetch the trusted default branch and resolve it to an exact commit SHA
-	// before any read. Reading the trusted config at this pinned SHA (rather
-	// than the origin/<defaultBranch> remote-tracking ref) is what makes a
-	// fetch failure fail closed: if the fetch errors or the ref does not
-	// resolve, trustedSHA stays empty, loadTrustedRepoConfig returns nil, and
-	// EffectiveRepoConfig drops the pushed branch's commands/agent. Without
-	// the resolve, a stale origin/<defaultBranch> left in the shared bare
-	// repo by a previous run could serve a trusted copy that the live default
-	// branch has already removed - silently running stale shell.
+	// Pin a freshly fetched trusted commit independently of shared tracking refs.
 	var trustedSHA string
 	if repo.DefaultBranch != "" {
-		fetchErr := fetchRunDefaultBranch(ctx, wtDir, repo)
-		if fetchErr != nil {
-			slog.Warn("failed to fetch default branch into worktree; trusted config disabled (commands/agent from pushed branch will be dropped)", "run_id", run.ID, "branch", repo.DefaultBranch, "error", fetchErr)
-		} else if sha, err := git.ResolveRef(ctx, wtDir, "refs/remotes/origin/"+repo.DefaultBranch); err != nil {
-			slog.Warn("failed to resolve fetched default-branch ref; trusted config disabled", "run_id", run.ID, "branch", repo.DefaultBranch, "error", err)
+		if sha, err := fetchTrustedDefaultBranchSHA(ctx, wtDir, repo); err != nil {
+			slog.Warn("failed to fetch trusted default branch", "run_id", run.ID, "branch", repo.DefaultBranch, "error", err)
 		} else {
 			trustedSHA = sha
 		}
