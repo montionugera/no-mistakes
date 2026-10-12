@@ -39,7 +39,8 @@ concurrency:
 jobs:
   check:
     name: PR must be raised via no-mistakes
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, king-server, no-mistakes]
+    timeout-minutes: 10
     # Known automation accounts are exempt so the release pipeline keeps working:
     # - github-actions[bot] opens the release-please PR via GITHUB_TOKEN
     # - dependabot[bot] opens dependency update PRs
@@ -51,6 +52,7 @@ jobs:
     # skipped job is also what every ruleset in the fleet already sees for these
     # authors, so keeping the condition here preserves the exact verdict shape.
     if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       github.event.pull_request.user.login != 'github-actions[bot]' &&
       github.event.pull_request.user.login != 'dependabot[bot]' &&
       github.event.pull_request.user.login != 'release-please[bot]'

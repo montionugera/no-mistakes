@@ -40,6 +40,9 @@ func TestGuardGeneratedFilesWorkflowExemptsReleasePlease(t *testing.T) {
 	}
 	content := string(data)
 
+	if !strings.Contains(content, forkGuard) {
+		t.Errorf("workflow must keep the same-repository fork guard alongside the author exemptions")
+	}
 	for _, login := range []string{"github-actions[bot]", "release-please[bot]"} {
 		needle := "github.event.pull_request.user.login != '" + login + "'"
 		if !strings.Contains(content, needle) {

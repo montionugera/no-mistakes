@@ -23,6 +23,9 @@ func TestNixWorkflowBuildsAndChecksTheFlake(t *testing.T) {
 	if !ok {
 		t.Fatal("Nix workflow has no nix job")
 	}
+	if !slices.Equal(wfList(job.RunsOn), kingServerRunner) {
+		t.Errorf("nix job runs-on = %v, want the self-hosted king-server runner", job.RunsOn)
+	}
 	if !slices.ContainsFunc(job.Steps, func(step wfStep) bool {
 		return strings.HasPrefix(step.Uses, "DeterminateSystems/nix-installer-action@")
 	}) {
@@ -45,13 +48,23 @@ func TestNixWorkflowBuildsAndChecksTheFlake(t *testing.T) {
 }
 
 func TestNixWorkflowRunsOnEveryVendorHashInput(t *testing.T) {
-	pr, ok := loadWorkflowPullRequest(t, filepath.Join(".github", "workflows", "nix.yml"))
-	if !ok {
-		t.Fatal("Nix workflow has no pull_request trigger")
+	raw, err := os.ReadFile(filepath.Join(".github", "workflows", "nix.yml"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	paths, _ := pr["paths"].([]any)
+	var wf struct {
+		On struct {
+			PullRequest struct {
+				Paths []string `yaml:"paths"`
+			} `yaml:"pull_request"`
+		} `yaml:"on"`
+	}
+	if err := yaml.Unmarshal(raw, &wf); err != nil {
+		t.Fatal(err)
+	}
+	paths := wf.On.PullRequest.Paths
 	for _, want := range []string{"go.mod", "go.sum", "package.nix", "flake.nix", "flake.lock", "default.nix"} {
-		if !slices.Contains(paths, any(want)) {
+		if !slices.Contains(paths, want) {
 			t.Errorf("Nix workflow pull_request paths must include %q, got %v", want, paths)
 		}
 	}

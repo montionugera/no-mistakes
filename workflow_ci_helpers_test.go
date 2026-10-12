@@ -9,6 +9,53 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// wfDoc is a minimal typed view of a workflow. Flexible fields (runs-on) are
+// decoded as any and normalized by wfScalar and wfList.
+type wfDoc struct {
+	Jobs map[string]*wfJob `yaml:"jobs"`
+}
+
+type wfJob struct {
+	name           string
+	RunsOn         any      `yaml:"runs-on"`
+	If             string   `yaml:"if"`
+	TimeoutMinutes int      `yaml:"timeout-minutes"`
+	Steps          []wfStep `yaml:"steps"`
+}
+
+type wfStep struct {
+	Name  string            `yaml:"name"`
+	Uses  string            `yaml:"uses"`
+	If    string            `yaml:"if"`
+	Shell string            `yaml:"shell"`
+	Env   map[string]string `yaml:"env"`
+	Run   string            `yaml:"run"`
+	With  map[string]string `yaml:"with"`
+}
+
+func wfScalar(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func wfList(v any) []string {
+	switch t := v.(type) {
+	case string:
+		return []string{t}
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, e := range t {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
 func loadCIWorkflowDoc(t *testing.T) *wfDoc {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join(".github", "workflows", "ci.yml"))

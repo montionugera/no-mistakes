@@ -1,38 +1,38 @@
 ---
 title: Fork CI on king-server
-description: Local Linux validation, Windows receive-hook coverage, and the required execution policy.
+description: Self-hosted-only workflow execution on king-server and the required execution policy.
 ---
 
-The `vifar/no-mistakes` fork runs its three Linux `CI` jobs on `king-server` through
-the existing `ci-pilot` Linux virtual machine. The repository-scoped runner
-`no-mistakes-king-server-1` uses the labels `self-hosted`, `Linux`, `X64`,
-`king-server`, and `no-mistakes`. All three Linux jobs require every label.
-There is no hosted fallback for those jobs when this runner is offline.
+The `vifar/no-mistakes` fork runs every job of every workflow (`CI`, `docs`,
+`Guard generated files`, `Nix flake`, and `Require no-mistakes`) on `king-server`
+through the existing `ci-pilot` Linux virtual machine. Nothing runs on a
+GitHub-hosted runner. The repository-scoped runner `no-mistakes-king-server-1`
+uses the labels `self-hosted`, `Linux`, `X64`, `king-server`, and
+`no-mistakes`, and every job requires every label. There is no hosted fallback
+when this runner is offline; jobs queue until it returns. It is a single
+runner, so jobs from all workflows run one at a time.
+
+Every job also carries the same-repository guard
+`github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository`,
+so code from an external fork pull request never reaches the runner. The
+release and channel-publishing workflows were removed from this fork; it
+publishes nothing from Actions. A repository test walks every workflow file and
+fails on any job that is not routed to these labels.
 
 CI runs on pull requests from branches in this repository, pushes to `main`,
 and manual dispatches. It checks formatting, the generated skill, and vet;
 runs the full Go race suite; builds the Linux CLI; cross-compiles the other
 desktop targets; and runs end-to-end journeys through `make e2e`. Go 1.27.1
 avoids the race-enabled subprocess issue documented for Go 1.26.0–1.26.4.
-The separate `windows-receive-hooks` job runs on hosted `windows-2025` and
-executes `TestReceiveHooksGitForWindows` with the `e2e` tag. It uses Git for
-Windows Bash and a recording native CLI to check drive-letter and UNC gates
-with `MSYS2_ARG_CONV_EXCL=*`, including enrolled runtime ownership, pinned
-native gate arguments, copied-hook refusal, and unchanged refs after refusal.
-The runner must already expose its loopback administrative drive share;
-missing prerequisites fail the test rather than skipping either path case.
-Cross-compilation remains the only macOS check and does not prove runtime
-behavior there.
+The Git for Windows receive-hook test (`TestReceiveHooksGitForWindows`, `e2e`
+tag) is not run by this fork's CI: no hosted Windows runner is used, and
+cross-compilation remains the only Windows and macOS check. It does not prove
+runtime behavior there.
 
 Every CI job checks out the exact PR head (or event SHA outside a PR) without
-persisting checkout credentials. The Windows job uploads
-`windows-receive-hooks-<head SHA>` even on failure, containing
-`windows-receive-hooks-head.txt` and `windows-receive-hooks.log`. The log
-records the native CLI calls and a head-stamped result for each passing drive
-and UNC case; use it with the job result to verify coverage of the proposed
-head. A local POSIX-shell run does not establish Git for Windows coverage.
+persisting checkout credentials.
 
-The runner needs Git, Make, a C compiler with libc development headers (for
+The runner needs Git, Make, Python 3 (for the `Require no-mistakes` action), a C compiler with libc development headers (for
 the race detector), and the `sqlite3` CLI used by the Pi-profile journeys.
 Administrators install these dependencies; the runner account does not gain
 sudo access. The 104-journey end-to-end package has a 25-minute deadline inside
@@ -76,9 +76,11 @@ verify its published SHA-256 digest, and pass a temporary registration token
 through a protected channel. Never save that bootstrap token in this repo.
 Runner credentials remain restricted to the runner account.
 
-The upstream docs, Nix, generated-file, signature, and release workflows retain
-their existing routing. This local workflow restores Go build and test CI;
-it does not change publication destinations or install the CLI on the owner’s Mac.
+The `docs`, `Guard generated files`, `Nix flake`, and `Require no-mistakes`
+workflows run on the same runner. `actions/setup-node` downloads its own Node.
+The Nix job installs Nix on the runner through the Determinate installer on its
+first run, so that run modifies `ci-pilot`. None of these workflows change
+publication destinations or install the CLI on the owner’s Mac.
 
 ## Self-update destination
 

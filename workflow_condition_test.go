@@ -6,10 +6,12 @@ import (
 )
 
 type workflowConditionContext struct {
-	EventName      string
-	ReleaseTagName string
-	Cancelled      bool
-	Needs          map[string]string
+	EventName  string
+	Ref        string
+	Repository string
+	HeadRepo   string
+	Author     string
+	Cancelled  bool
 }
 
 func evaluateWorkflowCondition(expression string, context workflowConditionContext) (bool, error) {
@@ -96,14 +98,14 @@ func workflowConditionValue(expression string, context workflowConditionContext)
 	switch expression {
 	case "github.event_name":
 		return context.EventName, nil
-	case "github.event.release.tag_name":
-		return context.ReleaseTagName, nil
-	}
-	if strings.HasPrefix(expression, "needs.") && strings.HasSuffix(expression, ".result") {
-		name := strings.TrimSuffix(strings.TrimPrefix(expression, "needs."), ".result")
-		if name != "" && !strings.Contains(name, ".") {
-			return context.Needs[name], nil
-		}
+	case "github.ref":
+		return context.Ref, nil
+	case "github.repository":
+		return context.Repository, nil
+	case "github.event.pull_request.head.repo.full_name":
+		return context.HeadRepo, nil
+	case "github.event.pull_request.user.login":
+		return context.Author, nil
 	}
 	return "", fmt.Errorf("unsupported workflow condition value %q", expression)
 }

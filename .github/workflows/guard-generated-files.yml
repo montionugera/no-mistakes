@@ -22,15 +22,18 @@ concurrency:
 jobs:
   check:
     name: Generated files must not be hand-edited
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, king-server, no-mistakes]
+    timeout-minutes: 10
     # release-please owns CHANGELOG.md and .release-please-manifest.json; its PR
     # is the one legitimate place those files change, so we exempt its author.
     if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       github.event.pull_request.user.login != 'github-actions[bot]' &&
       github.event.pull_request.user.login != 'release-please[bot]'
     steps:
       - uses: actions/checkout@v6
         with:
+          persist-credentials: false
           # Need history on both sides of the merge-base so `git diff base...head`
           # reflects exactly what GitHub shows as "Files changed".
           fetch-depth: 0
