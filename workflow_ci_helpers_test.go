@@ -12,6 +12,7 @@ import (
 // wfDoc is a minimal typed view of a workflow. Flexible fields (runs-on) are
 // decoded as any and normalized by wfScalar and wfList.
 type wfDoc struct {
+	On   any               `yaml:"on"`
 	Jobs map[string]*wfJob `yaml:"jobs"`
 }
 

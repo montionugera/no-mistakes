@@ -4,6 +4,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // TestGuardGeneratedFilesWorkflowCoversReleasePleaseArtifacts pins the list of
@@ -38,15 +40,24 @@ func TestGuardGeneratedFilesWorkflowExemptsReleasePlease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read workflow: %v", err)
 	}
-	content := string(data)
-
-	if !strings.Contains(content, forkGuard) {
-		t.Errorf("workflow must keep the same-repository fork guard alongside the author exemptions")
+	var wf wfDoc
+	if err := yaml.Unmarshal(data, &wf); err != nil {
+		t.Fatal(err)
 	}
-	for _, login := range []string{"github-actions[bot]", "release-please[bot]"} {
-		needle := "github.event.pull_request.user.login != '" + login + "'"
-		if !strings.Contains(content, needle) {
-			t.Errorf("workflow must exempt %q via %q", login, needle)
+	job := wf.Jobs["check"]
+	if job == nil {
+		t.Fatal("missing check job")
+	}
+	if err := workflowAdmissionError(job.If); err != nil {
+		t.Errorf("check admission: %v", err)
+	}
+	for _, login := range []string{"github-actions[bot]", "release-please[bot]", "human-contributor", "unlisted-automation[bot]"} {
+		got, err := evaluateWorkflowCondition(job.If, workflowConditionContext{
+			EventName: "pull_request", Repository: "owner/repo", HeadRepo: "owner/repo", Author: login,
+		})
+		want := login == "human-contributor" || login == "unlisted-automation[bot]"
+		if err != nil || got != want {
+			t.Errorf("author %s runs = %t, want %t, error = %v", login, got, want, err)
 		}
 	}
 }

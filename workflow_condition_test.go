@@ -191,3 +191,30 @@ func splitWorkflowCondition(expression, operator string) ([]string, bool, error)
 	}
 	return parts, true, nil
 }
+
+func workflowAdmissionError(expression string) error {
+	for _, tc := range []struct {
+		name  string
+		event string
+		head  string
+		ref   string
+		want  bool
+	}{
+		{"same-repository PR", "pull_request", "owner/repo", "refs/heads/main", true},
+		{"fork PR on main", "pull_request", "stranger/repo", "refs/heads/main", false},
+		{"fork PR merge ref", "pull_request", "stranger/repo", "refs/pull/1/merge", false},
+		{"push", "push", "", "refs/heads/main", true},
+		{"manual dispatch", "workflow_dispatch", "", "refs/heads/main", true},
+	} {
+		got, err := evaluateWorkflowCondition(expression, workflowConditionContext{
+			EventName: tc.event, Repository: "owner/repo", HeadRepo: tc.head, Ref: tc.ref, Author: "human-contributor",
+		})
+		if err != nil {
+			return fmt.Errorf("%s: %w", tc.name, err)
+		}
+		if got != tc.want {
+			return fmt.Errorf("%s runs = %t, want %t", tc.name, got, tc.want)
+		}
+	}
+	return nil
+}

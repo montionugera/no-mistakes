@@ -53,11 +53,18 @@ func TestDocsWorkflowJobsRunSelfHostedForSameRepositoryCodeOnly(t *testing.T) {
 		if !slices.Equal(wfList(job.RunsOn), kingServerRunner) {
 			t.Errorf("%s runs-on = %v", name, job.RunsOn)
 		}
-		if !strings.Contains(job.If, forkGuard) {
-			t.Errorf("%s must refuse external fork PR code: %q", name, job.If)
+		if err := workflowAdmissionError(job.If); err != nil {
+			t.Errorf("%s admission: %v", name, err)
 		}
 	}
-	if got := wf.Jobs["deploy"].If; !strings.Contains(got, "github.ref == 'refs/heads/main'") {
-		t.Errorf("deploy must stay main-only: %q", got)
+	for _, name := range []string{"build", "deploy"} {
+		for _, event := range []string{"pull_request", "push", "workflow_dispatch"} {
+			got, err := evaluateWorkflowCondition(wf.Jobs[name].If, workflowConditionContext{
+				EventName: event, Repository: "owner/repo", HeadRepo: "owner/repo", Ref: "refs/heads/feature", Author: "human-contributor",
+			})
+			if err != nil || got != (name == "build") {
+				t.Errorf("%s on non-main %s runs = %t, error = %v", name, event, got, err)
+			}
+		}
 	}
 }

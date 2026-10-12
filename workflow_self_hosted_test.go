@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -13,8 +14,6 @@ import (
 // kingServerRunner is the only runner this fork uses. Nothing may run on a
 // GitHub-hosted runner, so every job in every workflow must route here.
 var kingServerRunner = []string{"self-hosted", "Linux", "X64", "king-server", "no-mistakes"}
-
-const forkGuard = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
 
 // TestEveryWorkflowJobRunsOnTheKingServer walks every workflow. Jobs of any
 // pull_request workflow must also refuse external fork code before they are
@@ -29,38 +28,69 @@ func TestEveryWorkflowJobRunsOnTheKingServer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var wf struct {
-			On   any               `yaml:"on"`
-			Jobs map[string]*wfJob `yaml:"jobs"`
+		for _, problem := range kingServerWorkflowProblems(raw) {
+			t.Errorf("%s: %s", path, problem)
 		}
-		if err := yaml.Unmarshal(raw, &wf); err != nil {
-			t.Fatalf("parse %s: %v", path, err)
+	}
+}
+
+func kingServerWorkflowProblems(raw []byte) []string {
+	var wf wfDoc
+	if err := yaml.Unmarshal(raw, &wf); err != nil {
+		return []string{fmt.Sprintf("parse workflow: %v", err)}
+	}
+	var problems []string
+	if len(wf.Jobs) == 0 {
+		problems = append(problems, "workflow defines no jobs")
+	}
+	events := wfList(wf.On)
+	if on, ok := wf.On.(map[string]any); ok {
+		for event := range on {
+			events = append(events, event)
 		}
-		if len(wf.Jobs) == 0 {
-			t.Errorf("%s defines no jobs", path)
+	}
+	for name, job := range wf.Jobs {
+		if !slices.Equal(wfList(job.RunsOn), kingServerRunner) {
+			problems = append(problems, fmt.Sprintf("job %s runs-on = %v, want only %v", name, job.RunsOn, kingServerRunner))
 		}
-		pullRequest := false
-		switch on := wf.On.(type) {
-		case map[string]any:
-			_, pullRequest = on["pull_request"]
-		case []any:
-			pullRequest = slices.Contains(on, any("pull_request"))
+		if job.TimeoutMinutes < 1 {
+			problems = append(problems, fmt.Sprintf("job %s has no timeout-minutes", name))
 		}
-		for name, job := range wf.Jobs {
-			if !slices.Equal(wfList(job.RunsOn), kingServerRunner) {
-				t.Errorf("%s job %s runs-on = %v, want only %v", path, name, job.RunsOn, kingServerRunner)
+		if slices.Contains(events, "pull_request") {
+			if err := workflowAdmissionError(job.If); err != nil {
+				problems = append(problems, fmt.Sprintf("job %s admission: %v", name, err))
 			}
-			if job.TimeoutMinutes < 1 {
-				t.Errorf("%s job %s has no timeout-minutes", path, name)
+		}
+		for _, step := range job.Steps {
+			if strings.HasPrefix(step.Uses, "actions/checkout@") && step.With["persist-credentials"] != "false" {
+				problems = append(problems, fmt.Sprintf("job %s checkout must set persist-credentials: false", name))
 			}
-			if pullRequest && !strings.Contains(job.If, forkGuard) {
-				t.Errorf("%s job %s must refuse external fork PR code before runner admission; if: %q", path, name, job.If)
-			}
-			for _, step := range job.Steps {
-				if strings.HasPrefix(step.Uses, "actions/checkout@") && step.With["persist-credentials"] != "false" {
-					t.Errorf("%s job %s checkout must set persist-credentials: false", path, name)
+		}
+	}
+	return problems
+}
+
+func TestKingServerWorkflowRejectsUnsafeAdmission(t *testing.T) {
+	for _, trigger := range []string{"pull_request", "[pull_request]", "{pull_request: {}}"} {
+		for _, condition := range []string{
+			"",
+			"(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'pull_request'",
+		} {
+			t.Run(trigger+"/"+condition, func(t *testing.T) {
+				raw := fmt.Sprintf("on: %s\njobs:\n  check:\n    runs-on: [self-hosted, Linux, X64, king-server, no-mistakes]\n    timeout-minutes: 10\n", trigger)
+				if condition != "" {
+					raw += "    if: " + condition + "\n"
 				}
-			}
+				if problems := kingServerWorkflowProblems([]byte(raw)); len(problems) != 1 {
+					t.Fatalf("unsafe admission problems = %v, want one rejection", problems)
+				}
+			})
 		}
+		t.Run(trigger+"/safe", func(t *testing.T) {
+			raw := fmt.Sprintf("on: %s\njobs:\n  check:\n    runs-on: [self-hosted, Linux, X64, king-server, no-mistakes]\n    timeout-minutes: 10\n    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository\n", trigger)
+			if problems := kingServerWorkflowProblems([]byte(raw)); len(problems) != 0 {
+				t.Fatalf("safe admission rejected: %v", problems)
+			}
+		})
 	}
 }

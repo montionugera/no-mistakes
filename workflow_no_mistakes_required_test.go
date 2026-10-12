@@ -613,24 +613,7 @@ func renderRequiredWorkflowTemplate(t *testing.T, template string, event require
 // PR never reaches the runner, whatever its author.
 func TestNoMistakesRequiredWorkflowRefusesForkCodeBeforeSelfHostedAdmission(t *testing.T) {
 	condition := loadRequiredWorkflow(t).Jobs["check"].If
-	for _, tc := range []struct {
-		name     string
-		headRepo string
-		wantRun  bool
-	}{
-		{name: "same repository", headRepo: "owner/repo", wantRun: true},
-		{name: "external fork", headRepo: "stranger/repo", wantRun: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := evaluateWorkflowCondition(condition, workflowConditionContext{
-				EventName: "pull_request", Repository: "owner/repo", HeadRepo: tc.headRepo, Author: "human-contributor",
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != tc.wantRun {
-				t.Fatalf("check job runs = %t, want %t", got, tc.wantRun)
-			}
-		})
+	if err := workflowAdmissionError(condition); err != nil {
+		t.Fatal(err)
 	}
 }
