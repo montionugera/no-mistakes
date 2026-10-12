@@ -21,19 +21,19 @@ func TestLoadRecoveredConfig_BoundsFetchAndFailsClosed(t *testing.T) {
 	t.Cleanup(func() { recoveredConfigFetchTimeout = oldTimeout })
 
 	fetchResult := make(chan error, 1)
-	oldFetch := fetchRecoveredRemoteBranch
-	fetchRecoveredRemoteBranch = func(ctx context.Context, _, _, _ string) error {
+	oldFetch := fetchRecoveredDefaultBranchSHA
+	fetchRecoveredDefaultBranchSHA = func(ctx context.Context, _ string, _ *db.Repo) (string, error) {
 		select {
 		case <-ctx.Done():
 			fetchResult <- ctx.Err()
-			return ctx.Err()
+			return "", ctx.Err()
 		case <-time.After(time.Second):
 			err := errors.New("fetch context was not bounded")
 			fetchResult <- err
-			return err
+			return "", err
 		}
 	}
-	t.Cleanup(func() { fetchRecoveredRemoteBranch = oldFetch })
+	t.Cleanup(func() { fetchRecoveredDefaultBranchSHA = oldFetch })
 
 	p := paths.WithRoot(t.TempDir())
 	if err := p.EnsureDirs(); err != nil {
@@ -193,13 +193,41 @@ func TestLoadTrustedRepoConfig_PinnedSHAReadsFreshDefaultBranch(t *testing.T) {
 	if err := git.WorktreeAdd(ctx, bare, wt, staleSHA); err != nil {
 		t.Fatalf("WorktreeAdd: %v", err)
 	}
-	if err := git.FetchRemoteBranch(ctx, wt, "origin", "main"); err != nil {
-		t.Fatalf("fetch main: %v", err)
+	// Hold the shared tracking ref at the old commit, as a concurrent fetch
+	// would. The trusted reader must still import and pin the new remote tip.
+	gitCmd(t, wt, "update-ref", "refs/remotes/origin/main", staleSHA)
+	trackingDir := filepath.Join(bare, "refs", "remotes", "origin")
+	if err := os.WriteFile(filepath.Join(trackingDir, "main.lock"), nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	resolved, err := git.ResolveRef(ctx, wt, "refs/remotes/origin/main")
+	resolved, err := fetchTrustedDefaultBranchSHA(ctx, wt, &db.Repo{DefaultBranch: "main"})
 	if err != nil {
-		t.Fatalf("resolve origin/main: %v", err)
+		t.Fatalf("fetch trusted SHA: %v", err)
 	}
+	if got := gitOutput(t, wt, "rev-parse", "refs/remotes/origin/main"); got != staleSHA {
+		t.Fatalf("private fetch changed shared tracking ref to %s", got)
+	}
+	if refs, err := git.Run(ctx, wt, "for-each-ref", "--format=%(refname)", "refs/no-mistakes/trusted-config/"); err != nil || refs != "" {
+		t.Fatalf("private trusted-config ref inventory = %q, %v; want empty", refs, err)
+	}
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	mgr := NewRunManager(database, p, nil)
+	cfg, err := mgr.loadRecoveredConfig(ctx, &db.Run{ID: "test-run"}, &db.Repo{DefaultBranch: "main"}, wt)
+	if err != nil {
+		t.Fatalf("recover config while shared ref is locked: %v", err)
+	}
+	if cfg.TrustedConfigSHA != freshSHA || cfg.Commands.Lint != "echo fresh-B" {
+		t.Fatalf("recovered config = SHA %s lint %q, want fresh remote config", cfg.TrustedConfigSHA, cfg.Commands.Lint)
+	}
+
 	if resolved != freshSHA {
 		t.Fatalf("resolved SHA %s != fresh default-branch tip %s", resolved, freshSHA)
 	}

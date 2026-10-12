@@ -472,3 +472,53 @@ func TestWorktreeAddRemoveOnBareRepoUnderSafeBareRepositoryExplicit(t *testing.T
 		t.Fatalf("worktree remove from bare repo: %v", err)
 	}
 }
+
+// The private-fetch API promises object import without changing shared refs.
+// Real Git's configured fetch mapping would otherwise update origin/main even
+// with an explicit private destination, breaking concurrent trusted reads.
+func TestPrivateFetchesLeaveTrackingRefsAndFetchHeadUnchanged(t *testing.T) {
+	for _, exactRef := range []bool{false, true} {
+		name := "branch"
+		if exactRef {
+			name = "exact-ref"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			source := initTestRepo(t)
+			run(t, source, "git", "branch", "-M", "main")
+			clone := filepath.Join(t.TempDir(), "clone")
+			run(t, "", "git", "clone", source, clone)
+			before := run(t, clone, "git", "rev-parse", "refs/remotes/origin/main")
+			fetchHead := filepath.Join(clone, ".git", "FETCH_HEAD")
+			writeFile(t, fetchHead, "preserved fetch state\n")
+			writeFile(t, filepath.Join(source, "fresh.txt"), "fresh\n")
+			run(t, source, "git", "add", "fresh.txt")
+			run(t, source, "git", "commit", "-m", "advance remote")
+			want := run(t, source, "git", "rev-parse", "HEAD")
+			var err error
+			if exactRef {
+				err = FetchRemoteRef(ctx, clone, "origin", "refs/heads/main", want)
+			} else {
+				err = FetchRemoteBranchToPrivateRef(ctx, clone, "origin", "main", "refs/no-mistakes/test-private")
+				if err == nil {
+					if got := run(t, clone, "git", "rev-parse", "refs/no-mistakes/test-private"); got != want {
+						t.Fatalf("private ref = %s, want remote commit %s", got, want)
+					}
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := run(t, clone, "git", "rev-parse", "refs/remotes/origin/main"); got != before {
+				t.Fatalf("private fetch moved shared tracking ref from %s to %s", before, got)
+			}
+			if got := run(t, clone, "git", "cat-file", "-t", want); got != "commit" {
+				t.Fatalf("imported object type = %q, want commit", got)
+			}
+			data, err := os.ReadFile(fetchHead)
+			if err != nil || string(data) != "preserved fetch state\n" {
+				t.Fatalf("FETCH_HEAD changed: %q, %v", data, err)
+			}
+		})
+	}
+}

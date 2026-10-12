@@ -10,14 +10,20 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
+// Completion includes the executor's bounded five-second terminal Git check
+// and process cleanup. The test's wait must outlast that production budget.
+const cancellationTestWait = 15 * time.Second
+
 func TestExecutor_ContextCancellation(t *testing.T) {
 	database, p, run, repo := setupTest(t)
 	workDir := t.TempDir()
 
 	// Step that blocks until context is cancelled
+	started := make(chan struct{})
 	step := &adaptiveCallStep{
 		name: types.StepReview,
 		fn: func(sctx *StepContext) (*StepOutcome, error) {
+			close(started)
 			<-sctx.Ctx.Done()
 			return nil, sctx.Ctx.Err()
 		},
@@ -26,13 +32,17 @@ func TestExecutor_ContextCancellation(t *testing.T) {
 	exec := NewExecutor(database, p, nil, nil, []Step{step}, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() {
 		done <- exec.Execute(ctx, run, repo, workDir)
 	}()
 
-	// Give executor time to start
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-started:
+	case <-time.After(cancellationTestWait):
+		t.Fatal("step did not start")
+	}
 	cancel()
 
 	select {
@@ -40,7 +50,7 @@ func TestExecutor_ContextCancellation(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error from cancellation, got nil")
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(cancellationTestWait):
 		t.Fatal("executor timed out")
 	}
 
@@ -55,11 +65,13 @@ func TestExecutor_ContextCancelCause(t *testing.T) {
 	workDir := t.TempDir()
 
 	// Two steps: first passes, second blocks until context is cancelled.
-	// This tests that the cause propagates even when detected between steps.
+	// The handshake proves cancellation reaches the active second step.
+	started := make(chan struct{})
 	step1 := newPassStep(types.StepReview)
 	step2 := &adaptiveCallStep{
 		name: types.StepTest,
 		fn: func(sctx *StepContext) (*StepOutcome, error) {
+			close(started)
 			<-sctx.Ctx.Done()
 			return nil, context.Cause(sctx.Ctx)
 		},
@@ -69,13 +81,17 @@ func TestExecutor_ContextCancelCause(t *testing.T) {
 
 	cancelReason := fmt.Errorf("cancelled: superseded by new push")
 	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
 	done := make(chan error, 1)
 	go func() {
 		done <- exec.Execute(ctx, run, repo, workDir)
 	}()
 
-	// Give executor time to start step2
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-started:
+	case <-time.After(cancellationTestWait):
+		t.Fatal("second step did not start")
+	}
 	cancel(cancelReason)
 
 	select {
@@ -86,7 +102,7 @@ func TestExecutor_ContextCancelCause(t *testing.T) {
 		if !strings.Contains(err.Error(), "superseded by new push") {
 			t.Errorf("expected error to contain 'superseded by new push', got %q", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(cancellationTestWait):
 		t.Fatal("executor timed out")
 	}
 
@@ -113,8 +129,8 @@ func TestExecutor_ContextCancelCauseBetweenSteps(t *testing.T) {
 		name: types.StepReview,
 		fn: func(sctx *StepContext) (*StepOutcome, error) {
 			close(started)
-			// Small delay so cancel can fire before step2 starts
-			time.Sleep(50 * time.Millisecond)
+			// Return success only after cancellation, so it is detected between steps.
+			<-sctx.Ctx.Done()
 			return &StepOutcome{ExitCode: 0}, nil
 		},
 	}
@@ -124,12 +140,17 @@ func TestExecutor_ContextCancelCauseBetweenSteps(t *testing.T) {
 
 	cancelReason := fmt.Errorf("cancelled: superseded by new push")
 	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
 	done := make(chan error, 1)
 	go func() {
 		done <- exec.Execute(ctx, run, repo, workDir)
 	}()
 
-	<-started
+	select {
+	case <-started:
+	case <-time.After(cancellationTestWait):
+		t.Fatal("first step did not start")
+	}
 	cancel(cancelReason)
 
 	select {
@@ -140,8 +161,12 @@ func TestExecutor_ContextCancelCauseBetweenSteps(t *testing.T) {
 		if !strings.Contains(err.Error(), "superseded by new push") {
 			t.Errorf("expected error to contain 'superseded by new push', got %q", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(cancellationTestWait):
 		t.Fatal("executor timed out")
+	}
+
+	if step2.callCount() != 0 {
+		t.Fatal("second step ran after cancellation between steps")
 	}
 
 	updated, _ := database.GetRun(run.ID)
