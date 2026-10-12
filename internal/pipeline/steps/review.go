@@ -437,6 +437,10 @@ Risk assessment (after listing all findings):
 	// validates. Every other failure returns at once, and so does a rejection
 	// from a turn its deadline or a cancellation cut short.
 	turnPrompt := prompt
+	if sctx.ScopeFindings != "" {
+		prompt += scopeDispositionPromptSection(sctx.ScopeFindings)
+		turnPrompt = prompt
+	}
 	sessionRole := pipeline.SessionRole("")
 	if convDir != "" && !sctx.Fixing {
 		// A fresh identity unless this is the finalize turn of the pass that
@@ -471,7 +475,7 @@ Risk assessment (after listing all findings):
 		Prompt:     turnPrompt,
 		CWD:        sctx.WorkDir,
 		Env:        sctx.Env,
-		JSONSchema: reviewSchemaForFinalize(sctx.FinalizingAnswers && convDir != ""),
+		JSONSchema: reviewSchemaForFinalize(sctx.FinalizingAnswers && convDir != "" || sctx.ScopeFindings != ""),
 		OnChunk:    sctx.LogChunk,
 		Purpose:    "review",
 		Workload:   workload,
@@ -698,6 +702,7 @@ func (s *ReviewStep) completeCoverageGaps(sctx *pipeline.StepContext, basePrompt
 		completion = stripped
 	}
 	findings.Items = append(findings.Items, completion.Items...)
+	findings.WithdrawnFindings = append(findings.WithdrawnFindings, completion.WithdrawnFindings...)
 	findings.ReviewedPaths = mergeReviewedPaths(findings.ReviewedPaths, completion.ReviewedPaths)
 	mergeReviewRisk(&findings, completion)
 	// The completion turn's prompt is the full review prompt, protocol section
@@ -1045,14 +1050,14 @@ func resolveReviewBaseSHA(ctx context.Context, sctx *pipeline.StepContext) (stri
 	return baseSHA, nil
 }
 
-// withdrawnFindings is the answer round's retraction list. A blank id is
+// withdrawnFindings is the independent turn's retraction list. A blank id is
 // dropped: an entry that names nothing cannot retract anything, and letting it
 // through would clear on a typo. The reason travels with the id because a
 // retraction is a claim the reviewer makes, and the executor records it where
 // the finding's disappearance can be read back against it.
 //
 // Whether a round may retract at all is the executor's call, not this one's:
-// it owns the outstanding set and applies this list only on a finalize turn.
+// it owns the outstanding set and validates the turn's authority to retract.
 func withdrawnFindings(findings Findings) []types.WithdrawnFinding {
 	if len(findings.WithdrawnFindings) == 0 {
 		return nil

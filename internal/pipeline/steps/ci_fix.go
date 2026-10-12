@@ -685,7 +685,8 @@ func ciHeadAwaitsRecording(sctx *pipeline.StepContext, headSHA string) bool {
 // from Review after the CI step repairs a failing check, rather than publishing
 // the repair and continuing to monitor. It is the resolved ci.revalidate_repairs
 // policy (global config, overridden by the repository's trusted default-branch
-// config). The repair recorder uses it to choose immediate publication or
+// config), with mandatory revalidation for strict shipping. The repair recorder
+// uses it to choose immediate publication or
 // revalidation, and the CI monitor logs the resolved policy.
 func ciRevalidatesRepairs(sctx *pipeline.StepContext) bool {
 	return sctx.Run.Shipping != nil || sctx.Config != nil && sctx.Config.CI.RevalidateRepairs

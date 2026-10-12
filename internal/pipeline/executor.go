@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -1309,6 +1310,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	// Execute with possible fix loop
 rounds:
 	for {
+		if stepName == types.StepReview && run.Shipping != nil {
+			sctx.ScopeFindings = scopeFindingsForReview(sctx, outstandingFindings)
+		}
 		reviewStartingHeadSHA := run.HeadSHA
 		sctx.ReviewStartingHeadSHA = reviewStartingHeadSHA
 		if run.Shipping != nil && run.Shipping.Mode == types.ShippingImmutableSource {
@@ -1390,13 +1394,18 @@ rounds:
 			// that has nothing to do with it.
 			verificationFindings := dropReviewQuestionFindingsJSON(roundFindings)
 			outstandingFindings = dropReviewQuestionFindingsJSON(outstandingFindings)
-			// An answer round retracts by naming ids, never by silence - and
-			// ONLY an answer round. A fix round is held to the coverage rule,
-			// so a retraction it claimed would clear a selected finding no
-			// round ever positively verified.
+			// Answer rounds may retract unselected carry by name. A selected
+			// fix stays subject to verification; strict scope adjudications
+			// are checked separately against their durable human decisions.
 			var withdrawn []types.WithdrawnFinding
 			if sctx.FinalizingAnswers {
-				outstandingFindings, withdrawn = dropWithdrawnFindingsJSON(outstandingFindings, outcome.WithdrawnFindings)
+				var retractable []types.WithdrawnFinding
+				for _, w := range outcome.WithdrawnFindings {
+					if !slices.Contains(selectedOutstandingIDs, w.ID) {
+						retractable = append(retractable, w)
+					}
+				}
+				outstandingFindings, withdrawn = dropWithdrawnFindingsJSON(outstandingFindings, retractable)
 				for _, w := range withdrawn {
 					reason := w.Reason
 					if reason == "" {
@@ -1405,7 +1414,12 @@ rounds:
 					writeLog(fmt.Sprintf("answers retracted finding %s: %s", w.ID, safeurl.RedactText(reason)))
 				}
 			}
-			outstandingFindings = resolveVerifiedFindingsJSON(outstandingFindings, pendingVerificationIDs, outcome.ReviewedPaths, outcome.ReviewablePaths, verificationFindings)
+			var scopeWithdrawn []types.WithdrawnFinding
+			outstandingFindings, scopeWithdrawn = resolveReviewCarry(sctx, outstandingFindings, pendingVerificationIDs, outcome, verificationFindings)
+			withdrawn = append(withdrawn, scopeWithdrawn...)
+			for _, w := range scopeWithdrawn {
+				writeLog(fmt.Sprintf("independent review accepted scope disposition %s: %s", w.ID, safeurl.RedactText(w.Reason)))
+			}
 			pendingVerificationIDs = retainFindingIDs(outstandingFindings, pendingVerificationIDs)
 			selectedOutstandingIDs = retainFindingIDs(outstandingFindings, selectedOutstandingIDs)
 			effectiveFindings = mergeOutstandingFindingsJSON(outstandingFindings, roundFindings, outcome.ReviewedPaths)

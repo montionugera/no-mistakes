@@ -142,11 +142,25 @@ func stepFindingStats(step *StepResult, rounds []*StepRound) StepStats {
 	}
 
 	reported := make(map[types.Finding]bool)
+	withdrawn := make(map[types.Finding]bool)
+	byID := make(map[string]types.Finding)
 	var current []types.Finding
 	for _, round := range rounds {
+		if round.FindingsJSON != nil {
+			findings, err := types.ParseFindingsJSON(*round.FindingsJSON)
+			if err == nil {
+				for _, w := range findings.WithdrawnFindings {
+					if item, exists := byID[w.ID]; exists {
+						withdrawn[item] = true
+					}
+				}
+			}
+		}
 		items := findingItems(round.FindingsJSON)
 		for _, item := range items {
-			reported[findingStatsKey(item)] = true
+			key := findingStatsKey(item)
+			reported[key] = true
+			byID[item.ID] = key
 		}
 		current = items
 	}
@@ -154,6 +168,10 @@ func stepFindingStats(step *StepResult, rounds []*StepRound) StepStats {
 	stats.ReportedFindings = len(reported)
 	currentCount := len(current)
 	stats.FixedFindings = stats.ReportedFindings - currentCount
+	for _, item := range current {
+		delete(withdrawn, findingStatsKey(item))
+	}
+	stats.FixedFindings -= len(withdrawn)
 	if stats.FixedFindings < 0 {
 		stats.FixedFindings = 0
 	}

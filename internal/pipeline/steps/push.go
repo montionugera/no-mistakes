@@ -387,9 +387,9 @@ func updateGateMirrorAfterPush(ctx context.Context, sctx *pipeline.StepContext, 
 }
 
 // assertReviewApprovedPushHead refuses to publish a head that is not the
-// durably review-approved commit or a descendant of it. There is no exception:
-// a head that cannot show that ancestry has not been reviewed, and the CI
-// repair path answers that case by revalidating instead of publishing.
+// durably review-approved commit or a descendant of it. Ordinary publication
+// requires that ancestry; strict shipping also requires exact head and target
+// comparison equality. CI repairs revalidate when those requirements fail.
 func assertReviewApprovedPushHead(sctx *pipeline.StepContext, proposedHead string) error {
 	run, err := sctx.DB.GetRun(sctx.Run.ID)
 	if err != nil {

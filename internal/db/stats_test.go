@@ -6,6 +6,36 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
+func TestStepFindingStatsIndependentWithdrawalIsNotACodeFix(t *testing.T) {
+	d := openTestDB(t)
+	repo, err := d.InsertRepo("/fixture", "git@example.com:owner/repo.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := d.InsertRun(repo.ID, "feature", "head", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	step, err := d.InsertStepResult(run.ID, types.StepReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads := []string{
+		`{"findings":[{"id":"review-1","severity":"error","description":"outside scope","action":"ask-user"}]}`,
+		`{"findings":[{"id":"review-1","severity":"error","description":"new defect reusing the id","action":"auto-fix"}],"withdrawn_findings":[{"id":"review-1","reason":"independent review confirms accepted scope"}]}`,
+		`{"findings":[]}`,
+	}
+	for i, raw := range payloads {
+		if _, err := d.InsertStepRound(step.ID, i+1, "auto_fix", &raw, nil, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stats, err := d.StepFindingStats(step)
+	if err != nil || stats.ReportedFindings != 2 || stats.FixedFindings != 1 {
+		t.Fatalf("scope withdrawal must not count as fixing either reused id: %+v, %v", stats, err)
+	}
+}
+
 func TestGetStatsAggregatesReportedFixesAndRescueRuns(t *testing.T) {
 	d := openTestDB(t)
 	repoA, _ := d.InsertRepo("/repo/a", "git@example.com:a.git", "main")

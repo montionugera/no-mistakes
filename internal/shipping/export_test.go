@@ -2,6 +2,7 @@ package shipping
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -145,6 +146,44 @@ func TestExportRefusesPinnedDraftDrift(t *testing.T) {
 	f.forge.facts.Draft = true
 	if _, err := Export(context.Background(), f.database, f.repo, f.run.ID, "review", f.forge); err == nil {
 		t.Fatal("draft drift accepted")
+	}
+}
+
+// The receipt contract records the live PR draft state when it matches the
+// explicit run pin. A ready-for-review proof for a pinned draft PR is false.
+func TestExportPreservesPinnedDraftInReceipt(t *testing.T) {
+	draft := true
+	f := newExportFixtureWithDraft(t, &draft)
+	f.forge.facts.Draft = true
+	raw, err := Export(context.Background(), f.database, f.repo, f.run.ID, "review", f.forge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p Payload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatal(err)
+	}
+	if !p.Draft {
+		t.Fatal("receipt claims draft=false for the approved, explicitly pinned draft PR")
+	}
+	signed, err := Sign(raw, strings.NewReader(base64.StdEncoding.EncodeToString(make([]byte, 32))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope Envelope
+	if err := json.Unmarshal(signed, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := base64.StdEncoding.DecodeString(envelope.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var signedPayload Payload
+	if err := json.Unmarshal(payload, &signedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if !signedPayload.Draft {
+		t.Fatal("signed receipt claims draft=false for the approved, explicitly pinned draft PR")
 	}
 }
 

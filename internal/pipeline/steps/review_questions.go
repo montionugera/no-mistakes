@@ -199,17 +199,20 @@ func reviewAnswersPromptSection(conv reviewqa.Conversation) string {
 	return b.String()
 }
 
-// reviewSchemaForFinalize declares the retraction list, and only a finalize
-// turn with the conversation on may have it: the property is meaningless to
-// any other turn, which is never told what a carried finding is, and declaring
-// it anyway left an opt-in feature visible in the agent contract of every
-// repository that had not turned the conversation on.
+// reviewSchemaForFinalize declares retractions only when this turn receives
+// answer-round carry or strict human scope dispositions to adjudicate.
 func reviewSchemaForFinalize(finalizing bool) json.RawMessage {
 	if !finalizing {
 		return reviewFindingsSchema
 	}
-	property := `"withdrawn_findings":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"reason":{"type":"string"}},"required":["id","reason"]},"description":"Answer rounds only: carried findings that no longer hold now the questions are answered. A carried finding you omit here is kept."},`
+	property := `"withdrawn_findings":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"reason":{"type":"string"}},"required":["id","reason"]},"description":"Explicit independent retractions of the carried findings supplied in this turn, with a reason. Omitted findings remain outstanding."},`
 	return json.RawMessage(strings.Replace(string(reviewFindingsSchema), `"tested":`, property+`"tested":`, 1))
+}
+
+func scopeDispositionPromptSection(raw string) string {
+	return "\n\nRecorded human scope dispositions awaiting independent adjudication:\n" +
+		"These findings were explicitly declined under the accepted intent. The disposition is not proof that code was reviewed or fixed. Independently trace each claim against the accepted intent and recorded owner decisions. If the claim is outside the accepted scope or disproved, name its exact id in withdrawn_findings with the reason and the accepted requirement that settles it. Otherwise report it again. Omission keeps it outstanding. Never retract a selected fix or an operator-authored finding. Complete the entire current review coverage; a disposition cannot waive coverage, questions, other defects, or strict comparison requirements.\n" +
+		sanitizedPreviousFindingsForPrompt(raw)
 }
 
 // carriedFindingsPromptSection makes an answer round re-adjudicate what it

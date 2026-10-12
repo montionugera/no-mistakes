@@ -518,6 +518,12 @@ func renderRoundHistoryEntry(r *db.StepRound, earlierFixes map[string]bool) stri
 				b.WriteString(line)
 			}
 		}
+		if findings, err := types.ParseFindingsJSON(*r.FindingsJSON); err == nil && len(findings.WithdrawnFindings) > 0 {
+			b.WriteString("\nindependently_withdrawn_findings:")
+			for _, w := range findings.WithdrawnFindings {
+				fmt.Fprintf(&b, "\n  - %s: %s", sanitizePromptText(w.ID), sanitizePromptText(w.Reason))
+			}
+		}
 	}
 
 	declined := declinedFindingLines(r, earlierFixes)
