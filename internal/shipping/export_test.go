@@ -53,6 +53,10 @@ func receiptGit(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(b))
 }
 func newExportFixture(t *testing.T) *exportFixture {
+	return newExportFixtureWithDraft(t, nil)
+}
+
+func newExportFixtureWithDraft(t *testing.T, draft *bool) *exportFixture {
 	t.Helper()
 	root := t.TempDir()
 	dir := filepath.Join(root, "worktree")
@@ -90,7 +94,7 @@ func newExportFixture(t *testing.T) *exportFixture {
 		t.Fatal(err)
 	}
 	intent := &db.RunIntent{Summary: "exact user intent\n", Source: db.RunIntentSourceAgent, Score: 1}
-	run, err := database.InsertRunWithShipping(repo.ID, "feature", head, base, intent, "", "", "", "main", false, nil, &types.ShippingOptions{Mode: types.ShippingFull})
+	run, err := database.InsertRunWithShipping(repo.ID, "feature", head, base, intent, "", "", "", "main", false, nil, &types.ShippingOptions{Mode: types.ShippingFull, Draft: draft})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,6 +137,15 @@ func newExportFixture(t *testing.T) *exportFixture {
 	}
 	forge := &receiptForge{facts: scm.PRFacts{URL: prURL, State: scm.PRStateOpen, SourceRepo: "owner/project", SourceBranch: "feature", HeadSHA: head, TargetRepo: "owner/project", TargetBranch: "main", TargetSHA: base}, checks: []scm.Check{{Name: "approval", Bucket: scm.CheckBucketPending}}}
 	return &exportFixture{database, repo, run, forge, dir}
+}
+
+func TestExportRefusesPinnedDraftDrift(t *testing.T) {
+	draft := false
+	f := newExportFixtureWithDraft(t, &draft)
+	f.forge.facts.Draft = true
+	if _, err := Export(context.Background(), f.database, f.repo, f.run.ID, "review", f.forge); err == nil {
+		t.Fatal("draft drift accepted")
+	}
 }
 
 func TestExportReviewBeforeApprovalThenExactCIReady(t *testing.T) {

@@ -290,7 +290,7 @@ func (s *Service) Refresh(ctx context.Context) State {
 	state, run, ok := s.inspect(ctx)
 	if run != nil && run.Shipping != nil && run.Shipping.Mode == types.ShippingImmutableSource {
 		head, err := shipping.RemoteHead(ctx, s.workDir(), s.resolvedPushURL(ctx, s.Repo), run.Branch)
-		if err != nil || run.SubmittedHeadSHA == nil || head != *run.SubmittedHeadSHA {
+		if err != nil || run.SubmittedHeadSHA == nil || head != *run.SubmittedHeadSHA || shipping.CheckImmutableTarget(ctx, run, s.Repo, s.workDir()) != nil {
 			return blockedPlan(state, StateTargetChanged, "immutable_source_moved", "immutable published source moved or cannot be observed; no files or refs were changed")
 		}
 		state.Remote = RemoteState{ObservedHead: head, Freshness: "live", ObservedAt: time.Now().Unix()}

@@ -1,8 +1,10 @@
 package branchsync
 
 import (
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"path/filepath"
 	"testing"
+
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 func TestImmutableSourceCustodyIsInspectionOnly(t *testing.T) {
@@ -29,5 +31,27 @@ func TestImmutableSourceCustodyIsInspectionOnly(t *testing.T) {
 	}
 	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.old {
 		t.Fatalf("source checkout changed to %s", got)
+	}
+}
+
+func TestImmutableSourceRefreshRefusesMovedTarget(t *testing.T) {
+	f := newSyncFixture(t)
+	mustRun(t, f.local, "push", "--force", f.remote, f.old+":refs/heads/feature/sync")
+	mustRun(t, f.local, "push", "--force", f.remote, f.base+":refs/heads/main")
+	_, err := f.db.InsertRunWithShipping(f.repo.ID, "feature/sync", f.old, f.base, nil, "", "", "", "main", false, nil, &types.ShippingOptions{
+		Mode: types.ShippingImmutableSource, TargetBranch: "main", TargetSHA: f.base,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, f.local, "checkout", "main")
+	mustWrite(t, filepath.Join(f.local, "target.txt"), "advanced\n")
+	mustRun(t, f.local, "add", "target.txt")
+	mustRun(t, f.local, "commit", "-m", "advance target")
+	mustRun(t, f.local, "push", "--force", f.remote, "main:refs/heads/main")
+	mustRun(t, f.local, "checkout", "feature/sync")
+	state := f.service.Refresh(f.ctx)
+	if state.State != StateTargetChanged || state.Safety != "immutable_source_moved" {
+		t.Fatalf("moved target refresh state = %+v", state)
 	}
 }
