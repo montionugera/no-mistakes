@@ -1242,6 +1242,9 @@ func resolveImmutableSourceRerunHead(ctx context.Context, gateDir string, repo *
 	if remote != *selected.SubmittedHeadSHA {
 		return "", fmt.Errorf("refusing immutable rerun: published source branch %q is at %s, not selected submitted head %s", branch, remote, *selected.SubmittedHeadSHA)
 	}
+	if err := shipping.CheckImmutableTarget(ctx, selected, repo, gateDir, shipping.RemoteHead); err != nil {
+		return "", fmt.Errorf("observe immutable rerun target: %w", err)
+	}
 	return *selected.SubmittedHeadSHA, nil
 }
 
@@ -1495,7 +1498,10 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		copyPin := *shippingPin
 		shippingPin = &copyPin
 		shippingPin.TargetBranch = target
-		shippingPin.TargetSHA = ""
+		retainTargetPin := trigger == "rerun" && shippingPin.Mode == types.ShippingImmutableSource && strings.TrimSpace(shippingPin.TargetSHA) != ""
+		if !retainTargetPin {
+			shippingPin.TargetSHA = ""
+		}
 		if shippingPin.Mode == types.ShippingImmutableSource {
 			repoDir := m.paths.RepoDir(repo.ID)
 			sourceURL := git.ResolvePushURL(ctx, repoDir, repo.UpstreamURL, repo.ForkURL, repo.URLsVerified)
@@ -1514,12 +1520,14 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 					return "", fmt.Errorf("fetch immutable source objects: %w", err)
 				}
 			}
-			upstreamURL := git.ResolveUpstreamURL(ctx, repoDir, repo.UpstreamURL, repo.URLsVerified)
-			tip, err := shipping.RemoteHead(ctx, repoDir, upstreamURL, target)
-			if err != nil {
-				return "", err
+			if !retainTargetPin {
+				upstreamURL := git.ResolveUpstreamURL(ctx, repoDir, repo.UpstreamURL, repo.URLsVerified)
+				tip, err := shipping.RemoteHead(ctx, repoDir, upstreamURL, target)
+				if err != nil {
+					return "", err
+				}
+				shippingPin.TargetSHA = tip
 			}
-			shippingPin.TargetSHA = tip
 		}
 	}
 	// Cancel any active run for this repo+branch.
