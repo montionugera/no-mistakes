@@ -1,3 +1,0 @@
-{"summary":"fix open badge contrast and merge_method type guard"}</｜｜DSML｜｜parameter>
-</｜｜DSML｜｜invoke>
-</｜｜DSML｜｜tool_calls>

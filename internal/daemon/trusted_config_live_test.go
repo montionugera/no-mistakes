@@ -84,7 +84,7 @@ func TestTrustedConfigConcurrentStartupLive(t *testing.T) {
 					t.Fatalf("concurrent startup for %s: %v", branch, errs[i])
 				}
 				run, err := d.GetActiveRun(repo.ID, branch)
-				if err != nil || run == nil || run.Status != types.RunRunning {
+				if err != nil || run == nil {
 					t.Fatalf("active run for %s: %+v, %v", branch, run, err)
 				}
 				if agentName == "pi" && (run.PiProfile == nil || run.PiProfile.Model != "openai-codex/gpt-5.4" || run.PiProfile.Effort != agentcfg.EffortHigh) {
@@ -101,6 +101,12 @@ func TestTrustedConfigConcurrentStartupLive(t *testing.T) {
 						t.Fatalf("trusted command did not execute for %s: %q, %v", branch, data, err)
 					}
 					time.Sleep(20 * time.Millisecond)
+				}
+				// IPC acceptance precedes asynchronous executor startup. The
+				// command output proves it started before checking its status.
+				run, err = d.GetActiveRun(repo.ID, branch)
+				if err != nil || run == nil || run.Status != types.RunRunning {
+					t.Fatalf("active run after trusted command for %s: %+v, %v", branch, run, err)
 				}
 				t.Logf("IPC accepted branch=%s agent=%s run=%s; production repository gate emitted fresh-trusted from default SHA=%s (pushed SHA=%s)", branch, agentName, run.ID, fresh, head)
 			}

@@ -1,7 +1,0 @@
-package agent
-
-import "encoding/json"
-
-func Issue1284ProofParse(output string, schema json.RawMessage) (*Result, error) {
-	return finalizeTextResult("pi-proof", output, schema, TokenUsage{})
-}
