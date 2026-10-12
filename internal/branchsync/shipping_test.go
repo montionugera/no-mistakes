@@ -73,12 +73,20 @@ func TestImmutableSourceRefreshBoundsSourceAndTargetReads(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			f.service.RemoteTimeout = 40 * time.Millisecond
+			// Allow local Git URL resolution to finish on a loaded host before
+			// exercising the stalled remote read's deadline.
+			f.service.RemoteTimeout = 5 * time.Second
 			var deadline time.Time
 			f.service.lsRemote = func(ctx context.Context, dir, remote, ref string) (string, error) {
 				if ref == tc.ref {
 					deadline, _ = ctx.Deadline()
+					if deadline.IsZero() || time.Until(deadline) > f.service.RemoteTimeout {
+						t.Fatalf("remote read lacks the configured deadline: %v", deadline)
+					}
 					<-ctx.Done()
+					if ctx.Err() != context.DeadlineExceeded {
+						t.Fatalf("remote read did not time out: %v", ctx.Err())
+					}
 					return "", ctx.Err()
 				}
 				return f.pushed, nil
