@@ -46,6 +46,10 @@ If the home `.claude` links to `.agents`, `.claude/skills` links to `.agents/ski
 If the repo still contains a vendored skill copy written by an older no-mistakes version, `init` leaves it untouched and prints a notice that it is no longer needed and can be removed.
 The gate advertises Git push-option support, so you can skip steps for one push with `git push -o no-mistakes.skip=test,lint no-mistakes <branch>`.
 
+Managed receive hooks pin the canonical native home and the executable used during enrollment or explicit refresh. Ambient `NM_HOME` and a `no-mistakes` executable on `PATH` cannot redirect those helpers. If the pinned executable disappears, admission refuses the push; notification records a failure for an already accepted push.
+
+For an isolated installation, use a separate native home, binary, and independent Git clone. Pass `init --install-skill=false` to leave user-level agent skills unchanged. A linked worktree shares its Git common directory and remotes with its parent checkout, so it is not an isolated enrollment target.
+
 For GitHub fork contributions, keep `origin` pointed at the parent repository and pass `--fork-url` with your fork remote URL.
 The Push step, rebase branch-sync, and CI repair publication use the fork, including when [`ci.revalidate_repairs`](/no-mistakes/reference/repo-config/#cirevalidate_repairs) sends a repair back through Push, while GitHub PR and CI commands stay scoped to the parent repository and create PRs with `--head <fork-owner>:<branch>`.
 Fork routing currently requires both `origin` and `--fork-url` to be GitHub remotes with owner/repo paths.
@@ -558,6 +562,12 @@ is stale. The command refuses instead of falling back to the gate branch when
 the run-specific recovery ref is conflicting, invalid, or the recorded head is
 unavailable. Use `no-mistakes axi status` and reconcile custody first in that
 case.
+An immutable-source run selects the exact submitted head from the selected run
+only while that commit is still the live published source branch. Rerun does not
+depend on or move a stale or absent local gate branch. It preserves the run's
+shipping target and draft choice; a conflicting `--base-branch` is refused.
+If the gate lacks the commit, rerun fetches that exact published commit before
+it cancels or creates a replacement run; the fetch does not move a local branch.
 When invoked from a clean worktree, `rerun` also refuses if that worktree's HEAD
 differs from the selected gate or preserved head, before starting or superseding
 any run. The error names both full commit SHAs;
@@ -720,7 +730,7 @@ no-mistakes update --force
 Downloads the latest release, verifies the SHA-256 checksum, atomically replaces the running binary, and resets the daemon when it is running or stale daemon artifacts exist so the new executable is picked up, preferring the managed service path and falling back to a detached daemon if service startup is unavailable or fails.
 By default this installs the latest stable release.
 Pass `--beta` to include prereleases and install the latest beta when one is newer than the current stable release.
-Version discovery reads a `channels.json` manifest from the GitHub release-asset CDN (`releases/download/channels/channels.json`) so it does not consume the unauthenticated REST API rate limit. If the manifest is unavailable or invalid, the update fails without falling back to the REST API.
+Version discovery reads this fork's `channels.json` manifest from `https://github.com/vifar/no-mistakes/releases/download/channels/channels.json` so it does not consume the unauthenticated REST API rate limit. Stable, beta, and background checks use the same fork destination. If the manifest is unavailable or invalid, the update fails without falling back to upstream or the REST API.
 If the daemon is running from a different executable path, update still prompts before replacing it; pass `-y`/`--yes` to answer that prompt non-interactively.
 If the daemon executable path cannot be determined, the update aborts before replacement.
 If the daemon does not come back cleanly after a successful replacement, the command reports that failure.
@@ -796,3 +806,29 @@ no-mistakes daemon status
 ```
 
 Shows the PID if the daemon is running.
+
+## Strict shipping and review receipts
+
+The explicit `axi run --shipping-mode full` mode owns the complete Intent → Rebase → Review → Test → Document → Lint → Push → PR → CI pipeline. It persists its policy on the selected run. It refuses skips, passing command exceptions, and approval of unresolved actionable findings. `--yes` stops at those gates. Repairs and changes after Review must pass a fresh independent Review before publication. A changed target comparison invalidates readiness. Periodic CI reads wait at least five minutes; initial reads, explicit receipt exports, and event-driven reads remain immediate.
+
+An existing PR for a strict run must still target the persisted branch. The PR step and CI monitor read the live base and refuse a mismatch before editing, repair, or readiness. CI clears readiness if the PR base moves later. Ordinary runs continue to follow the live PR base for CI repair.
+
+Use `--shipping-mode immutable-source --base-branch main` for an existing published protected source promotion. It pins the submitted source and current target. Rebase observes the comparison, and Push verifies the already published source; neither writes that source. Validation may inspect it, but source mutation or a repair request refuses the run. A moved source or target requires a new run. Terminal branch synchronization is inspection-only: `axi sync --check` reports `state: immutable_source` and never offers a mutating action. Direct sync, recovery, and adoption mutations refuse this mode.
+
+An optional `--draft` or `--draft=false` pins the GitHub draft selection for that run. Without the flag, existing repository/global draft configuration applies. Reattach with ordinary `axi run` from the initiating branch; omit pin flags to retain the selected run's policy. An explicit conflicting mode or draft pin refuses. The caller's current head can be the submitted head or the current pipeline head while the daemon owns its run worktree.
+
+```sh
+no-mistakes axi run --shipping-mode full --draft --intent "Validate and ship this change"
+no-mistakes axi review-receipt --run <run-id> --phase review
+no-mistakes axi review-receipt --run <run-id> --phase ci-ready
+```
+
+`review-receipt` emits JSON on success, unlike ordinary TOON AXI output. Errors retain the ordinary structured AXI error format. It reads the recorded run without changing it. The `review` phase requires all configured pre-CI validation and publication steps completed, with an active CI monitor and an exact approved Review generation. It is available while CI awaits external approval. `ci-ready` also requires persisted readiness for that comparison and fresh, nonempty, successful applicable live checks (optional skipped hosted lanes retain native provider semantics). A configured custom gate after CI prevents a premerge receipt until its required completion; export never silently omits it. Empty checks, no-CI declarations, overrides, skips, dirty worktrees, unsupported providers, unresolved findings, and moved source/target comparisons refuse proof. The initial exact-forge proof provider is GitHub.
+
+Both phases bracket live PR and Git observations and recompute the merge base and SHA-256 of the exact untrimmed bytes from `git diff --no-ext-diff --no-textconv --binary --full-index TARGET...HEAD`. The payload includes source repository/ref, submitted/local/forge heads, PR URL, target ref/SHA, merge base, diff digest, monotonic per-run review generation, intent digest, mode/draft, final non-actionable findings and their digest, and completed/running step evidence. The eight pre-CI core steps are completed; CI remains running until merge. The receipt grants no merge or cleanup authority.
+
+`--signing-key-stdin` reads a bounded base64 32-byte Ed25519 seed outside authenticated validation-agent context. The command constructs and verifies its own payload; it never signs caller JSON. No key enters daemon IPC, agents, storage, logs, or errors. Provision and pipe the seed through the outer credential owner. Signed output is `{schema_version:1,algorithm:"Ed25519",key_id,payload,signature}`. `key_id` is SHA-256 of the raw public key; `payload` and `signature` use padded standard base64. The signature covers the UTF-8 bytes `no-mistakes-review-v1`, a NUL, then exact payload bytes. The decoded payload limit is 32 KiB and envelope limit is 49 KiB. Consumers must pin a trusted public key externally, authenticate bytes before parsing, and enforce current repository/PR/comparison identity and freshness.
+
+Strict status adds `submitted_head_sha`, `shipping_mode`, `source_repo`, `source_branch`, `target_branch`, `target_sha`, `review_generation`, `ci_ready`, and `ci_ready_no_ci`. Enrollment supplies source repository/branch and the persisted target branch before Review. Target SHA and review generation remain null before capture. Status readiness is cached observability; use a fresh receipt before a guarded merge. A strict parked Review recovered after daemon restart cannot reconstruct generation authority from its head alone; its completion refuses and requires a fresh native rerun.
+
+Strict shipping uses the persisted per-run target throughout validation. With no `--base-branch`, that target is the enrolled default branch; ordinary runs retain their configured PR-base behavior.

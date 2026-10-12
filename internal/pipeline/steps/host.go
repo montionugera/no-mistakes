@@ -21,6 +21,17 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/scm/plugin"
 )
 
+func ShippingProofHost(sctx *pipeline.StepContext) (scm.Host, error) {
+	if resolvedProvider(sctx) != scm.ProviderGitHub {
+		return nil, fmt.Errorf("exact shipping proof is supported only by GitHub")
+	}
+	host, reason := buildHost(sctx, scm.ProviderGitHub)
+	if host == nil {
+		return nil, fmt.Errorf("shipping proof host unavailable: %s", reason)
+	}
+	return host, nil
+}
+
 // resolvedProvider returns the run-scoped provider selected by forge profile
 // routing. Runs without a selected profile retain the legacy URL-based
 // detection, including the PR URL fallback used during recovery. A provider
@@ -135,6 +146,9 @@ func buildHost(sctx *pipeline.StepContext, provider scm.Provider) (scm.Host, str
 			forkRepo = github.RepoSlug(sctx.Repo.ForkURL)
 		}
 		draft := sctx.Config != nil && sctx.Config.Providers.GitHub.DraftPullRequests
+		if sctx.Run.Shipping != nil && sctx.Run.Shipping.Draft != nil {
+			draft = *sctx.Run.Shipping.Draft
+		}
 		return github.NewWithFork(cmdFactory, func() bool { return stepCLIAvailable(sctx, provider) }, host, repo, forkRepo, draft), ""
 	case scm.ProviderGitLab:
 		if sctx.Repo.ForkURL != "" {

@@ -13,6 +13,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps"
+	"github.com/kunchenguid/no-mistakes/internal/shipping"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 	"github.com/kunchenguid/no-mistakes/internal/verificationplan"
 	"github.com/spf13/cobra"
@@ -113,15 +114,18 @@ type stepView struct {
 
 // runView is a render-ready view of a pipeline run.
 type runView struct {
-	PiProfile        *agentcfg.PiProfile
-	VerificationPlan *verificationplan.Snapshot
-	ID               string
-	Branch           string
-	Status           string
-	HeadSHA          string
-	PRURL            string
-	CIReady          bool
-	CIReadyNoCI      bool
+	Shipping           *types.ShippingOptions
+	ShippingComparison *shipping.StatusIdentity
+	SubmittedHeadSHA   *string
+	PiProfile          *agentcfg.PiProfile
+	VerificationPlan   *verificationplan.Snapshot
+	ID                 string
+	Branch             string
+	Status             string
+	HeadSHA            string
+	PRURL              string
+	CIReady            bool
+	CIReadyNoCI        bool
 	// AwaitingAgentSince is the unix-seconds time the run parked at a gate
 	// awaiting the driving agent, or nil when the run is not parked. It powers
 	// the top-level parked signal in the run object.
@@ -137,6 +141,8 @@ type runView struct {
 
 func runViewFromIPC(r *ipc.RunInfo) runView {
 	rv := runView{
+		Shipping:           r.Shipping,
+		SubmittedHeadSHA:   r.SubmittedHeadSHA,
 		ID:                 r.ID,
 		Branch:             r.Branch,
 		Status:             string(r.Status),
@@ -148,6 +154,9 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 		TestOverrideReason: r.TestOverrideReason,
 		PiProfile:          r.PiProfile,
 		VerificationPlan:   r.VerificationPlan,
+	}
+	if r.Shipping != nil {
+		rv.ShippingComparison = &shipping.StatusIdentity{Generation: r.ReviewGeneration, SourceRepo: r.SourceRepo, SourceBranch: r.SourceBranch, TargetBranch: r.TargetBranch, TargetSHA: r.TargetSHA}
 	}
 	if r.PRURL != nil {
 		rv.PRURL = *r.PRURL
@@ -185,6 +194,10 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 
 func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 	rv := runView{
+		Shipping:           r.Shipping,
+		SubmittedHeadSHA:   r.SubmittedHeadSHA,
+		CIReady:            r.CIReadyAt != nil,
+		CIReadyNoCI:        r.CIReadyNoCI,
 		PiProfile:          r.PiProfile,
 		VerificationPlan:   r.VerificationPlan,
 		ID:                 r.ID,
@@ -192,6 +205,9 @@ func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 		Status:             string(r.Status),
 		HeadSHA:            r.HeadSHA,
 		AwaitingAgentSince: r.AwaitingAgentSince,
+	}
+	if r.Shipping != nil {
+		rv.ShippingComparison = shipping.CachedStatusIdentity(database, r)
 	}
 	if r.PRURL != nil {
 		rv.PRURL = *r.PRURL
@@ -486,6 +502,21 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 	}
 	fields = append(fields, toon.Field{Key: "head", Value: shortSHA(rv.HeadSHA)})
 	fields = append(fields, toon.Field{Key: "head_sha", Value: rv.HeadSHA})
+	if rv.Shipping != nil {
+		var sourceRepo, targetSHA, generation any
+		target := rv.Shipping.TargetBranch
+		if c := rv.ShippingComparison; c != nil {
+			sourceRepo = c.SourceRepo
+			if c.TargetSHA != "" {
+				targetSHA = c.TargetSHA
+			}
+			if c.Generation > 0 {
+				generation = c.Generation
+			}
+			target = c.TargetBranch
+		}
+		fields = append(fields, toon.Field{Key: "submitted_head_sha", Value: rv.SubmittedHeadSHA}, toon.Field{Key: "shipping_mode", Value: rv.Shipping.Mode}, toon.Field{Key: "source_repo", Value: sourceRepo}, toon.Field{Key: "source_branch", Value: strings.TrimPrefix(rv.Branch, "refs/heads/")}, toon.Field{Key: "target_branch", Value: target}, toon.Field{Key: "target_sha", Value: targetSHA}, toon.Field{Key: "review_generation", Value: generation}, toon.Field{Key: "ci_ready", Value: rv.CIReady}, toon.Field{Key: "ci_ready_no_ci", Value: rv.CIReadyNoCI})
+	}
 	if rv.TestOverrideReason != "" {
 		fields = append(fields, toon.Field{Key: "test_override_reason", Value: rv.TestOverrideReason})
 	}

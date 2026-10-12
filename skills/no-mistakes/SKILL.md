@@ -123,6 +123,8 @@ wrong.
 Before starting, run `no-mistakes axi` (home view).
 If it shows an active run on your current branch, inspect it with `no-mistakes axi status`.
 If it is parked at a gate, drive it with `no-mistakes axi respond`.
+For an explicitly authorized full shipping integration, use `axi run --shipping-mode full`. This persists strict no-skip/no-override policy and re-reviews any later change before publication. `immutable-source` validates an already published protected source without rewriting it and refuses repairs or mutating terminal sync. Optional `--draft[=false]` pins the run draft selection. `axi review-receipt --run ID --phase review|ci-ready` exports fresh JSON proof while the CI monitor remains active; signing via `--signing-key-stdin` belongs to the outer credential owner outside pipeline agents. Cached status and a body attestation do not replace that proof. Strict periodic CI reads wait at least five minutes.
+
 Reattach an in-flight run by re-running `no-mistakes axi run` when it still matches your current `HEAD` - either as the submitted head or as the current pipeline head.
 Only `no-mistakes axi abort` it when you mean to discard that run before starting over; aborting is a between-runs action, never a way to take over or bypass a gate while a run is still going (see [Validate and decide](#validate-and-decide)).
 If it shows an active run on another branch, leave that run alone and start validation for your current branch with `no-mistakes axi run --intent "..."`.

@@ -131,6 +131,9 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		return nil, err
 	}
 	if existing != nil {
+		if err := verifyStrictPRBaseBranch(ctx, sctx, host, existing); err != nil {
+			return nil, err
+		}
 		var live scm.PRContent
 		if reader, ok := host.(scm.PRContentReader); ok {
 			live, err = reader.GetPRContent(ctx, existing)

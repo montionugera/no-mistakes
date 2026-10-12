@@ -9,9 +9,12 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/cimonitor"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
+	"github.com/kunchenguid/no-mistakes/internal/scm/github"
+	"github.com/kunchenguid/no-mistakes/internal/shipping"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -19,6 +22,17 @@ const (
 	defaultBaseBranchTipResolveWindow = 30 * time.Second
 	defaultPublishedHeadResolveWindow = 30 * time.Second
 )
+
+func ciPollInterval(sctx *pipeline.StepContext, elapsed, override time.Duration) time.Duration {
+	interval := override
+	if interval == 0 {
+		interval = pollInterval(elapsed)
+	}
+	if sctx.Run.Shipping != nil && interval < 5*time.Minute {
+		return 5 * time.Minute
+	}
+	return interval
+}
 
 // CI monitoring status messages. These are surfaced to the user and parsed by
 // the TUI and the agent-facing axi commands to distinguish passed checks from
@@ -141,6 +155,9 @@ func (s *CIStep) ReconcileApprovalGate(sctx *pipeline.StepContext) (bool, error)
 	switch state {
 	case scm.PRStateMerged:
 		if err := verifyMergedProof(sctx.Ctx, host, &scm.PR{Number: prNumber, URL: prURL}, sctx.Run.HeadSHA); err != nil {
+			return false, err
+		}
+		if err := verifyShippingMergedProof(sctx, host, &scm.PR{Number: prNumber, URL: prURL}); err != nil {
 			return false, err
 		}
 		if err := sctx.DB.UpdateRunPRState(sctx.Run.ID, "merged"); err != nil {
@@ -278,6 +295,9 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 	// this re-entry is the retry of a retained repair a protected-path refusal
 	// interrupted: that repair is finished first and nothing new is requested.
 	repairRequested := sctx.Fixing && !retryRefusal
+	if repairRequested && sctx.Run.Shipping != nil && sctx.Run.Shipping.Mode == types.ShippingImmutableSource {
+		return nil, fmt.Errorf("immutable source forbids CI repairs")
+	}
 	defer func() {
 		if outcome != nil {
 			if s.pendingFixSummary != "" {
@@ -354,6 +374,27 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 		return nil, fmt.Errorf("extract PR number: %w", err)
 	}
 	pr := &scm.PR{Number: prNumber, URL: prURL}
+	baseBranch := effectivePRBaseBranch(sctx)
+	if sctx.Run.Shipping != nil {
+		if err := verifyStrictPRBaseBranch(ctx, sctx, host, pr); err != nil {
+			clearCIMonitorReady(sctx)
+			return nil, err
+		}
+	} else {
+		// A resumed ordinary run may have a different trusted configuration
+		// than the run that created this PR. Follow its live target for conflict
+		// repair and tip monitoring, as before.
+		if reader, ok := host.(scm.PRBaseBranchReader); ok {
+			if actual, readErr := reader.GetPRBaseBranch(ctx, pr); readErr == nil {
+				pr.BaseBranch = actual
+			} else if pluginContractBroken(readErr) {
+				return nil, readErr
+			}
+		}
+		if strings.TrimSpace(pr.BaseBranch) != "" {
+			baseBranch = strings.TrimSpace(pr.BaseBranch)
+		}
+	}
 	if retryRefusal {
 		if err := setCIMonitorReadiness(sctx, false, false); err != nil {
 			return nil, err
@@ -366,23 +407,6 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 		if repair.Revalidate {
 			return &pipeline.StepOutcome{RestartFrom: types.StepReview}, nil
 		}
-	}
-	baseBranch := effectivePRBaseBranch(sctx)
-	// A resumed run may have a different trusted configuration than the run
-	// that created this PR. Re-read the forge record without a base filter so
-	// conflict repair and tip monitoring follow the PR's actual target.
-	if reader, ok := host.(scm.PRBaseBranchReader); ok {
-		if actual, readErr := reader.GetPRBaseBranch(ctx, pr); readErr == nil {
-			pr.BaseBranch = actual
-		} else if pluginContractBroken(readErr) {
-			// A one-time read, not a poll: even a timeout fails closed,
-			// since falling back to the configured base could monitor or
-			// repair against a target the PR no longer has.
-			return nil, readErr
-		}
-	}
-	if strings.TrimSpace(pr.BaseBranch) != "" {
-		baseBranch = strings.TrimSpace(pr.BaseBranch)
 	}
 	if repairRequested {
 		repairOutcome, err := s.repairFromFindings(sctx, host, pr)
@@ -449,9 +473,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 	}
 	waitForPoll := func() error {
 		interval := s.pollIntervalOverride
-		if interval == 0 {
-			interval = pollInterval(now().Sub(started))
-		}
+		interval = ciPollInterval(sctx, now().Sub(started), interval)
 		if !unlimited {
 			remaining := timeout - now().Sub(timeoutAnchor)
 			if remaining < interval {
@@ -475,6 +497,12 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		if sctx.Run.Shipping != nil {
+			if err := verifyStrictPRBaseBranch(ctx, sctx, host, pr); err != nil {
+				clearCIMonitorReady(sctx)
+				return nil, err
+			}
 		}
 		botCommentReadFailed := false
 
@@ -522,12 +550,15 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			if err := verifyMergedProof(ctx, host, pr, sctx.Run.HeadSHA); err != nil {
 				return nil, err
 			}
+			if err := verifyShippingMergedProof(sctx, host, pr); err != nil {
+				return nil, err
+			}
 			if err := sctx.DB.UpdateRunPRState(sctx.Run.ID, "merged"); err != nil {
 				return nil, err
 			}
 			notifyPRMerged(sctx)
 			sctx.Log("PR has been merged!")
-			return &pipeline.StepOutcome{}, nil
+			return &pipeline.StepOutcome{MergedHeadSHA: sctx.Run.HeadSHA}, nil
 		} else if state == scm.PRStateClosed {
 			if err := sctx.DB.UpdateRunPRState(sctx.Run.ID, "closed"); err != nil {
 				return nil, err
@@ -537,6 +568,29 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 		} else if state == scm.PRStateOpen {
 			if err := sctx.DB.UpdateRunPRState(sctx.Run.ID, "open"); err != nil {
 				return nil, err
+			}
+		}
+		if sctx.Run.Shipping != nil {
+			if err := shipping.CheckImmutable(ctx, sctx.Run, sctx.Repo, sctx.WorkDir); err != nil {
+				return nil, err
+			}
+			comparison, err := sctx.DB.GetReviewComparison(sctx.Run.ID)
+			if err != nil {
+				return nil, err
+			}
+			if comparison == nil || !comparison.Approved {
+				return nil, fmt.Errorf("strict CI lacks approved review comparison")
+			}
+			upstreamURL := git.ResolveUpstreamURL(ctx, sctx.WorkDir, sctx.Repo.UpstreamURL, sctx.Repo.URLsVerified)
+			tip, err := shipping.RemoteHead(ctx, sctx.WorkDir, upstreamURL, comparison.TargetBranch)
+			if err != nil {
+				return nil, err
+			}
+			if tip != comparison.TargetSHA {
+				if err := setCIMonitorReadiness(sctx, false, false); err != nil {
+					return nil, err
+				}
+				return &pipeline.StepOutcome{RestartFrom: types.StepRebase}, nil
 			}
 		}
 
@@ -761,7 +815,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					// Applies even when no_ci is declared: registered checks are
 					// never waived.
 					lastMonitorLog = logCIMonitorStatus(sctx, ciWaitingMessage(checks), lastMonitorLog)
-				case len(checks) == 0 && (sctx.Config == nil || !sctx.Config.NoCI):
+				case len(checks) == 0 && (sctx.Config == nil || !sctx.Config.NoCI || sctx.Run.Shipping != nil):
 					// Empty forge results are ready ONLY with positive durable
 					// evidence from trusted default-branch config (no_ci: true).
 					// Without that declaration, keep waiting - delayed registration
@@ -870,4 +924,27 @@ func notifyPRMerged(sctx *pipeline.StepContext) {
 		return
 	}
 	sctx.OnPRMerged(sctx.Ctx, sctx.Run.ID)
+}
+
+// Strict custody requires the reviewed PR head, not a cached merged state.
+func verifyShippingMergedProof(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR) error {
+	if sctx.Run.Shipping == nil {
+		return nil
+	}
+	reader, ok := host.(scm.PRFactsReader)
+	if !ok {
+		return fmt.Errorf("strict shipping requires exact merged PR facts")
+	}
+	facts, err := reader.GetPRFacts(sctx.Ctx, pr)
+	if err != nil {
+		return err
+	}
+	c, err := sctx.DB.GetReviewComparison(sctx.Run.ID)
+	if err != nil {
+		return err
+	}
+	if c == nil || !c.Approved || c.HeadSHA != sctx.Run.HeadSHA || facts.State != scm.PRStateMerged || facts.URL != pr.URL || facts.HeadSHA != c.HeadSHA || facts.SourceRepo != c.SourceRepo || facts.SourceBranch != c.SourceBranch || facts.TargetBranch != c.TargetBranch || facts.TargetRepo != github.RepoSlug(sctx.Repo.UpstreamURL) {
+		return fmt.Errorf("merged PR differs from approved shipping comparison")
+	}
+	return shipping.CheckImmutableSource(sctx.Ctx, sctx.Run, sctx.Repo, sctx.WorkDir)
 }

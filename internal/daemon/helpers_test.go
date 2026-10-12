@@ -488,6 +488,12 @@ func waitForRunTerminalState(t *testing.T, d *db.DB, runID string) *db.Run {
 		// a pipeline failure.
 		timeout = time.Minute
 	}
+	return waitForRunTerminalStateWithTimeout(t, d, runID, timeout)
+}
+
+func waitForRunTerminalStateWithTimeout(t *testing.T, d *db.DB, runID string, timeout time.Duration) *db.Run {
+	t.Helper()
+
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		run, err := d.GetRun(runID)

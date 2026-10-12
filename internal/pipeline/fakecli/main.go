@@ -178,7 +178,17 @@ func fakeGHHandler(args []string) {
 		fmt.Printf("[{\"number\":%d,\"url\":%q,\"baseRefName\":%q}]\n", number, prURL, prBase)
 		os.Exit(0)
 	}
+	if len(args) >= 2 && args[0] == "api" && strings.Contains(args[1], "/pulls/") {
+		if facts := os.Getenv("FAKE_CLI_PR_FACTS_JSON"); facts != "" {
+			fmt.Println(facts)
+			os.Exit(0)
+		}
+	}
 	if len(args) >= 2 && args[0] == "pr" && args[1] == "view" {
+		if strings.Contains(strings.Join(args, " "), "--json baseRefName") {
+			fmt.Println(prBase)
+			os.Exit(0)
+		}
 		if strings.Contains(strings.Join(args, " "), "--json state") {
 			state := os.Getenv("FAKE_CLI_PR_STATE")
 			if state == "" {
@@ -590,6 +600,10 @@ func fakeCIGHHandler(args []string) {
 		} else {
 			fmt.Println("[]")
 		}
+		os.Exit(0)
+	}
+	if strings.Contains(joined, "pr view") && strings.Contains(joined, "--json baseRefName") {
+		fmt.Println(os.Getenv("FAKE_CLI_PR_BASE"))
 		os.Exit(0)
 	}
 	if strings.Contains(joined, "pr view") && strings.Contains(joined, "--json headRefOid") {

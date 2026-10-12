@@ -1,6 +1,14 @@
 package db
 
 const schemaSQL = `
+CREATE TABLE IF NOT EXISTS review_comparisons (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    source_repo TEXT NOT NULL, source_branch TEXT NOT NULL,
+    target_branch TEXT NOT NULL, target_sha TEXT NOT NULL,
+    head_sha TEXT NOT NULL, merge_base_sha TEXT NOT NULL,
+    diff_digest TEXT NOT NULL, generation INTEGER NOT NULL,
+    approved INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS repos (
     id             TEXT PRIMARY KEY,
     working_path   TEXT NOT NULL UNIQUE,
@@ -239,6 +247,7 @@ CREATE TABLE IF NOT EXISTS uncertified_pipeline_ranges (
 var migrationStatements = []string{
 	`ALTER TABLE runs ADD COLUMN verification_plan TEXT`,
 	`CREATE TRIGGER IF NOT EXISTS runs_verification_plan_immutable BEFORE UPDATE OF verification_plan ON runs WHEN NEW.verification_plan IS NOT OLD.verification_plan BEGIN SELECT RAISE(ABORT, 'run verification plan is immutable'); END`,
+	`ALTER TABLE runs ADD COLUMN shipping_options TEXT`,
 	`ALTER TABLE runs ADD COLUMN pi_profile TEXT`,
 	`CREATE TRIGGER IF NOT EXISTS runs_pi_profile_immutable BEFORE UPDATE OF pi_profile ON runs WHEN NEW.pi_profile IS NOT OLD.pi_profile BEGIN SELECT RAISE(ABORT, 'run Pi profile is immutable'); END`,
 	`ALTER TABLE repos ADD COLUMN fork_url TEXT`,
