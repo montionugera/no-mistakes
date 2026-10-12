@@ -1,0 +1,2 @@
+2026-10-12T11:59:33-05:00 lifecycle command=update force=false pid=69881 ppid=59662 parent_cmdline="/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python .validation-live/drive.py"
+2026-10-12T11:59:34-05:00 lifecycle command=update force=false pid=69980 ppid=59662 parent_cmdline=""
