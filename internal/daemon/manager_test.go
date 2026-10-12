@@ -764,6 +764,7 @@ func TestPushReceivedConcurrentDifferentBranchRunsAvoidSharedConfigLock(t *testi
 		if active.Status != types.RunRunning {
 			t.Fatalf("active run for %s status = %s, want running (error: %v)", br, active.Status, active.Error)
 		}
+		t.Logf("concurrent startup accepted branch=%s run=%s status=%s", br, active.ID, active.Status)
 	}
 }
 
