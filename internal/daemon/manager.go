@@ -1104,7 +1104,8 @@ func receiptForRun(run *db.Run, created bool) (ipc.LaunchReceipt, error) {
 
 // HandleRerun creates a new run for the latest recoverable head on a branch:
 // normally the gate branch, or the latest terminal run's verified unpublished
-// head while custody remains outstanding. An explicit intent overrides the
+// head while custody remains outstanding. An unverified head counts when its
+// own recovery ref anchors it above the gate head, exactly as Recover accepts. An explicit intent overrides the
 // selected run. Otherwise an authoritative intent is inherited byte-for-byte;
 // runs without one infer intent afresh. The selected run's PR URL is inherited
 // when that PR is not already merged or closed, so a later --base-branch
@@ -1264,9 +1265,15 @@ func inheritablePRURL(run *db.Run) string {
 }
 
 func resolveRerunHead(ctx context.Context, gateDir, branch string, latest *db.Run) (string, error) {
-	gateHead, err := git.Run(ctx, gateDir, "rev-parse", "refs/heads/"+branch+"^{commit}")
+	gateHead, exists, err := git.DirectRefTarget(ctx, gateDir, "refs/heads/"+branch)
 	if err != nil {
-		return "", fmt.Errorf("resolve gate head: %w", err)
+		return "", fmt.Errorf("resolve direct gate head: %w", err)
+	}
+	if !exists {
+		return "", fmt.Errorf("resolve gate head: branch %s is missing", branch)
+	}
+	if resolved, err := git.ResolveRef(ctx, gateDir, gateHead); err != nil || resolved != gateHead {
+		return "", fmt.Errorf("resolve gate head: branch %s does not directly name a commit", branch)
 	}
 	if latest == nil || !latest.Status.Terminal() || latest.CustodyReturnedAt != nil || latest.HeadSHA == gateHead {
 		return gateHead, nil
@@ -1277,7 +1284,7 @@ func resolveRerunHead(ctx context.Context, gateDir, branch string, latest *db.Ru
 	} else if latest.SubmittedHeadSHA != nil {
 		published = *latest.SubmittedHeadSHA
 	}
-	if published == latest.HeadSHA || latest.TerminalHeadVerifiedAt == nil {
+	if published == latest.HeadSHA || (latest.TerminalHeadVerifiedAt == nil && !custody.AnchoredDescendant(ctx, gateDir, latest.ID, gateHead, latest.HeadSHA)) {
 		return gateHead, nil
 	}
 	recoveryRef := custody.RecoveryRef(latest.ID)

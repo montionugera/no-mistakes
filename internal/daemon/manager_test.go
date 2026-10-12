@@ -1232,6 +1232,57 @@ func TestResolveRerunHeadUsesPreservedTerminalHeadInsteadOfStaleGateBranch(t *te
 	}
 }
 
+// A cancelled run whose terminalization anchored its fix commit but lost the
+// verified-head stamp (run 01M4QC5RSZKKXR1YN19BP7907H) must rerun the head
+// custody recovery preserves, not the stale gate head below it.
+func TestResolveRerunHeadUsesAnchoredUnverifiedHeadAboveTheGateHead(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	work := filepath.Join(root, "work")
+	gate := filepath.Join(root, "gate.git")
+	gitCmd(t, "", "init", work)
+	gitCmd(t, work, "config", "user.email", "test@test.com")
+	gitCmd(t, work, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(work, "file.txt"), []byte("submitted\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, work, "add", "file.txt")
+	gitCmd(t, work, "commit", "-m", "submitted")
+	submitted := gitOutput(t, work, "rev-parse", "HEAD")
+	gitCmd(t, "", "init", "--bare", gate)
+	gitCmd(t, work, "push", gate, "HEAD:refs/heads/feature/recover")
+	if err := os.WriteFile(filepath.Join(work, "file.txt"), []byte("fixed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, work, "commit", "-am", "no-mistakes(review): fix")
+	fixed := gitOutput(t, work, "rev-parse", "HEAD")
+	gitCmd(t, work, "push", gate, fixed+":refs/no-mistakes/recover-test-object")
+	run := &db.Run{ID: "run-1", Branch: "feature/recover", Status: types.RunCancelled, HeadSHA: fixed, SubmittedHeadSHA: &submitted}
+
+	head, err := resolveRerunHead(context.Background(), gate, run.Branch, run)
+	if err != nil || head != submitted {
+		t.Fatalf("unanchored unverified rerun head = %s, %v; want gate head %s", head, err, submitted)
+	}
+
+	gitCmd(t, gate, "update-ref", custody.RecoveryRef(run.ID), fixed)
+	head, err = resolveRerunHead(context.Background(), gate, run.Branch, run)
+	if err != nil || head != fixed {
+		t.Fatalf("anchored unverified rerun head = %s, %v; want anchored fix head %s", head, err, fixed)
+	}
+	if gateHead := gitOutput(t, gate, "rev-parse", "refs/heads/feature/recover"); gateHead != submitted {
+		t.Fatalf("rerun resolution moved gate branch = %s, want %s", gateHead, submitted)
+	}
+
+	gitCmd(t, gate, "update-ref", "refs/heads/other", submitted)
+	gitCmd(t, gate, "symbolic-ref", "refs/heads/feature/recover", "refs/heads/other")
+	if head, err := resolveRerunHead(context.Background(), gate, run.Branch, run); err == nil {
+		t.Fatalf("symbolic gate evidence selected rerun head %s", head)
+	}
+	if got := gitOutput(t, gate, "symbolic-ref", "refs/heads/feature/recover"); got != "refs/heads/other" {
+		t.Fatalf("rerun resolution replaced symbolic gate branch: %s", got)
+	}
+}
+
 func TestResolveRerunHeadUsesAdvancedGateWhenSubmittedHeadWasTerminal(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

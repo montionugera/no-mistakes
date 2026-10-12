@@ -176,6 +176,7 @@ type Service struct {
 	beforeApply                       func()
 	beforeGateReset                   func()
 	beforeRecoverTerminalHeadPreserve func()
+	beforeRecoverTerminalHeadLock     func()
 	beforeRecoverWorktreeMove         func()
 	beforeRecoverBranchMove           func()
 	afterRecoverBranchMove            func()
@@ -661,7 +662,9 @@ func (s *Service) BindRecoveryArchive(ctx context.Context, archiveRef string) St
 //     gate is available; otherwise the preserved head is verified through the
 //     gate's run-specific recovery ref and fetched into that anchor. Legacy terminal
 //     heads that still exist as unreferenced gate objects are anchored before
-//     recovery continues. A non-descendant live gate head is accepted only when
+//     recovery continues. A recorded head whose verification stamp was lost is
+//     accepted when the run's own recovery ref names exactly that head and it
+//     descends from the live gate head (custody.AnchoredDescendant). A non-descendant live gate head is accepted only when
 //     the recorded head is the exact reviewed result, that reviewed result
 //     preserves the local work, and both commits have the same final tree. The
 //     live rewrite is not merged with local again because its content has
@@ -681,10 +684,10 @@ func (s *Service) BindRecoveryArchive(ctx context.Context, archiveRef string) St
 //     required and preserved heads, raw non-symbolic archive ref, and the gate's
 //     run-specific recovery ref. Plain --recover refuses this source before any
 //     ref write; only the reported --recover --keep-local action can use it.
-//   - Anything unverifiable (an unverified recorded head, missing gate where
-//     required, conflicting evidence, failed anchor write or fetch, or changed
-//     assumptions) refuses with a reason. The sole exception is a verified head
-//     proven absent from both the worktree and an accessible gate when
+//   - Anything unverifiable (a recorded head lacking the proof above, missing
+//     gate where required, conflicting evidence, failed anchor write or fetch,
+//     or changed assumptions) refuses with a reason. The sole exception is a
+//     verified head proven absent from both the worktree and an accessible gate when
 //     --keep-local explicitly discards those unavailable pipeline commits.
 //     When any run in a stranded stack has such a missing head, the same preflight
 //     validates every non-superseded run, anchors each available head, and stamps
@@ -767,70 +770,63 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 		}
 	}
 	if run.TerminalHeadVerifiedAt == nil {
-		branch := state.Local.Branch
-		if strings.TrimSpace(s.GateDir) == "" {
-			return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the terminal run has no verified head and no gate is available to prove preserved custody; no files or refs were changed")
+		proof, safety, message := s.proveUnverifiedTerminalHead(ctx, state, run)
+		if safety != "" {
+			return blockedPlan(state, StatePipelineOwned, safety, message)
 		}
-		gateHead, err := git.Run(ctx, s.GateDir, "rev-parse", "refs/heads/"+branch+"^{commit}")
-		if err != nil {
-			return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the terminal run has no verified head and the preserved gate head could not be read; no files or refs were changed")
-		}
-		if gateHead != run.HeadSHA {
-			equalTreeRewrite := false
-			if !isAncestor(ctx, s.GateDir, run.HeadSHA, gateHead) {
-				recordedTree, recordedTreeErr := git.Run(ctx, s.GateDir, "rev-parse", run.HeadSHA+"^{tree}")
-				gateTree, gateTreeErr := git.Run(ctx, s.GateDir, "rev-parse", gateHead+"^{tree}")
-				recordedPreservesLocal := isAncestor(ctx, s.GateDir, state.Local.Head, run.HeadSHA) || preservedContainsLocalWork(ctx, s.GateDir, state.Local.Head, run.HeadSHA)
-				if recordedTreeErr != nil || gateTreeErr != nil || recordedTree != gateTree || !state.Local.Clean ||
-					run.ReviewApprovedHeadSHA == nil || *run.ReviewApprovedHeadSHA != run.HeadSHA || !recordedPreservesLocal {
-					return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the terminal run has no verified head and the gate head does not descend from the recorded reviewed head with identical final content; no files or refs were changed")
+		if proof.equalTreeRewrite || proof.anchoredDescendant {
+			if s.beforeRecoverTerminalHeadPreserve != nil {
+				s.beforeRecoverTerminalHeadPreserve()
+			}
+			branchNow, branchErr := git.CurrentBranch(ctx, s.workDir())
+			headNow, headErr := git.HeadSHA(ctx, s.workDir())
+			cleanNow, _ := worktreeClean(ctx, s.workDir())
+			if branchErr != nil || branchNow != state.Local.Branch || headErr != nil || headNow != state.Local.Head || !cleanNow {
+				return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the local branch or worktree changed while the terminal head was being verified; no files or refs were changed")
+			}
+			anchorRef := custody.RecoveryRef(run.ID)
+			branchRef := "refs/heads/" + state.Local.Branch
+			validate := func(anchorExists bool) error {
+				gateNow, gateExists, gateErr := git.DirectRefTarget(ctx, s.GateDir, branchRef)
+				if gateErr != nil || !gateExists || gateNow != proof.gateHead {
+					return fmt.Errorf("direct gate branch changed")
 				}
-				if symbolic, err := git.Run(ctx, s.GateDir, "symbolic-ref", "-q", "refs/heads/"+branch); err == nil && symbolic != "" {
-					return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the live gate branch is symbolic, so its terminal head cannot be verified; no files or refs were changed")
+				anchorNow, exists, anchorErr := git.DirectRefTarget(ctx, s.GateDir, anchorRef)
+				if anchorErr != nil || exists != anchorExists || (exists && anchorNow != proof.verifiedHead) {
+					return fmt.Errorf("direct recovery ref changed")
 				}
-				equalTreeRewrite = true
-				anchorRef := custody.RecoveryRef(run.ID)
-				if symbolic, err := git.Run(ctx, s.GateDir, "symbolic-ref", "-q", anchorRef); err == nil && symbolic != "" {
-					return blockedPlan(state, StatePipelineOwned, "blocked_recover_anchor_mismatch", "the run recovery ref in the local gate conflicts with the live gate head; no files or refs were changed")
-				}
-				anchored, anchorExists, anchorErr := git.ExactRefTarget(ctx, s.GateDir, anchorRef)
-				if anchorErr != nil || (anchorExists && anchored != gateHead) {
-					return blockedPlan(state, StatePipelineOwned, "blocked_recover_anchor_mismatch", "the run recovery ref in the local gate conflicts with the live gate head; no files or refs were changed")
-				}
-				if s.beforeRecoverTerminalHeadPreserve != nil {
-					s.beforeRecoverTerminalHeadPreserve()
-				}
-				branchNow, branchErr := git.CurrentBranch(ctx, s.workDir())
-				headNow, headErr := git.HeadSHA(ctx, s.workDir())
-				cleanNow, _ := worktreeClean(ctx, s.workDir())
-				if branchErr != nil || branchNow != state.Local.Branch || headErr != nil || headNow != state.Local.Head || !cleanNow {
-					return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the local branch or worktree changed while the terminal head was being verified; no files or refs were changed")
-				}
-				anchorCommand := fmt.Sprintf("create %s %s\n", anchorRef, gateHead)
-				if anchorExists {
-					anchorCommand = fmt.Sprintf("verify %s %s\n", anchorRef, gateHead)
-				}
-				transaction := fmt.Sprintf("start\nverify refs/heads/%s %s\n%sprepare\ncommit\n", branch, gateHead, anchorCommand)
-				if _, err := git.RunWithInput(ctx, s.GateDir, transaction, "update-ref", "--stdin", "--no-deref"); err != nil {
-					return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the live gate head or its create-only recovery ref changed while the terminal head was being verified; no files or refs were changed")
+				return nil
+			}
+			if err := validate(proof.anchorExists); err != nil {
+				return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the direct gate branch or recovery ref changed while the terminal head was being verified; no files or refs were changed")
+			}
+			if s.beforeRecoverTerminalHeadLock != nil {
+				s.beforeRecoverTerminalHeadLock()
+			}
+			branchCommand := fmt.Sprintf("verify %s %s\n", branchRef, proof.gateHead)
+			if !proof.anchorExists {
+				commands := branchCommand + fmt.Sprintf("create %s %s\n", anchorRef, proof.verifiedHead)
+				if err := git.WithPreparedRefTransaction(ctx, s.GateDir, commands, func() error { return validate(false) }); err != nil {
+					return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the direct gate branch or create-only recovery ref changed while the terminal head was being verified; custody was not returned")
 				}
 			}
-			if equalTreeRewrite {
-				updated, err := s.DB.VerifyTerminalRunHeadRewrite(run.ID, run.Status, run.HeadSHA, gateHead)
-				if err != nil || !updated {
-					return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the terminal run or its recorded review authority changed while the live gate head was being verified; the preserved recovery ref remains available and custody was not returned")
+			commands := branchCommand + fmt.Sprintf("verify %s %s\n", anchorRef, proof.verifiedHead)
+			if err := git.WithPreparedRefTransaction(ctx, s.GateDir, commands, func() error {
+				if err := validate(true); err != nil {
+					return err
 				}
-			} else if err := s.DB.UpdateRunStatusWithVerifiedHead(run.ID, run.Status, gateHead); err != nil {
-				return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the verified gate head could not be recorded; the preserved recovery ref remains available and custody was not returned")
+				return s.stampRecoveredTerminalHead(run, proof)
+			}); err != nil {
+				return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the terminal run or its direct gate recovery evidence changed while the terminal head was being verified; custody was not returned")
 			}
-		} else if err := s.DB.UpdateRunStatusWithVerifiedHead(run.ID, run.Status, gateHead); err != nil {
-			return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the verified gate head could not be preserved; no files or refs were changed")
+		} else if err := s.stampRecoveredTerminalHead(run, proof); err != nil {
+			return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the verified terminal head could not be recorded; no files or refs were changed")
 		}
-		run.HeadSHA = gateHead
+		run.HeadSHA = proof.verifiedHead
 		verifiedAt := time.Now().Unix()
 		run.TerminalHeadVerifiedAt = &verifiedAt
-		state.Pipeline.CurrentHead = gateHead
-		state.Relation = relationBetween(ctx, s.workDir(), state.Local.Head, gateHead)
+		state.Pipeline.CurrentHead = proof.verifiedHead
+		state.Relation = relationBetween(ctx, s.workDir(), state.Local.Head, proof.verifiedHead)
 	}
 	wd := s.workDir()
 	branch := state.Local.Branch
@@ -979,6 +975,77 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 		blocked.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "git log --oneline --left-right HEAD..." + anchorRef}
 		return blocked
 	}
+}
+
+func (s *Service) stampRecoveredTerminalHead(run *db.Run, proof unverifiedHeadProof) error {
+	if !proof.equalTreeRewrite {
+		return s.DB.UpdateRunStatusWithVerifiedHead(run.ID, run.Status, proof.verifiedHead)
+	}
+	updated, err := s.DB.VerifyTerminalRunHeadRewrite(run.ID, run.Status, run.HeadSHA, proof.verifiedHead)
+	if err != nil {
+		return err
+	}
+	if !updated {
+		return fmt.Errorf("terminal run or review authority changed")
+	}
+	return nil
+}
+
+// unverifiedHeadProof is what Recover may stamp for a terminal run that has no
+// verified head: the head to verify, and the gate refs Recover must revalidate
+// before stamping an equal-tree rewrite or an anchored descendant.
+type unverifiedHeadProof struct {
+	verifiedHead       string
+	gateHead           string
+	equalTreeRewrite   bool
+	anchoredDescendant bool
+	anchorExists       bool
+}
+
+// proveUnverifiedTerminalHead is the read-only evidence check for a terminal
+// head without a verification stamp. Recover runs it before stamping, and
+// recovery classification runs it too, so status never offers a recovery this
+// check is certain to refuse. A refusal returns its safety code and message.
+//
+// The live gate head is accepted when it equals or descends from the recorded
+// head; the recorded head is accepted when the run's own recovery ref pins it
+// above the gate head (terminalization anchored it but lost the stamp); and a
+// non-descendant gate head only as an equal-tree rewrite of the exact reviewed
+// result that preserves the local work.
+func (s *Service) proveUnverifiedTerminalHead(ctx context.Context, state State, run *db.Run) (unverifiedHeadProof, string, string) {
+	if strings.TrimSpace(s.GateDir) == "" {
+		return unverifiedHeadProof{}, "blocked_recover_unverified_head", "the terminal run has no verified head and no gate is available to prove preserved custody; no files or refs were changed"
+	}
+	branch := state.Local.Branch
+	gateHead, exists, err := git.DirectRefTarget(ctx, s.GateDir, "refs/heads/"+branch)
+	if err != nil || !exists {
+		return unverifiedHeadProof{}, "blocked_recover_unverified_head", "the terminal run has no verified head and the preserved gate head could not be read; no files or refs were changed"
+	}
+	if resolved, err := git.ResolveRef(ctx, s.GateDir, gateHead); err != nil || resolved != gateHead {
+		return unverifiedHeadProof{}, "blocked_recover_unverified_head", "the preserved gate branch does not directly name a commit; no files or refs were changed"
+	}
+	if gateHead == run.HeadSHA || isAncestor(ctx, s.GateDir, run.HeadSHA, gateHead) {
+		return unverifiedHeadProof{verifiedHead: gateHead}, "", ""
+	}
+	if custody.AnchoredDescendant(ctx, s.GateDir, run.ID, gateHead, run.HeadSHA) {
+		return unverifiedHeadProof{verifiedHead: run.HeadSHA, gateHead: gateHead, anchoredDescendant: true, anchorExists: true}, "", ""
+	}
+	recordedTree, recordedTreeErr := git.Run(ctx, s.GateDir, "rev-parse", run.HeadSHA+"^{tree}")
+	gateTree, gateTreeErr := git.Run(ctx, s.GateDir, "rev-parse", gateHead+"^{tree}")
+	recordedPreservesLocal := isAncestor(ctx, s.GateDir, state.Local.Head, run.HeadSHA) || preservedContainsLocalWork(ctx, s.GateDir, state.Local.Head, run.HeadSHA)
+	if recordedTreeErr != nil || gateTreeErr != nil || recordedTree != gateTree || !state.Local.Clean ||
+		run.ReviewApprovedHeadSHA == nil || *run.ReviewApprovedHeadSHA != run.HeadSHA || !recordedPreservesLocal {
+		return unverifiedHeadProof{}, "blocked_recover_unverified_head", "the terminal run has no verified head and the gate head does not descend from the recorded reviewed head with identical final content; no files or refs were changed"
+	}
+	anchorRef := custody.RecoveryRef(run.ID)
+	if symbolic, err := git.Run(ctx, s.GateDir, "symbolic-ref", "-q", anchorRef); err == nil && symbolic != "" {
+		return unverifiedHeadProof{}, "blocked_recover_anchor_mismatch", "the run recovery ref in the local gate conflicts with the live gate head; no files or refs were changed"
+	}
+	anchored, anchorExists, anchorErr := git.ExactRefTarget(ctx, s.GateDir, anchorRef)
+	if anchorErr != nil || (anchorExists && anchored != gateHead) {
+		return unverifiedHeadProof{}, "blocked_recover_anchor_mismatch", "the run recovery ref in the local gate conflicts with the live gate head; no files or refs were changed"
+	}
+	return unverifiedHeadProof{verifiedHead: gateHead, gateHead: gateHead, equalTreeRewrite: true, anchorExists: anchorExists}, "", ""
 }
 
 // recoverKeepLocal performs the explicit keep-local custody return: the
@@ -2333,6 +2400,11 @@ func (s *Service) recoverySourceAvailable(ctx context.Context, state *State, run
 		archiveProof = s.verifyBoundRecoveryArchiveRecords(ctx, state, run, archiveRecords)
 		if !archiveProof.available {
 			return archiveProof
+		}
+	}
+	if run.TerminalHeadVerifiedAt == nil {
+		if _, safety, message := s.proveUnverifiedTerminalHead(ctx, *state, run); safety != "" {
+			return unavailableRecoverySource(safety, message)
 		}
 	}
 

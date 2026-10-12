@@ -279,8 +279,11 @@ Run the pipeline and decide on its findings as they come up:
      outcome without either retrying or explaining what blocks it.
 
 ` + "`no-mistakes rerun`" + ` keeps its existing head selection: the gate head, or the
-latest terminal run's verified unpublished preserved head while custody remains
-outstanding. If a known clean caller ` + "`HEAD`" + ` differs from that selected head,
+latest terminal run's unpublished preserved head while custody remains
+outstanding. That preserved head must be verified at terminalization or, when
+the verification stamp is missing, the recorded head must be pinned exactly by
+the run's own non-symbolic ` + "`refs/no-mistakes/recover/<run>`" + ` ref and descend
+from the gate head. If a known clean caller ` + "`HEAD`" + ` differs from that selected head,
 it refuses before starting or superseding any run and reports both full SHAs.
 It never substitutes the caller head or moves either branch to make them match.
 On refusal, inspect ` + "`no-mistakes axi status`" + ` and follow the custody guidance

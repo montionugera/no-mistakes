@@ -448,7 +448,7 @@ For behind or diverged worktrees, recovery verifies the preserved head at the ru
 A clean behind worktree fast-forwards.
 A diverged worktree is adopted only when the preserved head provably carries every local change, proven by an executable three-way merge whose result is exactly the preserved head's tree.
 This covers a pipeline rebase onto a newer base without requiring the gate branch to advance to the preserved head.
-Terminalization pins a verified unpublished pipeline head under a run-specific recovery ref, so recovery does not require the gate branch itself to have advanced. If the verified recorded head is absent from both the worktree and an accessible gate and the recovery refs are compatible, status still offers `recover_custody`, but the command is `--recover --keep-local` rather than taking that head. Plain `--recover` without `--keep-local` still refuses.
+Terminalization pins an unpublished pipeline head under a run-specific recovery ref before recording it as verified, so recovery does not require the gate branch itself to have advanced. If the verification stamp is missing and the recorded head is ahead of the live gate branch head, recovery accepts it only when the run's own non-symbolic recovery ref names exactly that commit. The gate branch must directly name a commit too; recovery locks both refs in a Git transaction, checks their direct identities and exact commit targets under those locks, and keeps the locks through recording verification. An equal-tree recovery that creates an anchor commits it first, then locks and revalidates both refs before recording verification. If either changed, it refuses without a verification stamp. Status applies the same proof before offering recovery; without it, this case requires manual reconciliation. `no-mistakes rerun` selects that anchored head too, subject to its caller-head checks below; it also refuses a symbolic gate branch, and without the anchor proof it retains the gate-head selection. Recovery can also verify a live gate head equal to or descended from the recorded head, or an equal-tree rewrite of the exact reviewed result that preserves local work. These cases still require the ordinary recovery safety checks.
 That adoption anchors the pre-recovery local head under `refs/no-mistakes/recover-local/<run>`, then moves the branch with Git operations that refuse on their own rather than after a preceding check: an atomic compare-and-swap on the branch ref, and a working-tree update that aborts instead of overwriting a modified or untracked file.
 The proof is deliberately narrow and never uses patch identity, which discards hunk locations and whitespace and so cannot tell a genuine replay from a same-shaped edit elsewhere.
 Anything it cannot decide - unlanded local commits, or a rebase whose fix rounds also rewrote your own lines - still refuses with the anchor named, because only escalation can tell a deliberate pipeline fix apart from a dropped change.
@@ -560,12 +560,13 @@ no-mistakes rerun --closes 95
 `--model` and `--effort` opt this new run into a [pinned Pi profile](/no-mistakes/reference/global-config/#per-run-pi-profiles), with the same precedence and validation as `axi run`. Omitting both retains current global-config behavior; a prior run's model pin is not inherited.
 
 Starts a new pipeline run from the current gate branch, except when the latest
-terminal run has a verified unpublished head whose custody has not been
-returned: rerun then uses that preserved terminal head even if the gate branch
-is stale. The command refuses instead of falling back to the gate branch when
-the run-specific recovery ref is conflicting, invalid, or the recorded head is
-unavailable. Use `no-mistakes axi status` and reconcile custody first in that
-case.
+terminal run has an unpublished head that is verified or has the exact
+recovery-ref proof described under [Custody recovery](#custody-recovery), and
+custody has not been returned: rerun then uses that preserved terminal head even
+if the gate branch is stale. Once that terminal head is selected, the command
+refuses instead of falling back to the gate branch when the run-specific
+recovery ref is conflicting, invalid, or the recorded head is unavailable.
+Use `no-mistakes axi status` and reconcile custody first in that case.
 An immutable-source run selects the exact submitted head from the selected run
 only while that commit is still the live published source branch. Rerun does not
 depend on or move a stale or absent local gate branch. It preserves the run's
