@@ -199,6 +199,10 @@ func (s *Service) runLsRemote(ctx context.Context, dir, remote, ref string) (str
 	return git.LsRemote(ctx, dir, remote, ref)
 }
 
+func (s *Service) runRemoteHead(ctx context.Context, dir, remote, branch string) (string, error) {
+	return s.runLsRemote(ctx, dir, remote, "refs/heads/"+branch)
+}
+
 func (s *Service) runFetchRemote(ctx context.Context, dir, remote, branch, localRef string) error {
 	if s.fetchRemote != nil {
 		return s.fetchRemote(ctx, dir, remote, branch, localRef)
@@ -289,8 +293,20 @@ func (s *Service) InspectCached(ctx context.Context) State {
 func (s *Service) Refresh(ctx context.Context) State {
 	state, run, ok := s.inspect(ctx)
 	if run != nil && run.Shipping != nil && run.Shipping.Mode == types.ShippingImmutableSource {
-		head, err := shipping.RemoteHead(ctx, s.workDir(), s.resolvedPushURL(ctx, s.Repo), run.Branch)
-		if err != nil || run.SubmittedHeadSHA == nil || head != *run.SubmittedHeadSHA || shipping.CheckImmutableTarget(ctx, run, s.Repo, s.workDir()) != nil {
+		resolveCtx, resolveCancel := context.WithTimeout(ctx, s.remoteTimeout())
+		pushURL := s.resolvedPushURL(resolveCtx, s.Repo)
+		resolveErr := resolveCtx.Err()
+		resolveCancel()
+		sourceCtx, sourceCancel := context.WithTimeout(ctx, s.remoteTimeout())
+		head, err := s.runRemoteHead(sourceCtx, s.workDir(), pushURL, run.Branch)
+		sourceCancel()
+		if resolveErr != nil || err != nil || run.SubmittedHeadSHA == nil || head != *run.SubmittedHeadSHA {
+			return blockedPlan(state, StateTargetChanged, "immutable_source_moved", "immutable published source moved or cannot be observed; no files or refs were changed")
+		}
+		targetCtx, targetCancel := context.WithTimeout(ctx, s.remoteTimeout())
+		targetErr := shipping.CheckImmutableTarget(targetCtx, run, s.Repo, s.workDir(), s.runRemoteHead)
+		targetCancel()
+		if targetErr != nil {
 			return blockedPlan(state, StateTargetChanged, "immutable_source_moved", "immutable published source moved or cannot be observed; no files or refs were changed")
 		}
 		state.Remote = RemoteState{ObservedHead: head, Freshness: "live", ObservedAt: time.Now().Unix()}

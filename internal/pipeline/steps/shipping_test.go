@@ -7,6 +7,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,15 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+type mergedFactsHost struct {
+	scm.Host
+	facts scm.PRFacts
+}
+
+func (h *mergedFactsHost) GetPRFacts(context.Context, *scm.PR) (scm.PRFacts, error) {
+	return h.facts, nil
+}
 
 func TestShippingPushRequiresExactReviewRatherThanDescendant(t *testing.T) {
 	dir, base, head := setupGitRepo(t)
@@ -180,8 +190,12 @@ func TestImmutablePromotionMergeSettlesExecutorWithoutSourceMutation(t *testing.
 		t.Fatal(err)
 	}
 	run.PRURL = &prURL
+	wrongFacts := scm.PRFacts{State: scm.PRStateMerged, URL: prURL, SourceRepo: "test/repo", SourceBranch: "dev", HeadSHA: head, TargetRepo: "test/repo", TargetBranch: "main", TargetSHA: head}
+	if err := verifyShippingMergedProof(sctx, &mergedFactsHost{facts: wrongFacts}, &scm.PR{URL: prURL}); err == nil {
+		t.Fatal("merged proof accepted an unapproved target SHA")
+	}
 	env, _ := fakeGHWithBase(t, prURL, "main")
-	env = append(env, "FAKE_CLI_PR_STATE=MERGED", "FAKE_CLI_PR_FACTS_JSON="+fmt.Sprintf(`{"number":42,"html_url":%q,"state":"closed","merged":true,"head":{"ref":"dev","sha":%q,"repo":{"full_name":"test/repo"}},"base":{"ref":"main","sha":%q,"repo":{"full_name":"test/repo"}}}`, prURL, head, head))
+	env = append(env, "FAKE_CLI_PR_STATE=MERGED", "FAKE_CLI_PR_FACTS_JSON="+fmt.Sprintf(`{"number":42,"html_url":%q,"state":"closed","merged":true,"head":{"ref":"dev","sha":%q,"repo":{"full_name":"test/repo"}},"base":{"ref":"main","sha":%q,"repo":{"full_name":"test/repo"}}}`, prURL, head, base))
 	ci := &CIStep{}
 	wrapper := &transitionStep{name: types.StepCI, execute: func(ctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
 		gitCmd(t, dir, "push", remote, "HEAD:refs/heads/main")

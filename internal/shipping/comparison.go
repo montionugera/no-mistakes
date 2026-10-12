@@ -100,16 +100,16 @@ func CheckImmutable(ctx context.Context, run *db.Run, repo *db.Repo, dir string)
 	if err := CheckImmutableSource(ctx, run, repo, dir); err != nil {
 		return err
 	}
-	return CheckImmutableTarget(ctx, run, repo, dir)
+	return CheckImmutableTarget(ctx, run, repo, dir, RemoteHead)
 }
 
-func CheckImmutableTarget(ctx context.Context, run *db.Run, repo *db.Repo, dir string) error {
+func CheckImmutableTarget(ctx context.Context, run *db.Run, repo *db.Repo, dir string, remoteHead func(context.Context, string, string, string) (string, error)) error {
 	if run == nil || run.Shipping == nil || run.Shipping.Mode != types.ShippingImmutableSource {
 		return nil
 	}
 	if run.Shipping.TargetSHA != "" {
 		upstreamURL := git.ResolveUpstreamURL(ctx, dir, repo.UpstreamURL, repo.URLsVerified)
-		target, err := RemoteHead(ctx, dir, upstreamURL, run.Shipping.TargetBranch)
+		target, err := remoteHead(ctx, dir, upstreamURL, run.Shipping.TargetBranch)
 		if err != nil {
 			return err
 		}
