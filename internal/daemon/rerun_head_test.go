@@ -17,7 +17,7 @@ import (
 )
 
 func TestImmutableShippingRerunUsesPublishedSourceWithoutUpdatingGateBranch(t *testing.T) {
-	for _, gateState := range []string{"absent", "stale"} {
+	for _, gateState := range []string{"absent", "stale", "moved"} {
 		t.Run(gateState, func(t *testing.T) {
 			p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
 				steps := make([]pipeline.Step, 0, len(types.AllSteps()))
@@ -44,6 +44,11 @@ func TestImmutableShippingRerunUsesPublishedSourceWithoutUpdatingGateBranch(t *t
 			submitted := gitOutput(t, repo.WorkingPath, "rev-parse", "HEAD")
 			gitCmd(t, repo.WorkingPath, "push", "gate", "HEAD:refs/heads/feature")
 			gitCmd(t, repo.WorkingPath, "checkout", "main")
+			if gateState == "moved" {
+				gitCmd(t, repo.WorkingPath, "commit", "--allow-empty", "-m", "advance target")
+				gitCmd(t, repo.WorkingPath, "push", "gate", "main:refs/heads/main")
+				gitCmd(t, repo.WorkingPath, "checkout", "feature")
+			}
 			// Keep the selected commit out of the gate so the rerun must fetch
 			// the published object before WorktreeAdd can use it.
 			missingSourceObject := exec.Command("git", "--git-dir", p.RepoDir(repo.ID), "cat-file", "-e", submitted+"^{commit}")
@@ -51,7 +56,7 @@ func TestImmutableShippingRerunUsesPublishedSourceWithoutUpdatingGateBranch(t *t
 				t.Fatalf("test fixture already has published source object %s in the local gate", submitted)
 			}
 
-			shippingPin := &types.ShippingOptions{Mode: types.ShippingImmutableSource, TargetBranch: "main", Draft: rerunTestBoolPtr(true)}
+			shippingPin := &types.ShippingOptions{Mode: types.ShippingImmutableSource, TargetBranch: "main", TargetSHA: baseSHA, Draft: rerunTestBoolPtr(true)}
 			selected, err := d.InsertRunWithShipping(repo.ID, "feature", submitted, baseSHA, nil, "", "", "", "main", false, nil, shippingPin)
 			if err != nil {
 				t.Fatal(err)
@@ -81,13 +86,26 @@ func TestImmutableShippingRerunUsesPublishedSourceWithoutUpdatingGateBranch(t *t
 			if err := client.Call(ipc.MethodRerun, &ipc.RerunParams{
 				RepoID: repo.ID, Branch: "feature", PreviousRunID: selected.ID,
 			}, &result); err != nil {
-				t.Fatal(err)
+				if gateState != "moved" {
+					t.Fatal(err)
+				}
+				if !strings.Contains(err.Error(), "immutable target moved") {
+					t.Fatalf("moved target refusal = %v, want immutable target movement", err)
+				}
+				runs, runErr := d.GetRunsByRepo(repo.ID)
+				if runErr != nil || len(runs) != 2 {
+					t.Fatalf("moved target refusal created a run: runs=%d err=%v", len(runs), runErr)
+				}
+				return
+			}
+			if gateState == "moved" {
+				t.Fatalf("rerun succeeded after target movement: %s", result.RunID)
 			}
 			got := waitForRunTerminalStateWithTimeout(t, d, result.RunID, time.Minute)
 			if got.Status != types.RunCompleted || got.SubmittedHeadSHA == nil || *got.SubmittedHeadSHA != submitted {
 				t.Fatalf("rerun = %+v, want completed at immutable source %s", got, submitted)
 			}
-			if got.Shipping == nil || got.Shipping.Mode != types.ShippingImmutableSource || got.Shipping.TargetBranch != "main" || got.Shipping.Draft == nil || !*got.Shipping.Draft {
+			if got.Shipping == nil || got.Shipping.Mode != types.ShippingImmutableSource || got.Shipping.TargetBranch != "main" || got.Shipping.TargetSHA != baseSHA || got.Shipping.Draft == nil || !*got.Shipping.Draft {
 				t.Fatalf("rerun lost strict shipping mode, target, or draft: %+v", got.Shipping)
 			}
 			if got.PRBaseBranch == nil || *got.PRBaseBranch != "main" {
