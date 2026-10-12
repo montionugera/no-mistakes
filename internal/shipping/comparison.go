@@ -100,6 +100,10 @@ func CheckImmutable(ctx context.Context, run *db.Run, repo *db.Repo, dir string)
 	if err := CheckImmutableSource(ctx, run, repo, dir); err != nil {
 		return err
 	}
+	return CheckImmutableTarget(ctx, run, repo, dir)
+}
+
+func CheckImmutableTarget(ctx context.Context, run *db.Run, repo *db.Repo, dir string) error {
 	if run == nil || run.Shipping == nil || run.Shipping.Mode != types.ShippingImmutableSource {
 		return nil
 	}

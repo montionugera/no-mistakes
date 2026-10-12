@@ -149,10 +149,12 @@ func Export(ctx context.Context, database *db.DB, repo *db.Repo, runID, phase st
 	if err != nil {
 		return nil, err
 	}
-	if err := checkFacts(first, repo, facts); err != nil {
+	if err := checkFacts(first, repo, facts, run.Shipping.Draft); err != nil {
 		return nil, err
 	}
-	first.Draft = facts.Draft
+	if run.Shipping.Draft == nil {
+		first.Draft = facts.Draft
+	}
 	if err := checkGit(ctx, dir, repo, first); err != nil {
 		return nil, err
 	}
@@ -187,7 +189,9 @@ func Export(ctx context.Context, database *db.DB, repo *db.Repo, runID, phase st
 	if err != nil {
 		return nil, err
 	}
-	after.Draft = facts.Draft
+	if run.Shipping.Draft == nil {
+		after.Draft = facts.Draft
+	}
 	if !reflect.DeepEqual(first, after) {
 		return nil, fmt.Errorf("pipeline authority moved during receipt export")
 	}
@@ -226,6 +230,9 @@ func durablePayload(database *db.DB, runID, phase string) (Payload, error) {
 	}
 	if r.Shipping.Mode == types.ShippingImmutableSource && *r.SubmittedHeadSHA != r.HeadSHA {
 		return p, fmt.Errorf("immutable submitted source changed")
+	}
+	if r.Shipping.Draft != nil {
+		p.Draft = *r.Shipping.Draft
 	}
 	if r.Shipping.Mode == types.ShippingFull && (r.LastPushedSHA == nil || *r.LastPushedSHA != r.HeadSHA || r.PushGeneration == nil || *r.PushGeneration < 1 || r.PushRef == nil || *r.PushRef != "refs/heads/"+c.SourceBranch || r.PushTargetFingerprint == nil || *r.PushTargetFingerprint == "" || r.PushTargetKind == nil) {
 		return p, fmt.Errorf("strict shipping lacks exact durable publication proof")
@@ -301,8 +308,8 @@ func durablePayload(database *db.DB, runID, phase string) (Payload, error) {
 	return p, nil
 }
 
-func checkFacts(p Payload, repo *db.Repo, f scm.PRFacts) error {
-	if f.State != scm.PRStateOpen || f.URL != p.PRURL || f.SourceRepo != p.SourceRepo || f.SourceRepo != github.RepoSlug(repo.PushURL()) || f.SourceBranch != p.SourceBranch || f.HeadSHA != p.LocalHeadSHA || f.TargetRepo != github.RepoSlug(repo.UpstreamURL) || f.TargetBranch != p.TargetBranch || f.TargetSHA != p.TargetSHA {
+func checkFacts(p Payload, repo *db.Repo, f scm.PRFacts, draft *bool) error {
+	if f.State != scm.PRStateOpen || f.URL != p.PRURL || f.SourceRepo != p.SourceRepo || f.SourceRepo != github.RepoSlug(repo.PushURL()) || f.SourceBranch != p.SourceBranch || f.HeadSHA != p.LocalHeadSHA || f.TargetRepo != github.RepoSlug(repo.UpstreamURL) || f.TargetBranch != p.TargetBranch || f.TargetSHA != p.TargetSHA || draft != nil && f.Draft != *draft {
 		return fmt.Errorf("live PR comparison differs from approved Review")
 	}
 	return nil

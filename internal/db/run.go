@@ -375,10 +375,25 @@ func (d *DB) GetRunByLaunchNonce(repoID, branch, launchNonce string) (*Run, erro
 // this caller is its first observer. The expected immutable receipt binding,
 // including an explicit PR base branch, is part of the UPDATE predicate, so a
 // conflicting observer cannot consume `created`.
-func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch string, omitIntent bool, profiles ...*agentcfg.PiProfile) (*Run, bool, error) {
+func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch string, omitIntent bool, shipping *types.ShippingOptions, profiles ...*agentcfg.PiProfile) (*Run, bool, error) {
 	request := agentcfg.OptionalPiProfile(profiles)
 	if err := request.ValidateRequest(); err != nil {
 		return nil, false, err
+	}
+	shippingMode := ""
+	var shippingDraft any
+	if shipping != nil {
+		if err := shipping.Validate(); err != nil {
+			return nil, false, err
+		}
+		shippingMode = shipping.Mode
+		if shipping.Draft != nil {
+			if *shipping.Draft {
+				shippingDraft = int64(1)
+			} else {
+				shippingDraft = int64(0)
+			}
+		}
 	}
 	model, effort := "", ""
 	if request != nil {
@@ -393,11 +408,13 @@ func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, v
 			   AND submitted_head_sha = ? AND launch_validation_generation = ? AND launch_intent_digest = ?
 			   AND (? = '' OR pr_base_branch = ?)
 			   AND (? = 0 OR omit_intent = ?)
+			   AND (? = '' OR json_extract(shipping_options, '$.mode') = ?)
+			   AND (? IS NULL OR json_extract(shipping_options, '$.draft') = ?)
 			   AND (? = '' OR json_extract(pi_profile, '$.model') = ?)
 			   AND (? = '' OR json_extract(pi_profile, '$.effort') = ?)
 			   AND launch_receipt_claimed_at IS NULL
 			 RETURNING `+runColumns,
-			now(), repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, prBaseBranch, omitIntent, omitIntent, model, model, effort, effort,
+			now(), repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, prBaseBranch, omitIntent, omitIntent, shippingMode, shippingMode, shippingDraft, shippingDraft, model, model, effort, effort,
 		), r)
 		if err == nil {
 			return r, true, nil
@@ -409,7 +426,7 @@ func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, v
 		if err != nil {
 			return nil, false, err
 		}
-		if r == nil || !r.PiProfile.Matches(request) || r.LaunchReceiptClaimedAt != nil ||
+		if r == nil || !r.Shipping.Matches(shipping) || !r.PiProfile.Matches(request) || r.LaunchReceiptClaimedAt != nil ||
 			r.SubmittedHeadSHA == nil || *r.SubmittedHeadSHA != submittedHeadSHA ||
 			r.LaunchValidationGeneration == nil || *r.LaunchValidationGeneration != validationGeneration ||
 			r.LaunchIntentDigest == nil || *r.LaunchIntentDigest != intentDigest ||
