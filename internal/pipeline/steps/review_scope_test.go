@@ -24,10 +24,12 @@ func TestReviewStep_ScopeDispositionRetractionProtocol(t *testing.T) {
 			ag.runFn = func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
 				var schema struct {
 					Properties map[string]struct {
-						Type string `json:"type"`
+						Type  string `json:"type"`
 						Items struct {
-							Required []string `json:"required"`
-							Properties map[string]struct { Type string `json:"type"` } `json:"properties"`
+							Required   []string `json:"required"`
+							Properties map[string]struct {
+								Type string `json:"type"`
+							} `json:"properties"`
 						} `json:"items"`
 					} `json:"properties"`
 				}
