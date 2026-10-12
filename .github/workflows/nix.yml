@@ -1,8 +1,8 @@
 name: Nix flake
 
 # A path-filtered PR run is safe here: this workflow backs no required check,
-# and the filter omits every release-please output, so release PRs create no
-# run. The push trigger covers what the filter misses after merge.
+# and the filter omits the retained upstream release-please outputs.
+# The push trigger covers what the filter misses after merge.
 on:
   pull_request:
     branches:

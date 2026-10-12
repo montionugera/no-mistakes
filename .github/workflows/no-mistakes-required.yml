@@ -12,9 +12,9 @@ on:
     types: [opened, edited, synchronize, reopened]
     branches:
       - main
-    # Never create a run for a release-please PR. The job-level author exemption
-    # below cannot do this: it is evaluated inside a run, and a GITHUB_TOKEN PR's
-    # run is created in action_required and never starts.
+    # Retain the upstream generated-output exclusions: a job-level exemption
+    # cannot prevent a GITHUB_TOKEN PR's run being created in action_required.
+    # This fork no longer creates release-please PRs.
     paths-ignore:
       - .release-please-manifest.json
       - CHANGELOG.md
@@ -30,8 +30,8 @@ permissions:
 
 # GitHub concurrency groups retain at most one pending run, replacing older
 # pending runs even when cancel-in-progress is false. Give body-bearing events
-# an immutable per-event group so first-time-fork approvals can never collapse
-# opened/edited checks. Keep reopened coalescing as before.
+# an immutable per-event group so admitted opened/edited checks never collapse.
+# Keep reopened coalescing as before.
 concurrency:
   group: no-mistakes-required-${{ github.event.pull_request.number }}-${{ (github.event.action == 'opened' || github.event.action == 'edited') && github.run_id || 'head-change' }}
   cancel-in-progress: true
@@ -41,8 +41,8 @@ jobs:
     name: PR must be raised via no-mistakes
     runs-on: [self-hosted, Linux, X64, king-server, no-mistakes]
     timeout-minutes: 10
-    # Known automation accounts are exempt so the release pipeline keeps working:
-    # - github-actions[bot] opens the release-please PR via GITHUB_TOKEN
+    # Retain the upstream automation exemptions despite removing fork releases:
+    # - github-actions[bot] and release-please[bot] are release automation accounts
     # - dependabot[bot] opens dependency update PRs
     # Other authors (human or bot) must raise PRs through `git push no-mistakes`.
     #

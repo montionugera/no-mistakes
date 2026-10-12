@@ -6,7 +6,7 @@ metadata:
   internal: true
 ---
 
-**Fork status:** `vifar/no-mistakes` removed `release.yml`, `publish-channels.yml`, `cmd/publish-channels`, `release-please-config.json`, and their workflow tests; nothing publishes from this fork and every workflow job runs self-hosted (see `docs/src/content/docs/guides/fork-ci.md`). The signing notes below describe the upstream release design and are history here; do not restore a hosted-runner release workflow.
+**Fork status:** The [fork CI guide](../../../docs/src/content/docs/guides/fork-ci.md) owns this fork's workflow and publication policy. The signing notes below describe the removed upstream release design and are history here; do not restore a hosted-runner release workflow.
 
 **macOS Release Signing (permanent identity)**
 

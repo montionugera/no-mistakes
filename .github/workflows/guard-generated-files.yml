@@ -5,9 +5,9 @@ on:
     types: [opened, synchronize, reopened]
     branches:
       - main
-    # Never create a run for a release-please PR. The job-level author exemption
-    # below cannot do this: it is evaluated inside a run, and a GITHUB_TOKEN PR's
-    # run is created in action_required and never starts.
+    # Retain the upstream generated-output exclusions: a job-level exemption
+    # cannot prevent a GITHUB_TOKEN PR's run being created in action_required.
+    # This fork no longer creates release-please PRs.
     paths-ignore:
       - .release-please-manifest.json
       - CHANGELOG.md
@@ -24,8 +24,8 @@ jobs:
     name: Generated files must not be hand-edited
     runs-on: [self-hosted, Linux, X64, king-server, no-mistakes]
     timeout-minutes: 10
-    # release-please owns CHANGELOG.md and .release-please-manifest.json; its PR
-    # is the one legitimate place those files change, so we exempt its author.
+    # Retain the upstream automation exemptions for the protected generated
+    # outputs. CONTRIBUTING.md owns the rule for edits in this fork.
     if: >-
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       github.event.pull_request.user.login != 'github-actions[bot]' &&

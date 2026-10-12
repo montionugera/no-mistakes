@@ -16,8 +16,14 @@ Every job also carries the same-repository guard
 `github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository`,
 so code from an external fork pull request never reaches the runner. The
 release and channel-publishing workflows were removed from this fork; it
-publishes nothing from Actions. A repository test walks every workflow file and
-fails on any job that is not routed to these labels.
+does not publish CLI releases or update channels from Actions. The docs workflow
+still deploys GitHub Pages from `main`. `TestEveryWorkflowJobRunsOnTheKingServer`
+walks every workflow file and rejects incorrect runner labels, missing job
+timeouts, unsafe fork admission, or persisted checkout credentials.
+
+External fork PRs skip the required check in this solo-use repository; approving
+a workflow run does not bypass the job guard. The workflow generator for users'
+repositories (`internal/cli/ci_workflow.go`) is unchanged.
 
 CI runs on pull requests from branches in this repository, pushes to `main`,
 and manual dispatches. It checks formatting, the generated skill, and vet;
