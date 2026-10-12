@@ -22,6 +22,27 @@ func PreserveRecoveryHead(ctx context.Context, dir, runID, head string) error {
 	return PreserveRecoveryAnchor(ctx, dir, RecoveryRef(runID), head)
 }
 
+// AnchoredDescendant reports whether the run's own recovery ref in dir pins
+// exactly head and head descends from base. Every writer of that create-only
+// ref pins a head it observed or verified for the run, so it is the same
+// evidence a verified terminal head carries even when the verification stamp
+// itself was lost.
+func AnchoredDescendant(ctx context.Context, dir, runID, base, head string) bool {
+	ref := RecoveryRef(runID)
+	if base == "" || head == "" {
+		return false
+	}
+	if _, err := git.Run(ctx, dir, "symbolic-ref", "-q", ref); err == nil {
+		return false
+	}
+	target, exists, err := git.ExactRefTarget(ctx, dir, ref)
+	if err != nil || !exists || target != head {
+		return false
+	}
+	_, err = git.Run(ctx, dir, "merge-base", "--is-ancestor", base, head)
+	return err == nil
+}
+
 func PreserveRecoveryAnchor(ctx context.Context, dir, ref, head string) error {
 	if symbolic, err := git.Run(ctx, dir, "symbolic-ref", "-q", ref); err == nil {
 		return fmt.Errorf("recovery anchor %s is symbolic to %s instead of the verified commit %s", ref, symbolic, head)

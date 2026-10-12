@@ -410,6 +410,7 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 	// Execute steps sequentially. A late repair may send the same run back
 	// through validation before any new head is published.
 	revalidating := false
+	var restartedBy types.StepName
 	for i := 0; i < len(e.steps); i++ {
 		step := e.steps[i]
 		if ctx.Err() != nil {
@@ -434,7 +435,7 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 		if err != nil {
 			return e.failRun(run, repo, fmt.Errorf("restore step %s execution state: %w", step.Name(), err), ctx)
 		}
-		if revalidating && step.Name() == types.StepReview {
+		if revalidating && step.Name() == types.StepReview && restartedBy != types.StepReview {
 			state.outstandingFindings = ""
 			state.selectedOutstandingIDs = nil
 		}
@@ -462,6 +463,7 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 				return e.failRun(run, repo, fmt.Errorf("step %s requested invalid restart from %s", step.Name(), restartFrom), ctx)
 			}
 			revalidating = true
+			restartedBy = step.Name()
 			i = restartIndex - 1
 		}
 	}
@@ -632,7 +634,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 			return e.failRun(run, repo, fmt.Errorf("complete reconciled step %s: %w", gate.step.Name(), err), ctx)
 		}
 		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusCompleted), "", "", &duration)
-		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, false)
+		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, "")
 	}
 	reconcileCtx := &StepContext{
 		Ctx:          ctx,
@@ -735,14 +737,14 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 			return e.failRun(run, repo, fmt.Errorf("complete recovered step %s: %w", gate.step.Name(), err), ctx)
 		}
 		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusCompleted), "", "", &duration)
-		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, false)
+		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, "")
 	case types.ActionSkip:
 		e.recordDeclinedRound(gate.lastRoundID, gate.findings, gate.step.Name(), gate.round)
 		if err := e.db.CompleteStepWithStatus(gate.stepResult.ID, types.StepStatusSkipped, recoveredExitCode(gate.stepResult), duration, recoveredLogPath(gate.stepResult)); err != nil {
 			return e.failRun(run, repo, fmt.Errorf("skip recovered step %s: %w", gate.step.Name(), err), ctx)
 		}
 		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusSkipped), "", "", &duration)
-		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, false)
+		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, "")
 	case types.ActionAbort:
 		e.recordDeclinedRound(gate.lastRoundID, gate.findings, gate.step.Name(), gate.round)
 		if dbErr := e.db.FailStep(gate.stepResult.ID, "aborted by user", duration); dbErr != nil {
@@ -829,9 +831,9 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 			if indexErr != nil {
 				return e.failRun(run, repo, fmt.Errorf("step %s requested invalid restart from %s", gate.step.Name(), restartFrom), ctx)
 			}
-			return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, restartIndex, true)
+			return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, restartIndex, gate.step.Name())
 		}
-		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, false)
+		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, "")
 	default:
 		return e.failRun(run, repo, fmt.Errorf("step %s: unsupported approval action %q", gate.step.Name(), response.action), ctx)
 	}
@@ -912,7 +914,11 @@ func (e *Executor) recoveredGate(runID string) (*recoveredGate, error) {
 	return gate, nil
 }
 
-func (e *Executor) executeRecoveredRemainder(ctx context.Context, run *db.Run, repo *db.Repo, workDir, logDir string, start int, revalidating bool) error {
+// restartedBy names the step whose restart started this remainder, or is empty
+// when it continues in order. A restart Review requested itself continues that
+// review pass's carried set; any later step's restart starts a fresh one.
+func (e *Executor) executeRecoveredRemainder(ctx context.Context, run *db.Run, repo *db.Repo, workDir, logDir string, start int, restartedBy types.StepName) error {
+	revalidating := restartedBy != ""
 	results, err := e.db.GetStepsByRun(run.ID)
 	if err != nil {
 		return e.failRun(run, repo, fmt.Errorf("get recovered steps: %w", err), ctx)
@@ -931,7 +937,7 @@ func (e *Executor) executeRecoveredRemainder(ctx context.Context, run *db.Run, r
 		if stateErr != nil {
 			return e.failRun(run, repo, fmt.Errorf("restore step %s execution state: %w", e.steps[index].Name(), stateErr), ctx)
 		}
-		if revalidating && e.steps[index].Name() == types.StepReview {
+		if revalidating && e.steps[index].Name() == types.StepReview && restartedBy != types.StepReview {
 			state.outstandingFindings = ""
 			state.selectedOutstandingIDs = nil
 		}
@@ -948,6 +954,7 @@ func (e *Executor) executeRecoveredRemainder(ctx context.Context, run *db.Run, r
 				return e.failRun(run, repo, fmt.Errorf("step %s requested invalid restart from %s", e.steps[index].Name(), restartFrom), ctx)
 			}
 			revalidating = true
+			restartedBy = e.steps[index].Name()
 			index = restartIndex - 1
 		}
 	}
@@ -1535,7 +1542,15 @@ rounds:
 			}
 		}
 
-		if !outcome.NeedsApproval && !hasAskUserFindingsJSON(effectiveFindings) && !hasBlockingFindingsJSON(effectiveFindings) && (!carryFindings || !hasSelectedFindingsJSON(effectiveFindings, selectedOutstandingIDs)) {
+		// A restart hands the carried set on to the restarted step (see
+		// restartedBy), so only this round's own findings may hold the restart
+		// at a gate; parking on the carry would wait for a verification only
+		// the restarted pass can provide.
+		gateFindings := effectiveFindings
+		if restartFrom != "" {
+			gateFindings = roundFindings
+		}
+		if !outcome.NeedsApproval && !hasAskUserFindingsJSON(gateFindings) && !hasBlockingFindingsJSON(gateFindings) && (!carryFindings || !hasSelectedFindingsJSON(gateFindings, selectedOutstandingIDs)) {
 			// Step completed without needing approval.
 			// Any remaining info-only or non-blocking findings
 			// are acceptable and don't block the pipeline.

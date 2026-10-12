@@ -3021,3 +3021,220 @@ func TestAdoptPublishedRefusesReplacedPushTarget(t *testing.T) {
 		}
 	})
 }
+
+// newUnverifiedAnchoredRecoverFixture reproduces run 01M4QC5RSZKKXR1YN19BP7907H:
+// the run was cancelled after a fix round committed onto the submitted head,
+// terminalization anchored that fix commit at the run's own recovery ref but
+// its deadline expired before the verified-head stamp was written, and the gate
+// branch still names the submitted head the fix descends from.
+func newUnverifiedAnchoredRecoverFixture(t *testing.T) *recoverFixture {
+	t.Helper()
+	f := newRecoverFixture(t, types.RunCancelled)
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted)
+	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+	if err := f.db.UpdateRunErrorStatus(f.run.ID, types.RunCancelReasonAbortedByUser, types.RunCancelled); err != nil {
+		t.Fatal(err)
+	}
+	f.run, _ = f.db.GetRun(f.run.ID)
+	if f.run.TerminalHeadVerifiedAt != nil || f.run.HeadSHA != f.preserved {
+		t.Fatalf("fixture run = %#v", f.run)
+	}
+	return f
+}
+
+func TestRecoverUnverifiedHeadAnchoredAboveTheGateHead(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		fastForward bool
+	}{
+		{name: "worktree behind at the submitted head"},
+		{name: "worktree already fast-forwarded to the anchored head", fastForward: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newUnverifiedAnchoredRecoverFixture(t)
+			if tc.fastForward {
+				mustRun(t, f.local, "fetch", f.gate, f.anchorRef())
+				mustRun(t, f.local, "merge", "--ff-only", f.preserved)
+			}
+
+			status := f.service.InspectCached(f.ctx)
+			if status.NextAction == nil || status.NextAction.Code != "recover_custody" || status.NextAction.Command != "no-mistakes axi sync --recover" {
+				t.Fatalf("status next action = %#v (%s)", status.NextAction, status.Safety)
+			}
+			state := f.service.Recover(f.ctx, false)
+			if !state.Recovered || state.State != StateCustodyReturned {
+				t.Fatalf("recovery = %#v", state)
+			}
+			if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+				t.Fatalf("HEAD = %s, want anchored fix head %s", got, f.preserved)
+			}
+			if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
+				t.Fatalf("recovery moved the gate branch to %s", got)
+			}
+			run, err := f.db.GetRun(f.run.ID)
+			if err != nil || run.HeadSHA != f.preserved || run.TerminalHeadVerifiedAt == nil || run.CustodyReturnedAt == nil {
+				t.Fatalf("recovered run = %#v, err %v", run, err)
+			}
+		})
+	}
+}
+
+// Without its own exact anchor the unverified head stays refused, and status
+// must not advertise the recovery it is certain to refuse.
+func TestRecoverUnverifiedHeadAboveTheGateHeadNeedsItsOwnAnchor(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no anchor", func(t *testing.T) {
+		f := newUnverifiedAnchoredRecoverFixture(t)
+		mustRun(t, f.gate, "update-ref", "-d", f.anchorRef())
+		mustRun(t, f.gate, "update-ref", "refs/no-mistakes/test-keep", f.preserved)
+		assertManualReconciliationOffer(t, f.service.InspectCached(f.ctx))
+		if state := assertUnverifiedRecoveryRefusalNoMutation(t, f); state.Safety != "blocked_recover_unverified_head" {
+			t.Fatalf("unanchored refusal = %s", state.Safety)
+		}
+	})
+	t.Run("anchor names another commit", func(t *testing.T) {
+		f := newUnverifiedAnchoredRecoverFixture(t)
+		mustRun(t, f.gate, "update-ref", "refs/no-mistakes/test-keep", f.preserved)
+		mustRun(t, f.gate, "update-ref", f.anchorRef(), mustRun(t, f.gate, "rev-parse", f.preserved+"^"))
+		assertManualReconciliationOffer(t, f.service.InspectCached(f.ctx))
+		if state := assertUnverifiedRecoveryRefusalNoMutation(t, f); state.Safety != "blocked_recover_unverified_head" {
+			t.Fatalf("mismatched-anchor refusal = %s", state.Safety)
+		}
+	})
+	t.Run("symbolic anchor", func(t *testing.T) {
+		f := newUnverifiedAnchoredRecoverFixture(t)
+		mustRun(t, f.gate, "update-ref", "refs/no-mistakes/test-keep", f.preserved)
+		mustRun(t, f.gate, "update-ref", "-d", f.anchorRef())
+		mustRun(t, f.gate, "symbolic-ref", f.anchorRef(), "refs/no-mistakes/test-keep")
+		assertManualReconciliationOffer(t, f.service.InspectCached(f.ctx))
+		if state := assertUnverifiedRecoveryRefusalNoMutation(t, f); state.Safety != "blocked_recover_unverified_head" {
+			t.Fatalf("symbolic-anchor refusal = %s", state.Safety)
+		}
+	})
+	t.Run("symbolic gate branch", func(t *testing.T) {
+		f := newUnverifiedAnchoredRecoverFixture(t)
+		mustRun(t, f.gate, "update-ref", "refs/heads/other", f.submitted)
+		mustRun(t, f.gate, "symbolic-ref", "refs/heads/feature/recover", "refs/heads/other")
+		assertManualReconciliationOffer(t, f.service.InspectCached(f.ctx))
+		if state := assertUnverifiedRecoveryRefusalNoMutation(t, f); state.Safety != "blocked_recover_unverified_head" {
+			t.Fatalf("symbolic-gate refusal = %s", state.Safety)
+		}
+		if got := mustRun(t, f.gate, "symbolic-ref", "refs/heads/feature/recover"); got != "refs/heads/other" {
+			t.Fatalf("refusal replaced symbolic gate branch: %s", got)
+		}
+	})
+}
+
+// The proof that recovers a lost verification stamp must still exist at the
+// stamping boundary. A concurrent writer may change refs without deleting the
+// underlying object, so object existence alone cannot authorize recovery.
+func TestRecoverUnverifiedAnchoredHeadRevalidatesBeforeStamping(t *testing.T) {
+	t.Parallel()
+	for _, mutation := range []string{"delete anchor", "move anchor", "symbolic anchor", "move gate", "symbolic gate"} {
+		t.Run(mutation, func(t *testing.T) {
+			t.Parallel()
+			f := newUnverifiedAnchoredRecoverFixture(t)
+			var gateRefsAfterWriter string
+			called := false
+			f.service.beforeRecoverTerminalHeadPreserve = func() {
+				called = true
+				switch mutation {
+				case "delete anchor":
+					mustRun(t, f.gate, "update-ref", "-d", f.anchorRef())
+				case "move anchor":
+					mustRun(t, f.gate, "update-ref", f.anchorRef(), f.submitted)
+				case "symbolic anchor":
+					mustRun(t, f.gate, "update-ref", "refs/no-mistakes/other", f.preserved)
+					mustRun(t, f.gate, "symbolic-ref", f.anchorRef(), "refs/no-mistakes/other")
+				case "move gate":
+					mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.preserved)
+				case "symbolic gate":
+					mustRun(t, f.gate, "update-ref", "refs/heads/other", f.submitted)
+					mustRun(t, f.gate, "symbolic-ref", "refs/heads/feature/recover", "refs/heads/other")
+				}
+				gateRefsAfterWriter = mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)")
+			}
+			state := f.service.Recover(f.ctx, false)
+			if !called || state.Recovered || state.Changed || state.Safety != "blocked_recover_assumptions_changed" {
+				t.Fatalf("changed proof recovery = %#v, mutation applied = %v", state, called)
+			}
+			run, err := f.db.GetRun(f.run.ID)
+			if err != nil || run.HeadSHA != f.preserved || run.TerminalHeadVerifiedAt != nil || run.CustodyReturnedAt != nil || run.UpdatedAt != f.run.UpdatedAt {
+				t.Fatalf("changed proof was stamped: run = %#v, err = %v", run, err)
+			}
+			if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+				t.Fatalf("refusal moved local head to %s", got)
+			}
+			if got := mustRun(t, f.local, "for-each-ref", "--format=%(refname) %(objectname)", "refs/no-mistakes"); got != "" {
+				t.Fatalf("refusal created local recovery refs: %s", got)
+			}
+			if got := mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"); got != gateRefsAfterWriter {
+				t.Fatalf("refusal changed writer's gate refs: %s != %s", got, gateRefsAfterWriter)
+			}
+		})
+	}
+}
+
+func TestRecoverUnverifiedHeadRejectsRefReplacementAfterPreflight(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"anchored", "equal tree existing anchor", "equal tree new anchor"} {
+		for _, mutation := range []string{"delete gate", "move gate", "symbolic gate", "delete anchor", "move anchor", "symbolic anchor"} {
+			if mode == "equal tree new anchor" && mutation == "delete anchor" {
+				continue
+			}
+			t.Run(mode+"/"+mutation, func(t *testing.T) {
+				t.Parallel()
+				var f *recoverFixture
+				if mode == "anchored" {
+					f = newUnverifiedAnchoredRecoverFixture(t)
+				} else {
+					f, _ = newTerminalEqualTreeRewriteFixture(t)
+					if mode == "equal tree existing anchor" {
+						mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+					}
+				}
+				gateHead := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover")
+				var writerRefs string
+				called := false
+				f.service.beforeRecoverTerminalHeadLock = func() {
+					called = true
+					switch mutation {
+					case "delete gate":
+						mustRun(t, f.gate, "update-ref", "-d", "refs/heads/feature/recover")
+					case "move gate":
+						mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.run.HeadSHA)
+					case "symbolic gate":
+						mustRun(t, f.gate, "update-ref", "refs/heads/other", gateHead)
+						mustRun(t, f.gate, "symbolic-ref", "refs/heads/feature/recover", "refs/heads/other")
+					case "delete anchor":
+						mustRun(t, f.gate, "update-ref", "-d", f.anchorRef())
+					case "move anchor":
+						mustRun(t, f.gate, "update-ref", f.anchorRef(), f.submitted)
+					case "symbolic anchor":
+						mustRun(t, f.gate, "update-ref", "refs/no-mistakes/other", f.preserved)
+						mustRun(t, f.gate, "symbolic-ref", f.anchorRef(), "refs/no-mistakes/other")
+					}
+					writerRefs = mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)")
+				}
+				state := f.service.Recover(f.ctx, false)
+				if !called || state.Recovered || state.Changed || state.Safety != "blocked_recover_assumptions_changed" {
+					t.Fatalf("replacement recovery = %#v, writer ran = %v", state, called)
+				}
+				run, err := f.db.GetRun(f.run.ID)
+				if err != nil || run.HeadSHA != f.run.HeadSHA || run.TerminalHeadVerifiedAt != nil || run.CustodyReturnedAt != nil || run.UpdatedAt != f.run.UpdatedAt {
+					t.Fatalf("replacement was stamped: %#v, err %v", run, err)
+				}
+				if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+					t.Fatalf("refusal moved local head to %s", got)
+				}
+				if got := mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"); got != writerRefs {
+					t.Fatalf("refusal changed writer refs: %s != %s", got, writerRefs)
+				}
+			})
+		}
+	}
+}
