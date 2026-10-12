@@ -137,6 +137,14 @@ func (d *DB) GetStepsByRun(runID string) ([]*StepResult, error) {
 }
 
 func (d *DB) ResetStepsFrom(runID string, stepOrder int) error {
+	if stepOrder <= types.StepReview.Order() {
+		if _, err := d.sql.Exec(`UPDATE review_comparisons SET approved=0 WHERE run_id=?`, runID); err != nil {
+			return err
+		}
+		if _, err := d.sql.Exec(`UPDATE runs SET ci_ready_at=NULL,ci_ready_no_ci=0 WHERE id=? AND shipping_options IS NOT NULL`, runID); err != nil {
+			return err
+		}
+	}
 	_, err := d.sql.Exec(`
 		UPDATE step_results
 		SET status = ?, exit_code = NULL, duration_ms = NULL, log_path = NULL,
@@ -364,7 +372,7 @@ func (d *DB) completeStep(id string, status types.StepStatus, exitCode int, dura
 // the run's exact review-approved head. Neither write survives if the other
 // fails, so a failed completion cannot create approval authority and a
 // completed review cannot lack it.
-func (d *DB) CompleteReviewStep(id, runID, approvedHeadSHA string, exitCode int, durationMS int64, logPath string) error {
+func (d *DB) CompleteReviewStep(id, runID, approvedHeadSHA string, exitCode int, durationMS int64, logPath string, generation ...int64) error {
 	tx, err := d.sql.Begin()
 	if err != nil {
 		return fmt.Errorf("begin complete review step: %w", err)
@@ -372,9 +380,25 @@ func (d *DB) CompleteReviewStep(id, runID, approvedHeadSHA string, exitCode int,
 	defer tx.Rollback()
 
 	ts := now()
+	var shipping *string
+	if err := tx.QueryRow(`SELECT shipping_options FROM runs WHERE id=?`, runID).Scan(&shipping); err != nil {
+		return fmt.Errorf("read review run: %w", err)
+	}
+	if shipping != nil {
+		if len(generation) != 1 || generation[0] < 1 {
+			return fmt.Errorf("strict review completion requires captured generation")
+		}
+		result, err := tx.Exec(`UPDATE review_comparisons SET approved=1 WHERE run_id=? AND head_sha=? AND generation=?`, runID, approvedHeadSHA, generation[0])
+		if err != nil {
+			return err
+		}
+		if n, err := result.RowsAffected(); err != nil || n != 1 {
+			return fmt.Errorf("review completion lacks exact comparison")
+		}
+	}
 	result, err := tx.Exec(
-		`UPDATE step_results SET status = ?, exit_code = ?, duration_ms = ?, log_path = ?, completed_at = ?, last_activity_at = ?, last_activity = ?, agent_pid = NULL WHERE id = ?`,
-		types.StepStatusCompleted, exitCode, durationMS, logPath, ts, ts, fmt.Sprintf("status: %s", types.StepStatusCompleted), id,
+		`UPDATE step_results SET status = ?, exit_code = ?, duration_ms = ?, log_path = ?, completed_at = ?, last_activity_at = ?, last_activity = ?, agent_pid = NULL WHERE id = ? AND run_id = ?`,
+		types.StepStatusCompleted, exitCode, durationMS, logPath, ts, ts, fmt.Sprintf("status: %s", types.StepStatusCompleted), id, runID,
 	)
 	if err != nil {
 		return fmt.Errorf("complete review step: %w", err)

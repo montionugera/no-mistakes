@@ -19,10 +19,12 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
+	"github.com/kunchenguid/no-mistakes/internal/shipping"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 const (
+	StateImmutableSource      = "immutable_source"
 	StatePipelineOwned        = "pipeline_owned"
 	StatePushInProgress       = "push_in_progress"
 	StateBehind               = "behind"
@@ -286,6 +288,14 @@ func (s *Service) InspectCached(ctx context.Context) State {
 // no-mistakes ref. It never updates an ordinary remote-tracking ref.
 func (s *Service) Refresh(ctx context.Context) State {
 	state, run, ok := s.inspect(ctx)
+	if run != nil && run.Shipping != nil && run.Shipping.Mode == types.ShippingImmutableSource {
+		head, err := shipping.RemoteHead(ctx, s.workDir(), s.resolvedPushURL(ctx, s.Repo), run.Branch)
+		if err != nil || run.SubmittedHeadSHA == nil || head != *run.SubmittedHeadSHA {
+			return blockedPlan(state, StateTargetChanged, "immutable_source_moved", "immutable published source moved or cannot be observed; no files or refs were changed")
+		}
+		state.Remote = RemoteState{ObservedHead: head, Freshness: "live", ObservedAt: time.Now().Unix()}
+		return state
+	}
 	if !ok || !refreshable(state) {
 		return state
 	}
@@ -405,6 +415,10 @@ func (s *Service) Refresh(ctx context.Context) State {
 }
 
 func (s *Service) gateContextRefusal(ctx context.Context) (State, bool) {
+	state, run, _ := s.inspect(ctx)
+	if run != nil && run.Shipping != nil && run.Shipping.Mode == types.ShippingImmutableSource {
+		return state, true
+	}
 	p := s.Paths
 	if p == nil && strings.TrimSpace(s.GateDir) != "" {
 		p = paths.WithRoot(filepath.Dir(filepath.Dir(filepath.Clean(s.GateDir))))
@@ -1795,6 +1809,13 @@ func (s *Service) inspect(ctx context.Context) (State, *db.Run, bool) {
 		PushedHead: ptr(run.LastPushedSHA), PushedAt: value(run.LastPushedAt), PushGeneration: value(run.PushGeneration),
 	}
 	state.PRState = normalizePRState(run.PRState)
+	if run.Shipping != nil && run.Shipping.Mode == types.ShippingImmutableSource {
+		state.State = StateImmutableSource
+		state.Safety = "immutable_source_inspection_only"
+		state.NextAction = nil
+		state.Target = TargetState{Kind: targetKind(s.Repo), URL: displayTarget(s.Repo.PushURL()), Ref: "refs/heads/" + branch}
+		return state, run, true
+	}
 	state.Target = TargetState{Kind: ptr(run.PushTargetKind), URL: displayTarget(s.Repo.PushURL()), Ref: ptr(run.PushRef)}
 	state.Target.Remote = s.remoteName(ctx)
 	state.Remote = RemoteState{ObservedHead: ptr(run.LastPushedSHA), Freshness: "pipeline_push", ObservedAt: value(run.LastPushedAt)}

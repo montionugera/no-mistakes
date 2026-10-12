@@ -1023,3 +1023,7 @@ Override the [global Azure DevOps draft setting](/no-mistakes/reference/global-c
 |---|---|
 | Type | `bool` |
 | Default | Inherits from global (default `false`) |
+
+## Per-run strict shipping selection
+
+`axi run --shipping-mode full|immutable-source` persists a run policy rather than adding repository configuration. Strict full shipping always sends repairs through the existing Review revalidation path; it cannot weaken validation with skip or override settings. Strict periodic CI polling is at least five minutes. `axi run --draft[=false]` optionally pins that run's GitHub draft choice above the repository/global draft setting. Omit the flag to inherit existing configuration. Both selections survive reattachment and rerun; explicit conflicting reattachment refuses.

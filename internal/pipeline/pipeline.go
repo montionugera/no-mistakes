@@ -175,7 +175,10 @@ type StepOutcome struct {
 	// ReviewApprovedHeadSHA is set only by a successfully executed full review
 	// round. The executor durably records it only when the review step actually
 	// completes, never while that outcome is parked or after a failed round.
-	ReviewApprovedHeadSHA string
+	ReviewApprovedHeadSHA      string
+	ReviewComparisonGeneration int64
+	// MergedHeadSHA is set only after exact CI forge merge verification.
+	MergedHeadSHA string
 
 	// DurationOverrideMS, when positive, replaces the wall-clock duration
 	// reported for this step. Used by demo mode to show realistic durations

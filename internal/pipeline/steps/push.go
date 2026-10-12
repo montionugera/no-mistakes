@@ -14,6 +14,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
+	"github.com/kunchenguid/no-mistakes/internal/shipping"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -23,6 +24,16 @@ type PushStep struct{}
 func (s *PushStep) Name() types.StepName { return types.StepPush }
 
 func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	if sctx.Run.Shipping != nil && sctx.Run.Shipping.Mode == types.ShippingImmutableSource {
+		if err := shipping.CheckImmutable(sctx.Ctx, sctx.Run, sctx.Repo, sctx.WorkDir); err != nil {
+			return nil, err
+		}
+		if err := assertReviewApprovedPushHead(sctx, sctx.Run.HeadSHA); err != nil {
+			return nil, err
+		}
+		sctx.Log("verified already published immutable source; no push performed")
+		return &pipeline.StepOutcome{}, nil
+	}
 	if err := assertPipelineHeadContinuity(sctx, s.Name()); err != nil {
 		return nil, err
 	}
@@ -73,6 +84,27 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	headBeingPushed, err := git.HeadSHA(ctx, sctx.WorkDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve head before push: %w", err)
+	}
+	if sctx.Run.Shipping != nil {
+		approved, err := sctx.DB.GetRun(sctx.Run.ID)
+		if err != nil {
+			return nil, err
+		}
+		if approved.ReviewApprovedHeadSHA == nil || *approved.ReviewApprovedHeadSHA != headBeingPushed {
+			if err := recordAgentFixHead(sctx, s.Name(), headBeingPushed); err != nil {
+				return nil, err
+			}
+			return &pipeline.StepOutcome{RestartFrom: types.StepReview}, nil
+		}
+	}
+	if sctx.Run.Shipping != nil {
+		current, err := shippingTargetCurrent(sctx, headBeingPushed)
+		if err != nil {
+			return nil, err
+		}
+		if !current {
+			return &pipeline.StepOutcome{RestartFrom: types.StepRebase}, nil
+		}
 	}
 	// This run's own review/test/document have already completed by now (see
 	// AllSteps' fixed order), so these are honest statuses to attest for the
@@ -368,7 +400,19 @@ func assertReviewApprovedPushHead(sctx *pipeline.StepContext, proposedHead strin
 		return fmt.Errorf("refusing to push: %s", reason)
 	}
 	if proposedHead == approvedHead {
+		if run.Shipping != nil {
+			current, err := shippingTargetCurrent(sctx, proposedHead)
+			if err != nil {
+				return err
+			}
+			if !current {
+				return fmt.Errorf("review target moved before publication")
+			}
+		}
 		return nil
+	}
+	if run.Shipping != nil {
+		return fmt.Errorf("strict shipping requires the exact review-approved head before publication")
 	}
 	if _, err := stepGitRun(sctx, "merge-base", "--is-ancestor", approvedHead, proposedHead); err != nil {
 		return fmt.Errorf("refusing to push: proposed head %s violates continuity with review-approved head %s (it is not an equal or descendant commit)", shortObjectID(proposedHead), shortObjectID(approvedHead))
@@ -449,4 +493,24 @@ func lastKnownBranchTip(ctx context.Context, sctx *pipeline.StepContext, branch 
 		}
 	}
 	return lastFetchedBranchTip(ctx, sctx.WorkDir, branch, fork)
+}
+
+// shippingTargetCurrent validates the approved comparison at the publication owner.
+func shippingTargetCurrent(sctx *pipeline.StepContext, head string) (bool, error) {
+	c, err := sctx.DB.GetReviewComparison(sctx.Run.ID)
+	if err != nil {
+		return false, err
+	}
+	if c == nil || !c.Approved || c.HeadSHA != head || c.Generation < 1 {
+		return false, fmt.Errorf("strict publication lacks approved comparison generation")
+	}
+	if sctx.Run.Shipping.Mode == types.ShippingFull && c.MergeBaseSHA != c.TargetSHA {
+		return false, nil
+	}
+	targetURL := git.ResolveUpstreamURL(sctx.Ctx, sctx.WorkDir, sctx.Repo.UpstreamURL, sctx.Repo.URLsVerified)
+	target, err := shipping.RemoteHead(sctx.Ctx, sctx.WorkDir, targetURL, c.TargetBranch)
+	if err != nil {
+		return false, err
+	}
+	return target == c.TargetSHA, nil
 }

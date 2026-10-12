@@ -13,6 +13,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/shipping"
 	"github.com/kunchenguid/no-mistakes/internal/testguidance"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -191,6 +192,18 @@ Previous review findings to address:
 		}
 		fixSummary = summary
 	}
+	var reviewGeneration int64
+	if sctx.Run.Shipping != nil {
+		comparison, err := shipping.Capture(ctx, sctx.DB, sctx.Repo, sctx.Run, sctx.WorkDir, effectivePRBaseBranch(sctx))
+		if err != nil {
+			return nil, err
+		}
+		if sctx.Run.Shipping.Mode == types.ShippingFull && comparison.MergeBaseSHA != comparison.TargetSHA {
+			return &pipeline.StepOutcome{RestartFrom: types.StepRebase}, nil
+		}
+		baseSHA = comparison.MergeBaseSHA
+		reviewGeneration = comparison.Generation
+	}
 	reviewTargetSHA := sctx.Run.HeadSHA
 
 	// The changed-file set is read once and viewed two ways on purpose: the
@@ -221,9 +234,10 @@ Previous review findings to address:
 		noChangeFindings.ReviewedPaths = nil
 		findingsJSON, _ := json.Marshal(noChangeFindings)
 		return approvedReviewOutcome(reviewTargetSHA, &pipeline.StepOutcome{
-			Findings:        string(findingsJSON),
-			ReviewablePaths: reviewable,
-			FixSummary:      fixSummary,
+			Findings:                   string(findingsJSON),
+			ReviewablePaths:            reviewable,
+			FixSummary:                 fixSummary,
+			ReviewComparisonGeneration: reviewGeneration,
 		})
 	}
 
@@ -540,13 +554,14 @@ Risk assessment (after listing all findings):
 	findingsJSON, _ := json.Marshal(findings)
 
 	return approvedReviewOutcome(reviewTargetSHA, &pipeline.StepOutcome{
-		NeedsApproval:     needsApproval,
-		AutoFixable:       len(findings.Items) > 0,
-		Findings:          string(findingsJSON),
-		ReviewedPaths:     findings.ReviewedPaths,
-		WithdrawnFindings: withdrawnFindings(findings),
-		ReviewablePaths:   reviewable,
-		FixSummary:        fixSummary,
+		NeedsApproval:              needsApproval,
+		AutoFixable:                len(findings.Items) > 0,
+		Findings:                   string(findingsJSON),
+		ReviewedPaths:              findings.ReviewedPaths,
+		WithdrawnFindings:          withdrawnFindings(findings),
+		ReviewablePaths:            reviewable,
+		FixSummary:                 fixSummary,
+		ReviewComparisonGeneration: reviewGeneration,
 	})
 }
 

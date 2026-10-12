@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +15,99 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+func TestImmutableShippingRerunUsesPublishedSourceWithoutUpdatingGateBranch(t *testing.T) {
+	for _, gateState := range []string{"absent", "stale"} {
+		t.Run(gateState, func(t *testing.T) {
+			p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+				steps := make([]pipeline.Step, 0, len(types.AllSteps()))
+				for _, name := range types.AllSteps() {
+					steps = append(steps, &mockPassStep{name: name})
+				}
+				return steps
+			})
+			repo, baseSHA := setupTestGitRepo(t, p, d, "immutable-rerun-"+gateState)
+			gitCmd(t, repo.WorkingPath, "checkout", "-B", "main")
+
+			published := filepath.Join(t.TempDir(), "published.git")
+			gitCmd(t, "", "init", "--bare", published)
+			gitCmd(t, repo.WorkingPath, "remote", "set-url", "gate", published)
+			gitCmd(t, p.RepoDir(repo.ID), "remote", "set-url", "origin", published)
+			gitCmd(t, repo.WorkingPath, "push", "gate", "main:refs/heads/main")
+			repo, err := d.ReplaceRepoURLs(repo.ID, published, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			gitCmd(t, repo.WorkingPath, "checkout", "-b", "feature")
+			gitCmd(t, repo.WorkingPath, "commit", "--allow-empty", "-m", "immutable source")
+			submitted := gitOutput(t, repo.WorkingPath, "rev-parse", "HEAD")
+			gitCmd(t, repo.WorkingPath, "push", "gate", "HEAD:refs/heads/feature")
+			gitCmd(t, repo.WorkingPath, "checkout", "main")
+			// Keep the selected commit out of the gate so the rerun must fetch
+			// the published object before WorktreeAdd can use it.
+			missingSourceObject := exec.Command("git", "--git-dir", p.RepoDir(repo.ID), "cat-file", "-e", submitted+"^{commit}")
+			if err := missingSourceObject.Run(); err == nil {
+				t.Fatalf("test fixture already has published source object %s in the local gate", submitted)
+			}
+
+			shippingPin := &types.ShippingOptions{Mode: types.ShippingImmutableSource, TargetBranch: "main", Draft: rerunTestBoolPtr(true)}
+			selected, err := d.InsertRunWithShipping(repo.ID, "feature", submitted, baseSHA, nil, "", "", "", "main", false, nil, shippingPin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := d.UpdateRunStatus(selected.ID, types.RunFailed); err != nil {
+				t.Fatal(err)
+			}
+			newer, err := d.InsertRun(repo.ID, "feature", baseSHA, baseSHA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := d.UpdateRunStatus(newer.ID, types.RunFailed); err != nil {
+				t.Fatal(err)
+			}
+			if gateState == "stale" {
+				gitCmd(t, p.RepoDir(repo.ID), "update-ref", "refs/heads/feature", baseSHA)
+			}
+			gateBranchesBefore := gitOutput(t, p.RepoDir(repo.ID), "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads")
+			publishedBranchesBefore := gitOutput(t, published, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads")
+
+			client, err := ipc.Dial(p.Socket())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			var result ipc.RerunResult
+			if err := client.Call(ipc.MethodRerun, &ipc.RerunParams{
+				RepoID: repo.ID, Branch: "feature", PreviousRunID: selected.ID,
+			}, &result); err != nil {
+				t.Fatal(err)
+			}
+			got := waitForRunTerminalStateWithTimeout(t, d, result.RunID, time.Minute)
+			if got.Status != types.RunCompleted || got.SubmittedHeadSHA == nil || *got.SubmittedHeadSHA != submitted {
+				t.Fatalf("rerun = %+v, want completed at immutable source %s", got, submitted)
+			}
+			if got.Shipping == nil || got.Shipping.Mode != types.ShippingImmutableSource || got.Shipping.TargetBranch != "main" || got.Shipping.Draft == nil || !*got.Shipping.Draft {
+				t.Fatalf("rerun lost strict shipping mode, target, or draft: %+v", got.Shipping)
+			}
+			if got.PRBaseBranch == nil || *got.PRBaseBranch != "main" {
+				t.Fatalf("rerun PR base = %#v, want pinned main target", got.PRBaseBranch)
+			}
+			fetchedSourceObject := exec.Command("git", "--git-dir", p.RepoDir(repo.ID), "cat-file", "-e", submitted+"^{commit}")
+			if err := fetchedSourceObject.Run(); err != nil {
+				t.Fatalf("rerun did not fetch published source object %s into the gate: %v", submitted, err)
+			}
+			if gateBranchesAfter := gitOutput(t, p.RepoDir(repo.ID), "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"); gateBranchesAfter != gateBranchesBefore {
+				t.Fatalf("rerun changed gate branches:\nbefore:\n%s\nafter:\n%s", gateBranchesBefore, gateBranchesAfter)
+			}
+			if publishedBranchesAfter := gitOutput(t, published, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"); publishedBranchesAfter != publishedBranchesBefore {
+				t.Fatalf("rerun changed published source branches:\nbefore:\n%s\nafter:\n%s", publishedBranchesBefore, publishedBranchesAfter)
+			}
+		})
+	}
+}
+
+func rerunTestBoolPtr(value bool) *bool { return &value }
 
 func TestRerunChecksCallerHeadAgainstSelectedHead(t *testing.T) {
 	for _, preserved := range []bool{false, true} {

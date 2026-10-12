@@ -30,6 +30,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/reviewqa"
 	"github.com/kunchenguid/no-mistakes/internal/runenv"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
+	"github.com/kunchenguid/no-mistakes/internal/shipping"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 	"github.com/kunchenguid/no-mistakes/internal/verificationplan"
@@ -813,6 +814,7 @@ func assertGateTrustedConfigReadable(ctx context.Context, wtDir, defaultBranch, 
 // A proof-mode push creates an unclaimed row: the first matching observer
 // receives the sole `created` disposition by atomically claiming it.
 func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushReceivedParams) (string, error) {
+	ctx = types.WithShippingOptions(ctx, params.Shipping)
 	// Ref deletion (git push remote :branch) sends new SHA as all-zeros.
 	// Nothing to validate - skip pipeline.
 	if git.IsZeroSHA(params.New) {
@@ -854,6 +856,7 @@ func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushRec
 // HandleStartFreshRun creates or replays a proof-mode launch only after
 // checking the creation context under the repository/branch lock.
 func (m *RunManager) HandleStartFreshRun(ctx context.Context, params *ipc.StartFreshRunParams) (ipc.LaunchReceipt, error) {
+	ctx = types.WithShippingOptions(ctx, params.Shipping)
 	repo, err := m.db.GetRepo(params.RepoID)
 	if err != nil {
 		return ipc.LaunchReceipt{}, fmt.Errorf("get repo: %w", err)
@@ -899,6 +902,9 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 		if existing != nil {
 			if planID != "" && (existing.VerificationPlan == nil || existing.VerificationPlan.ID != planID) {
 				return "", fmt.Errorf("verification plan cannot replace an existing run attachment")
+			}
+			if !existing.Shipping.Matches(types.ShippingFromContext(ctx)) {
+				return "", fmt.Errorf("conflicting launch_nonce: shipping pin differs")
 			}
 			if !existing.PiProfile.Matches(request) {
 				return "", fmt.Errorf("conflicting launch_nonce: Pi profile differs from run pin")
@@ -948,10 +954,26 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 
 		gateHead, err := git.Run(ctx, gateDir, "rev-parse", "refs/heads/"+branch+"^{commit}")
 		if err != nil {
-			return "", fmt.Errorf("resolve gate head: %w", err)
+			if pin := types.ShippingFromContext(ctx); pin == nil || pin.Mode != types.ShippingImmutableSource {
+				return "", fmt.Errorf("resolve gate head: %w", err)
+			}
+			gateHead = ""
 		}
 		if gateHead != headSHA {
-			return "", fmt.Errorf("launch context drift: gate branch %q is at %s, not requested %s", branch, gateHead, headSHA)
+			if pin := types.ShippingFromContext(ctx); pin == nil || pin.Mode != types.ShippingImmutableSource {
+				return "", fmt.Errorf("launch context drift: gate branch %q is at %s, not requested %s", branch, gateHead, headSHA)
+			}
+			sourceURL := git.ResolvePushURL(ctx, gateDir, repo.UpstreamURL, repo.ForkURL, repo.URLsVerified)
+			remote, err := shipping.RemoteHead(ctx, gateDir, sourceURL, branch)
+			if err != nil {
+				return "", fmt.Errorf("observe immutable published source: %w", err)
+			}
+			if remote != headSHA {
+				return "", fmt.Errorf("immutable published source differs from submitted head")
+			}
+			if _, err := git.Run(ctx, gateDir, "fetch", "--no-tags", "--no-write-fetch-head", sourceURL, headSHA); err != nil {
+				return "", fmt.Errorf("fetch immutable source objects: %w", err)
+			}
 		}
 		inheritedPRURL := ""
 		if baseSHA == "" {
@@ -1098,18 +1120,12 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 	}
 
 	gateDir := m.paths.RepoDir(repo.ID)
-	gateHead, err := git.Run(ctx, gateDir, "rev-parse", "refs/heads/"+branch+"^{commit}")
-	if err != nil {
-		return "", fmt.Errorf("resolve gate head: %w", err)
-	}
-
 	runs, err := m.db.GetRunsByRepo(repoID)
 	if err != nil {
 		return "", fmt.Errorf("get runs: %w", err)
 	}
 
 	var latestForBranch *db.Run
-	var matchingHead *db.Run
 	for _, run := range runs {
 		if run.Branch != branch {
 			continue
@@ -1117,20 +1133,9 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 		if latestForBranch == nil {
 			latestForBranch = run
 		}
-		if run.HeadSHA == gateHead {
-			matchingHead = run
-			break
-		}
 	}
 	if latestForBranch == nil {
 		return "", fmt.Errorf("no previous run for branch %s", branch)
-	}
-	headSHA, err := resolveRerunHead(ctx, gateDir, branch, latestForBranch)
-	if err != nil {
-		return "", err
-	}
-	if callerHeadSHA != "" && callerHeadSHA != headSHA {
-		return "", fmt.Errorf("refusing rerun: selected head %s differs from clean local head %s; inspect `no-mistakes axi status` and reconcile custody before using `no-mistakes axi run` to submit the local head", headSHA, callerHeadSHA)
 	}
 	selectedRun := latestForBranch
 	if previousRunID != "" {
@@ -1143,9 +1148,39 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 		}
 	}
 
+	var headSHA, gateHead string
+	var matchingHead *db.Run
+	if selectedRun.Shipping != nil && selectedRun.Shipping.Mode == types.ShippingImmutableSource {
+		headSHA, err = resolveImmutableSourceRerunHead(ctx, gateDir, repo, selectedRun)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		gateHead, err = git.Run(ctx, gateDir, "rev-parse", "refs/heads/"+branch+"^{commit}")
+		if err != nil {
+			return "", fmt.Errorf("resolve gate head: %w", err)
+		}
+		for _, run := range runs {
+			if run.Branch == branch && run.HeadSHA == gateHead {
+				matchingHead = run
+				break
+			}
+		}
+		headSHA, err = resolveRerunHead(ctx, gateDir, branch, latestForBranch)
+		if err != nil {
+			return "", err
+		}
+	}
+	if callerHeadSHA != "" && callerHeadSHA != headSHA {
+		return "", fmt.Errorf("refusing rerun: selected head %s differs from clean local head %s; inspect `no-mistakes axi status` and reconcile custody before using `no-mistakes axi run` to submit the local head", headSHA, callerHeadSHA)
+	}
+
 	baseSHA := latestForBranch.BaseSHA
 	if matchingHead != nil && headSHA == gateHead {
 		baseSHA = matchingHead.BaseSHA
+	}
+	if selectedRun.Shipping != nil && selectedRun.Shipping.Mode == types.ShippingImmutableSource {
+		baseSHA = selectedRun.BaseSHA
 	}
 
 	intentSource := db.RunIntentSourceAgent
@@ -1162,17 +1197,52 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 	}
 
 	storedPRBaseBranch := strings.TrimSpace(prBaseBranch)
-	if storedPRBaseBranch == "" && selectedRun.PRBaseBranch != nil {
+	if selectedRun.Shipping != nil {
+		pinnedTarget := strings.TrimSpace(selectedRun.Shipping.TargetBranch)
+		if pinnedTarget == "" {
+			return "", fmt.Errorf("strict shipping run %s has no pinned PR target", selectedRun.ID)
+		}
+		if storedPRBaseBranch != "" && storedPRBaseBranch != pinnedTarget {
+			return "", fmt.Errorf("refusing rerun: requested PR target %q conflicts with pinned strict shipping target %q", storedPRBaseBranch, pinnedTarget)
+		}
+		storedPRBaseBranch = pinnedTarget
+	} else if storedPRBaseBranch == "" && selectedRun.PRBaseBranch != nil {
 		storedPRBaseBranch = strings.TrimSpace(*selectedRun.PRBaseBranch)
 	}
 	// Publication omission is tighten-only on rerun as everywhere else: the
 	// selected run's decision is inherited and this rerun can only add to it.
 	// The locked start then folds in the operator's live global default, which
 	// likewise can only add omission, never remove it.
+	ctx = types.WithShippingOptions(ctx, selectedRun.Shipping)
 	// Closing references are structured run metadata and survive reruns: an
 	// explicit request is added to, never replaces, what the selected run carried.
 	closingIssues = append(append([]string(nil), selectedRun.ClosingIssueRefs...), closingIssues...)
 	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource, storedPRBaseBranch, selectedRun.OmitIntent || omitIntent, inheritablePRURL(selectedRun), planID, closingIssues, profiles...)
+}
+
+func resolveImmutableSourceRerunHead(ctx context.Context, gateDir string, repo *db.Repo, selected *db.Run) (string, error) {
+	if selected == nil || selected.Shipping == nil || selected.Shipping.Mode != types.ShippingImmutableSource {
+		return "", fmt.Errorf("selected run is not an immutable source run")
+	}
+	if selected.SubmittedHeadSHA == nil || strings.TrimSpace(*selected.SubmittedHeadSHA) == "" || *selected.SubmittedHeadSHA != selected.HeadSHA {
+		return "", fmt.Errorf("refusing immutable rerun: selected run has no exact submitted source head")
+	}
+	branch := strings.TrimPrefix(selected.Branch, "refs/heads/")
+	if branch == "" {
+		return "", fmt.Errorf("refusing immutable rerun: selected source branch is empty")
+	}
+	if repo == nil {
+		return "", fmt.Errorf("refusing immutable rerun: repository is missing")
+	}
+	sourceURL := git.ResolvePushURL(ctx, gateDir, repo.UpstreamURL, repo.ForkURL, repo.URLsVerified)
+	remote, err := shipping.RemoteHead(ctx, gateDir, sourceURL, branch)
+	if err != nil {
+		return "", fmt.Errorf("observe immutable rerun source: %w", err)
+	}
+	if remote != *selected.SubmittedHeadSHA {
+		return "", fmt.Errorf("refusing immutable rerun: published source branch %q is at %s, not selected submitted head %s", branch, remote, *selected.SubmittedHeadSHA)
+	}
+	return *selected.SubmittedHeadSHA, nil
 }
 
 func inheritablePRURL(run *db.Run) string {
@@ -1407,6 +1477,51 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		}
 	}
 
+	shippingPin := types.ShippingFromContext(ctx)
+	if err := shippingPin.Validate(); err != nil {
+		return "", err
+	}
+	if shippingPin != nil {
+		if len(skipSteps) > 0 {
+			return "", fmt.Errorf("strict shipping forbids skipped steps")
+		}
+		target := strings.TrimSpace(prBaseBranch)
+		if target == "" {
+			target = repo.DefaultBranch
+		}
+		if _, err := steps.ValidateRunPRBaseBranchName(target); err != nil {
+			return "", err
+		}
+		copyPin := *shippingPin
+		shippingPin = &copyPin
+		shippingPin.TargetBranch = target
+		shippingPin.TargetSHA = ""
+		if shippingPin.Mode == types.ShippingImmutableSource {
+			repoDir := m.paths.RepoDir(repo.ID)
+			sourceURL := git.ResolvePushURL(ctx, repoDir, repo.UpstreamURL, repo.ForkURL, repo.URLsVerified)
+			remote, err := shipping.RemoteHead(ctx, repoDir, sourceURL, branch)
+			if err != nil {
+				return "", fmt.Errorf("observe immutable published source: %w", err)
+			}
+			if remote != headSHA {
+				return "", fmt.Errorf("immutable published source differs from submitted head")
+			}
+			// WorktreeAdd resolves the immutable SHA from the gate's object DB.
+			// Import it before cancellation so a missing object cannot supersede
+			// a healthy run. This fetch writes no branch or FETCH_HEAD refs.
+			if _, err := git.Run(ctx, repoDir, "cat-file", "-e", headSHA+"^{commit}"); err != nil {
+				if _, err := git.Run(ctx, repoDir, "fetch", "--no-tags", "--no-write-fetch-head", sourceURL, headSHA); err != nil {
+					return "", fmt.Errorf("fetch immutable source objects: %w", err)
+				}
+			}
+			upstreamURL := git.ResolveUpstreamURL(ctx, repoDir, repo.UpstreamURL, repo.URLsVerified)
+			tip, err := shipping.RemoteHead(ctx, repoDir, upstreamURL, target)
+			if err != nil {
+				return "", err
+			}
+			shippingPin.TargetSHA = tip
+		}
+	}
 	// Cancel any active run for this repo+branch.
 	m.cancelActiveRuns(repo.ID, branch)
 
@@ -1433,7 +1548,7 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 	// pr.publish_intent is enforced independently by the PR step.
 	storedOmitIntent := omitIntent || (globalCfg != nil && !globalCfg.Intent.PublishesIntentByDefault())
 
-	run, err := m.db.InsertRunWithIntentAndLaunchNonce(repo.ID, branch, headSHA, baseSHA, runIntent, launchNonce, validationGeneration, intentDigest, storedPRBaseBranch, storedOmitIntent, plan, pin)
+	run, err := m.db.InsertRunWithOptions(repo.ID, branch, headSHA, baseSHA, runIntent, launchNonce, validationGeneration, intentDigest, storedPRBaseBranch, storedOmitIntent, plan, pin, shippingPin)
 	if err != nil {
 		trackStartFailure("create_run")
 		return "", fmt.Errorf("create run: %w", err)
@@ -1953,6 +2068,47 @@ func (m *RunManager) HandleRespond(runID string, step types.StepName, action typ
 // declines, user instructions, and user-authored findings to the executor, and
 // returns the dispositions the response recorded.
 func (m *RunManager) HandleRespondWithOverrides(runID string, step types.StepName, action types.ApprovalAction, findingIDs, ignoreFindingIDs []string, instructions map[string]string, addedFindings []types.Finding, approvalReason string) (pipeline.RespondDispositions, error) {
+	run, err := m.db.GetRun(runID)
+	if err != nil {
+		return pipeline.RespondDispositions{}, err
+	}
+	if run != nil && run.Shipping != nil {
+		if action == types.ActionSkip {
+			return pipeline.RespondDispositions{}, fmt.Errorf("strict shipping forbids skipped steps")
+		}
+		if action == types.ActionFix && run.Shipping.Mode == types.ShippingImmutableSource {
+			return pipeline.RespondDispositions{}, fmt.Errorf("immutable source forbids repairs")
+		}
+		if action == types.ActionApprove {
+			if step == types.StepReview {
+				return pipeline.RespondDispositions{}, fmt.Errorf("strict Review requires a complete independent review; fix or rerun the review")
+			}
+			if approvalReason != "" {
+				return pipeline.RespondDispositions{}, fmt.Errorf("strict shipping forbids Test exceptions")
+			}
+			rows, err := m.db.GetStepsByRun(runID)
+			if err != nil {
+				return pipeline.RespondDispositions{}, err
+			}
+			for _, row := range rows {
+				if row.StepName != step {
+					continue
+				}
+				if row.ExitCode != nil && *row.ExitCode != 0 {
+					return pipeline.RespondDispositions{}, fmt.Errorf("strict shipping forbids passing command overrides")
+				}
+				if row.OverrideReason != nil {
+					return pipeline.RespondDispositions{}, fmt.Errorf("strict shipping forbids recorded overrides")
+				}
+				if row.FindingsJSON != nil {
+					f, err := types.ParseFindingsJSON(*row.FindingsJSON)
+					if err != nil || types.HasActionableFindings(f) {
+						return pipeline.RespondDispositions{}, fmt.Errorf("strict shipping cannot approve unresolved actionable findings")
+					}
+				}
+			}
+		}
+	}
 	m.mu.Lock()
 	exec, ok := m.executors[runID]
 	m.mu.Unlock()
