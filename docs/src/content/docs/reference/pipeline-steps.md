@@ -419,6 +419,4 @@ Step logs also record native subprocess start, exit, and retry lifecycle lines p
 
 ## Explicit strict shipping policy
 
-Strict Test admission accepts an explicit operator acknowledgment of a genuine `no-surface` result, with or without a reason, as [normal completion](/no-mistakes/reference/cli/#strict-shipping-and-review-receipts). The original verdict and all reasoned untested scenarios remain recorded alongside authorization through recovery and receipt export; this does not waive failures, malformed claims, budget cuts, or other actionable findings.
-
 The [strict shipping CLI contract](/no-mistakes/reference/cli/#strict-shipping-and-review-receipts) owns admission flags, periodic polling, immutable-source custody, and receipt phases. [Review](#review), [Push](#push), [PR](#pr), and [CI](#ci) above own their exact-comparison checks and restart behavior. Immutable-source execution boundaries verify the submitted head and clean worktree before and after each step. CI remains active after `checks-passed` until native terminal custody settles.

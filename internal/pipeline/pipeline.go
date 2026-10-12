@@ -234,9 +234,9 @@ type ApprovalGateResumer interface {
 // failing checks, and the Test step's persisted failing commands.test result).
 // The executor calls it once, synchronously, when a human answers
 // ActionApprove - never for Skip, Abort, or Fix, which do not claim the step
-// passed. A human's approval always proceeds (this never blocks a deliberate
-// operator decision), but when the verifier returns a reason the executor
-// records the completion as an explicit override (StepResult.OverrideReason,
+// passed. For ordinary runs, an admitted approval proceeds, but when the
+// verifier returns a reason the executor records the completion as an
+// explicit override (StepResult.OverrideReason,
 // via db.SetStepOverrideReason) instead of making it indistinguishable from a
 // genuinely green completion. CI re-checks its live condition; Test reads the
 // command result persisted when its gate parked rather than re-running it.
@@ -247,9 +247,9 @@ type ApprovalGateResumer interface {
 // from "still unresolved" (e.g.
 // the provider could not be reached); implementations should fail closed by
 // treating err as if it were an unresolved condition described by err, and
-// callers do the same rather than silently completing on error, but the
-// approval itself still proceeds either way - this interface only decides
-// how the completion is recorded, never whether it happens.
+// callers do the same rather than silently completing on error. Ordinary
+// runs record an override; strict shipping refuses any unresolved condition.
+// Strict approval admission is owned by db.StepResult.StrictApprovalRefusal.
 type ApprovalOverrideVerifier interface {
 	VerifyApprovalOverride(sctx *StepContext) (unresolved string, err error)
 }

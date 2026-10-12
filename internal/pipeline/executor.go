@@ -1776,12 +1776,11 @@ done:
 // override (db.SetStepOverrideReason) instead of a silent plain pass. CI
 // re-checks its live condition; Test inspects the configured-command result
 // persisted when its gate parked. See ApprovalOverrideVerifier's doc for the
-// full contract. It never blocks or changes the approval itself: a human's
-// ActionApprove always proceeds, and a step that does not implement the
-// interface (today: every step but CI and Test) is completely unaffected. A
-// verification error fails closed - it is recorded as an unresolved condition,
-// not silently treated as clear - but still never stops
-// the approval, only what it gets recorded as.
+// full contract. For ordinary runs, an admitted ActionApprove proceeds and a
+// verification error is recorded as an unresolved condition rather than
+// silently treated as clear. Strict shipping refuses an unresolved condition.
+// A step without the interface needs no override verification; strict admission
+// still applies through db.StepResult.StrictApprovalRefusal.
 //
 // Persisting that override marker is itself fail-closed: downstream consumers
 // derive each step's override status from its durable override/approval reasons,

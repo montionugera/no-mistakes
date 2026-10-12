@@ -816,9 +816,9 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					// never waived.
 					lastMonitorLog = logCIMonitorStatus(sctx, ciWaitingMessage(checks), lastMonitorLog)
 				case len(checks) == 0 && (sctx.Config == nil || !sctx.Config.NoCI || sctx.Run.Shipping != nil):
-					// Empty forge results are ready ONLY with positive durable
-					// evidence from trusted default-branch config (no_ci: true).
-					// Without that declaration, keep waiting - delayed registration
+					// Only ordinary runs may use trusted no_ci: true as evidence
+					// for empty forge results. Strict shipping requires checks.
+					// Otherwise keep waiting - delayed registration
 					// is common and must never look green. Elapsed time is not
 					// evidence; there is no grace-period promotion path.
 					clearCIMonitorReady(sctx)

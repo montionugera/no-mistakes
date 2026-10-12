@@ -134,7 +134,7 @@ Exhausting the bound fails the step with `validate review analyzer findings afte
 
 - Both `ActionApprove` sites in `internal/pipeline/executor.go` (live wait and `Resume`) route through `Executor.applyApprovalOverride` before completing the step.
 `ApprovalOverrideVerifier` supplies the unresolved condition: CI re-checks live checks; Test reads its persisted configured-command failure.
-A verification error records an unresolved condition, not a clean pass; approval proceeds unless the durable evidence write itself fails.
+A verification error records an unresolved condition, not a clean pass; for ordinary runs, approval proceeds unless the durable evidence write itself fails. Strict shipping refuses unresolved override conditions, and its shared admission owner is `db.StepResult.StrictApprovalRefusal`.
 Test approval's operator explanation is separate local evidence in `step_results.approval_reason` (NULL = no recorded approval, empty = approval without a reason); `db.StepResult.TestOverrideReason` owns its snapshot/event qualification: only a failing configured command, a `no-go`/`inconclusive` verdict, or a Test-agent invocation-budget cut qualifies, so a `no-surface` acknowledgement completes normally.
 CI overrides and explicit Test exceptions produce `passed-with-override` through `outcomeForRun`.
 Do not reuse the configured-command `override_reason` for all Test approvals: that would expand PR enforcement to evidence-only exceptions and change approval policy.
