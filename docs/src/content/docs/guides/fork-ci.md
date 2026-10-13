@@ -40,8 +40,9 @@ persisting checkout credentials.
 
 The runner needs Git, Make, Python 3 (for the `Require no-mistakes` action), a C compiler with libc development headers (for
 the race detector), the `sqlite3` CLI used by the Pi-profile journeys, and
-multi-user Nix (for the `Nix flake` workflow, which reads it from
-`/nix/var/nix/profiles/default/bin`). Administrators install these dependencies; the runner account does not gain
+multi-user Nix with an active `nix-daemon` usable by `nm-ci`. The `Nix flake`
+workflow adds `/nix/var/nix/profiles/default/bin` to `GITHUB_PATH` by default.
+Administrators install these dependencies; the runner account does not gain
 sudo access. The default end-to-end package deadline is 40 minutes inside
 the 45-minute job bound. Each run retains the temporary-daemon inventory and
 cleanup trap.
