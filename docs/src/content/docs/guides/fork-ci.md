@@ -1,14 +1,14 @@
 ---
-title: Fork CI on king-server
-description: Self-hosted-only workflow execution on king-server and the required execution policy.
+title: Fork CI on a self-hosted runner
+description: Self-hosted-only workflow execution and the required execution policy.
 ---
 
-The `vifar/no-mistakes` fork runs every job of every workflow (`CI`, `docs`,
-`Guard generated files`, `Nix flake`, and `Require no-mistakes`) on `king-server`
-through the existing `ci-pilot` Linux virtual machine. Nothing runs on a
-GitHub-hosted runner. The repository-scoped runner `no-mistakes-king-server-1`
-uses the labels `self-hosted`, `Linux`, `X64`, `king-server`, and
-`no-mistakes`, and every job requires every label. There is no hosted fallback
+This fork runs every job of every workflow (`CI`, `docs`,
+`Guard generated files`, `Nix flake`, and `Require no-mistakes`) on a single
+repository-scoped self-hosted Linux runner, hosted in a dedicated virtual
+machine. Nothing runs on a GitHub-hosted runner. Every job requires the
+runner's full label set (`self-hosted`, `Linux`, `X64`, plus the fork's
+dedicated runner labels pinned in `workflow_self_hosted_test.go`). There is no hosted fallback
 when this runner is offline; jobs queue until it returns. It is a single
 runner, so jobs from all workflows run one at a time.
 
@@ -17,8 +17,8 @@ Every job also carries the same-repository guard
 so code from an external fork pull request never reaches the runner. The
 release and channel-publishing workflows were removed from this fork; it
 does not publish CLI releases or update channels from Actions. The docs workflow
-still deploys GitHub Pages from `main`. `TestEveryWorkflowJobRunsOnTheKingServer`
-walks every workflow file and rejects incorrect runner labels, missing job
+still deploys GitHub Pages from `main`. The self-hosted workflow test
+(`workflow_self_hosted_test.go`) walks every workflow file and rejects incorrect runner labels, missing job
 timeouts, unsafe fork admission, or persisted checkout credentials.
 
 External fork PRs skip the required check in this solo-use repository; approving
@@ -40,7 +40,7 @@ persisting checkout credentials.
 
 The runner needs Git, Make, Python 3 (for the `Require no-mistakes` action), a C compiler with libc development headers (for
 the race detector), the `sqlite3` CLI used by the Pi-profile journeys, and
-multi-user Nix with an active `nix-daemon` usable by `nm-ci`. The `Nix flake`
+multi-user Nix with an active `nix-daemon` usable by the runner account. The `Nix flake`
 workflow adds `/nix/var/nix/profiles/default/bin` to `GITHUB_PATH` by default.
 Administrators install these dependencies; the runner account does not gain
 sudo access. The default end-to-end package deadline is 40 minutes inside
@@ -51,7 +51,7 @@ cleanup trap.
 
 This public fork must enforce `.github/ci-actor-policy.json` as an **active,
 repository-wide** GitHub Actions policy before any persistent local runner
-is registered. It allows only `vifar` and the existing official
+is registered. It allows only the repository owner and the existing official
 `github-actions[bot]`, `dependabot[bot]`, and `release-please[bot]` identities.
 There is no workflow-path restriction: the policy applies to every workflow.
 
@@ -71,14 +71,14 @@ See [GitHub's workflow execution controls](https://docs.github.com/en/actions/ho
 
 ## Runner ownership and recovery
 
-The runner runs as `nm-ci`, with a private home directory at `/home/nm-ci` and
-its own workspace under `/home/nm-ci/actions-runner`. This account has neither
-sudo access nor Docker-group membership. Its service is
-`actions.runner.vifar-no-mistakes.no-mistakes-king-server-1.service`.
-Existing Controller runners keep their separate registrations and services.
+The runner runs as a dedicated unprivileged account with a private home
+directory and its own `actions-runner` workspace. This account has neither
+sudo access nor Docker-group membership, and runs the runner as its own
+system service. Other runners on the same virtual machine keep their separate
+accounts, registrations, and services.
 
 If CI queues, inspect this runner's status on the repository Actions runners
-page and the dedicated service in `ci-pilot`. Recheck the policy before
+page and its service on the runner's virtual machine. Recheck the policy before
 starting or re-registering it. Use GitHub's official runner distribution,
 verify its published SHA-256 digest, and pass a temporary registration token
 through a protected channel. Never save that bootstrap token in this repo.
@@ -86,10 +86,10 @@ Runner credentials remain restricted to the runner account.
 
 The `docs`, `Guard generated files`, `Nix flake`, and `Require no-mistakes`
 workflows run on the same runner. `actions/setup-node` downloads its own Node.
-The Nix job does not install Nix: an administrator installs multi-user Nix in
-`ci-pilot` once (for example with the Determinate installer and `sudo`), and the
+The Nix job does not install Nix: an administrator installs multi-user Nix on
+the runner's virtual machine once (for example with the Determinate installer and `sudo`), and the
 job fails with an actionable error if it is missing. None of these workflows change
-publication destinations or install the CLI on the owner’s Mac.
+publication destinations or install the CLI on a developer machine.
 
 ## Self-update destination
 
@@ -97,7 +97,3 @@ The [update command reference](/no-mistakes/reference/cli/#no-mistakes-update)
 owns the fork destination, manifest requirements, and refusal behavior. The fork
 must publish its own channel manifest and release assets before release updates
 can succeed.
-
-A dedicated `controller-shipping-<full-source-sha>` build follows that reference's
-development-build policy. This source change does not publish a release or
-install a CLI.
