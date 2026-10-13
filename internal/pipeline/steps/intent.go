@@ -178,7 +178,7 @@ func defaultRunIntent(ctx context.Context, sctx *pipeline.StepContext) (*intent.
 		gitWorkDir = repo.WorkingPath
 	}
 
-	resolvedBaseSHA := resolveIntentBaseSHA(ctx, gitWorkDir, run.BaseSHA, repo.DefaultBranch)
+	resolvedBaseSHA := resolveIntentBaseSHA(ctx, gitWorkDir, run.BaseSHA, repo.DefaultBranch, cfg.TrustedConfigSHA)
 	diffFiles, err := diffFilesForIntentMatching(ctx, gitWorkDir, resolvedBaseSHA, run.HeadSHA)
 	if err != nil {
 		return nil, err
@@ -255,14 +255,23 @@ func splitDiffNameOnly(out string) []string {
 // Prefers an explicit run.BaseSHA when reachable in the worktree, but falls
 // back to merge-base against the default branch when the SHA is the zero ref
 // (new branch push) or has been orphaned by a force push that rewrote the
-// prior remote tip away. Final fallback is git's empty-tree SHA so the diff
+// prior remote tip away, then to the run's pinned trusted default-branch commit.
+// Final fallback is git's empty-tree SHA so the diff
 // always succeeds.
-func resolveIntentBaseSHA(ctx context.Context, workDir, baseSHA, defaultBranch string) string {
+func resolveIntentBaseSHA(ctx context.Context, workDir, baseSHA, defaultBranch, trustedSHA string) string {
 	if !git.IsZeroSHA(baseSHA) && commitReachable(ctx, workDir, baseSHA) {
 		return baseSHA
 	}
 	if mb := mergeBaseWithDefaultBranch(ctx, workDir, defaultBranch); mb != "" {
 		return mb
+	}
+	// Intent runs before the rebase step populates origin/<default>, and the
+	// run no longer leaves a shared tracking ref behind. The trusted
+	// default-branch commit the run already pinned is the same anchor.
+	if trustedSHA != "" && commitReachable(ctx, workDir, trustedSHA) {
+		if mb, err := git.Run(ctx, workDir, "merge-base", "HEAD", trustedSHA); err == nil && strings.TrimSpace(mb) != "" {
+			return strings.TrimSpace(mb)
+		}
 	}
 	return git.EmptyTreeSHA
 }

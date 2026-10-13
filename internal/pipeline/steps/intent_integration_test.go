@@ -419,3 +419,34 @@ func TestIntentStep_Integration_RespectsTimeout(t *testing.T) {
 		t.Fatal("IntentStep.Execute did not return within budget")
 	}
 }
+
+// A gate imports the trusted default commit under a private ref before Intent,
+// while origin/main is first populated by the later Rebase step.
+func TestDefaultRunIntent_NewGateUsesTrustedDefaultCommit(t *testing.T) {
+	repoDir, fakeHome, base, head := initIntentRepo(t)
+	withFakeHome(t, fakeHome)
+	// Include an unrelated default-branch file. Diffing the empty tree would
+	// wrongly make this a multi-file change with only one transcript overlap.
+	gitCmd(t, repoDir, "checkout", "--detach", base)
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("base documentation"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repoDir, "add", "README.md")
+	gitCmd(t, repoDir, "commit", "-m", "default docs")
+	trusted := gitCmd(t, repoDir, "rev-parse", "HEAD")
+	gitCmd(t, repoDir, "cherry-pick", head)
+	head = gitCmd(t, repoDir, "rev-parse", "HEAD")
+	gitCmd(t, repoDir, "update-ref", "refs/no-mistakes/trusted/default", trusted)
+	// Remove branch names: the private trusted ref and HEAD are all a new
+	// gate has before rebase fetches remote-tracking refs.
+	branches := gitCmd(t, repoDir, "for-each-ref", "--format=%(refname)", "refs/heads/")
+	for _, ref := range strings.Fields(branches) {
+		gitCmd(t, repoDir, "update-ref", "-d", ref)
+	}
+	cfg := &config.Config{Intent: config.Intent{Enabled: true, Threshold: 0.1, SlackDays: 3}, TrustedConfigSHA: trusted}
+	sctx := newIntentIntegrationContext(t, repoDir, "0000000000000000000000000000000000000000", head, cfg)
+	outcome, err := (&IntentStep{}).Execute(sctx)
+	if err != nil || outcome == nil || outcome.Skipped || sctx.Run.Intent == nil {
+		t.Fatalf("new gate intent: outcome=%+v err=%v intent=%v", outcome, err, sctx.Run.Intent)
+	}
+}
