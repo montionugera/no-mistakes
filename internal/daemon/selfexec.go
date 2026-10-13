@@ -17,8 +17,9 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 )
 
-var daemonHealthCheck = daemonIsRunningViaIPC
+var daemonHealthCheck func(*paths.Paths, ...time.Duration) (bool, error) = daemonIsRunningViaIPC
 var daemonDial = ipc.Dial
+var daemonHealthDial = ipc.DialWithDeadline
 var daemonStart = Start
 var daemonProcessRunning = processRunning
 var daemonProcessStartTime = processStartTime
@@ -53,6 +54,10 @@ func daemonStopTimeout() time.Duration {
 
 func daemonStartPollInterval() time.Duration {
 	return durationFromEnv("NM_TEST_DAEMON_START_POLL_INTERVAL", 100*time.Millisecond)
+}
+
+func daemonHealthReplyTimeout() time.Duration {
+	return durationFromEnv("NM_TEST_DAEMON_HEALTH_REPLY_TIMEOUT", 5*time.Second)
 }
 
 func durationFromEnv(name string, fallback time.Duration) time.Duration {
@@ -399,7 +404,8 @@ func waitForDaemonStartWithProcess(p *paths.Paths, proc *os.Process, exitCh <-ch
 	var lastHealthErr error
 
 	for time.Now().Before(deadline) {
-		if alive, err := daemonHealthCheck(p); alive {
+		remaining := time.Until(deadline)
+		if alive, err := daemonHealthCheck(p, remaining); alive {
 			slog.Info("daemon ready", "pid", pid)
 			return nil
 		} else if err != nil {
@@ -440,7 +446,12 @@ func waitForDaemonStartWithProcess(p *paths.Paths, proc *os.Process, exitCh <-ch
 				nextManagedProbe = time.Now().Add(250 * time.Millisecond)
 			}
 		}
-		time.Sleep(pollInterval)
+		if remaining := time.Until(deadline); pollInterval > remaining {
+			pollInterval = remaining
+		}
+		if pollInterval > 0 {
+			time.Sleep(pollInterval)
+		}
 	}
 
 	timeoutErr := fmt.Errorf("daemon launched but did not become ready within %v", timeout)
@@ -531,8 +542,15 @@ func IsRunning(p *paths.Paths) (bool, error) {
 	return daemonHealthCheck(p)
 }
 
-func daemonIsRunningViaIPC(p *paths.Paths) (bool, error) {
-	client, err := ipc.Dial(p.Socket())
+func daemonIsRunningViaIPC(p *paths.Paths, budget ...time.Duration) (bool, error) {
+	deadline := time.Time{}
+	if len(budget) > 0 {
+		if budget[0] <= 0 {
+			return false, fmt.Errorf("daemon health check deadline exceeded")
+		}
+		deadline = time.Now().Add(budget[0])
+	}
+	client, err := daemonHealthDial(p.Socket(), deadline)
 	if err != nil {
 		_, statErr := os.Stat(p.Socket())
 		if os.IsNotExist(statErr) {
@@ -552,7 +570,17 @@ func daemonIsRunningViaIPC(p *paths.Paths) (bool, error) {
 	defer client.Close()
 
 	var result ipc.HealthResult
-	if err := client.CallWithTimeout(ipc.MethodHealth, &ipc.HealthParams{}, &result, ipc.DefaultDialTimeout); err != nil {
+	timeout := daemonHealthReplyTimeout()
+	if !deadline.IsZero() {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false, fmt.Errorf("daemon health check deadline exceeded")
+		}
+		if timeout > remaining {
+			timeout = remaining
+		}
+	}
+	if err := client.CallWithTimeout(ipc.MethodHealth, &ipc.HealthParams{}, &result, timeout); err != nil {
 		return false, err
 	}
 	return result.Status == "ok", nil
