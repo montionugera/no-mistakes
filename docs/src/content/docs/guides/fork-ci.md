@@ -39,7 +39,9 @@ Every CI job checks out the exact PR head (or event SHA outside a PR) without
 persisting checkout credentials.
 
 The runner needs Git, Make, Python 3 (for the `Require no-mistakes` action), a C compiler with libc development headers (for
-the race detector), and the `sqlite3` CLI used by the Pi-profile journeys.
+the race detector), the `sqlite3` CLI used by the Pi-profile journeys, and
+multi-user Nix with an active `nix-daemon` usable by `nm-ci`. The `Nix flake`
+workflow adds `/nix/var/nix/profiles/default/bin` to `GITHUB_PATH` by default.
 Administrators install these dependencies; the runner account does not gain
 sudo access. The default end-to-end package deadline is 40 minutes inside
 the 45-minute job bound. Each run retains the temporary-daemon inventory and
@@ -84,8 +86,9 @@ Runner credentials remain restricted to the runner account.
 
 The `docs`, `Guard generated files`, `Nix flake`, and `Require no-mistakes`
 workflows run on the same runner. `actions/setup-node` downloads its own Node.
-The Nix job installs Nix on the runner through the Determinate installer on its
-first run, so that run modifies `ci-pilot`. None of these workflows change
+The Nix job does not install Nix: an administrator installs multi-user Nix in
+`ci-pilot` once (for example with the Determinate installer and `sudo`), and the
+job fails with an actionable error if it is missing. None of these workflows change
 publication destinations or install the CLI on the owner’s Mac.
 
 ## Self-update destination
