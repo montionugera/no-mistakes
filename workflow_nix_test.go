@@ -26,10 +26,17 @@ func TestNixWorkflowBuildsAndChecksTheFlake(t *testing.T) {
 	if !slices.Equal(wfList(job.RunsOn), kingServerRunner) {
 		t.Errorf("nix job runs-on = %v, want the self-hosted king-server runner", job.RunsOn)
 	}
-	if !slices.ContainsFunc(job.Steps, func(step wfStep) bool {
+	// The runner account has no sudo, so an installer step can never succeed;
+	// the job must use the administrator-preinstalled multi-user Nix.
+	if slices.ContainsFunc(job.Steps, func(step wfStep) bool {
 		return strings.HasPrefix(step.Uses, "DeterminateSystems/nix-installer-action@")
 	}) {
-		t.Fatal("nix job must install Nix")
+		t.Error("nix job must not run the Nix installer: the runner account has no sudo")
+	}
+	if !slices.ContainsFunc(job.Steps, func(step wfStep) bool {
+		return strings.Contains(step.Run, "/nix/var/nix/profiles/default/bin") && strings.Contains(step.Run, "GITHUB_PATH")
+	}) {
+		t.Fatal("nix job must put the preinstalled multi-user Nix on PATH")
 	}
 	var commands []string
 	for _, command := range workflowCommandsMatching(job.Steps, func(wfStep) bool { return true }) {

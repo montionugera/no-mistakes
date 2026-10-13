@@ -40,7 +40,18 @@ jobs:
           # refuses a shallow clone ("'revCount' is not available").
           fetch-depth: 0
 
-      - uses: DeterminateSystems/nix-installer-action@v23
+      # The runner account has no sudo, so CI cannot install Nix. An
+      # administrator preinstalls multi-user Nix in ci-pilot (see
+      # docs/src/content/docs/guides/fork-ci.md); the job uses its daemon.
+      - name: Use the runner's preinstalled Nix
+        run: |
+          nix_bin=/nix/var/nix/profiles/default/bin
+          if [ ! -x "$nix_bin/nix" ]; then
+            echo "::error::multi-user Nix is not installed on this runner; an administrator must preinstall it (see guides/fork-ci)"
+            exit 1
+          fi
+          echo "$nix_bin" >> "$GITHUB_PATH"
+          "$nix_bin/nix" --version
 
       - name: Evaluate every advertised system
         run: nix flake check --all-systems --no-build
