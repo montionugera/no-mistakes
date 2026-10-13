@@ -255,8 +255,8 @@ func splitDiffNameOnly(out string) []string {
 // Prefers an explicit run.BaseSHA when reachable in the worktree, but falls
 // back to merge-base against the default branch when the SHA is the zero ref
 // (new branch push) or has been orphaned by a force push that rewrote the
-// prior remote tip away, then to the run's pinned trusted default-branch commit.
-// Final fallback is git's empty-tree SHA so the diff
+// prior remote tip away, then to the merge-base with the run's pinned trusted
+// default-branch commit. Final fallback is git's empty-tree SHA so the diff
 // always succeeds.
 func resolveIntentBaseSHA(ctx context.Context, workDir, baseSHA, defaultBranch, trustedSHA string) string {
 	if !git.IsZeroSHA(baseSHA) && commitReachable(ctx, workDir, baseSHA) {

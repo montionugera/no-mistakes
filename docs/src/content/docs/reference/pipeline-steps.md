@@ -54,6 +54,7 @@ This is best-effort context, and when available it is included in rebase fixes, 
 
 - Treats newly supplied explicit intent (`agent`) and exact inherited rerun intent (`rerun`) as authoritative acceptance criteria, while preserving their distinct sources, and skips transcript-based inference even when `intent.enabled` is false
 - Runs transcript-based inference only when `intent.enabled` is true
+- Computes changed files from the run's base commit when that commit is available. Otherwise, it tries the merge-base with the default branch, then the merge-base with the run's pinned trusted default-branch commit, and uses the empty tree only if neither merge-base can be resolved. This keeps transcript matching scoped to the change before Rebase has populated remote-tracking refs.
 - Matches local agent transcripts against non-deleted changed files when present, falling back to all changed files for all-deletion diffs, may use the configured pipeline agent to disambiguate plausible matches, and summarizes the likely author intent with that agent
 - Stores the derived summary, source, session ID, and match score on the run
 - Logs accepted candidate diagnostics, including source, session, CWD, score, confidence, overlap, decision, and acceptance reason
