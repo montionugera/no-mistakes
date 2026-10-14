@@ -577,9 +577,8 @@ How long the CI step monitors an open PR, including provider CI status and PR me
 Accepts any Go `time.ParseDuration` string: `30m`, `2h`, `4h30m`, etc.
 
 This is an idle timeout, not an absolute deadline: every time the base branch advances, the monitor re-arms it.
-So an actively-updated green PR keeps its monitor no matter how long it stays open.
-If it later develops an actual merge conflict (on GitHub, GitLab, Forgejo, Azure DevOps, or a provider plugin declaring `mergeable_state`), the CI auto-fix path rebases it, revalidates from Review because rebasing cannot prove continuity with the reviewed head, and publishes it through Push, while a clean behind PR needs no command.
-A genuinely idle/abandoned PR still parks at an approval gate after the timeout elapses.
+For ordinary runs, when the live target commit advances with green checks and no merge conflict, CI clears readiness and keeps monitoring, withholding checks-passed. It may wait until ci_timeout, or indefinitely when unlimited. When CI returns, including with findings, the boundary guard rejects the changed comparison and terminates the run. The monitor does not automatically repair or revalidate that changed comparison. After termination, restart from the current target and head; never hand-rebase. See the [restart and custody conditions](/no-mistakes/reference/cli/#no-mistakes-rerun).
+With an unchanged comparison, a genuinely idle/abandoned PR still parks at an approval gate after the timeout elapses.
 While that CI gate is parked, the daemon continues bounded read-only PR-state checks.
 If the PR is merged or closed externally, an eligible stale gate returns to CI execution under the [CI completion rules](/no-mistakes/reference/pipeline-steps/#ci); the observation alone does not complete the run. An open, unknown, or temporarily unreachable PR remains parked for a user decision.
 
@@ -1027,7 +1026,7 @@ Changes apply to the next run, and to a run recovered after a daemon restart, wh
 
 ### commit.fix_message
 
-Template for the subject of commits created by the Review, Test, Document, Lint, and CI repair paths, plus operator-authorized repository gate repairs.
+Template for the subject of commits created by the Review, Test, Document, Lint, and CI repair paths, plus repository gate repairs.
 
 | | |
 | --- | --- |
@@ -1125,7 +1124,7 @@ Entries are limited to 1,024 bytes and 16 placeholders, the list to 16 entries, 
 The 1,024-byte limit also applies to the rendered line, checked when configuration loads with every placeholder at its 64-byte maximum, so an entry that loads cannot overflow at commit time.
 An invalid entry fails configuration loading, and a render failure at commit time leaves the changes unstaged.
 
-Trailers are added to Review, Test, Document, and Lint fix commits, operator-authorized repository gate repairs, and CI repair commits. Commits that no single invocation produced get none rather than a guessed agent: the Push step's catch-all commit, a CI repair retried after a protected-path refusal, and rebase or merge commits that an agent writes itself.
+Trailers are added to Review, Test, Document, and Lint fix commits, repository gate repairs, and CI repair commits. Commits that no single invocation produced get none rather than a guessed agent: the Push step's catch-all commit, a CI repair retried after a protected-path refusal, and rebase or merge commits that an agent writes itself.
 A per-repo [`commit.trailers`](/no-mistakes/reference/repo-config/#committrailers) list or a matching [`repository_overrides`](#repository_overrides) entry replaces this list rather than extending it; an empty list clears it.
 
 ### repository_overrides

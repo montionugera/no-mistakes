@@ -554,13 +554,13 @@ This uses the existing pipeline finding shape. Each finding needs a non-empty `i
 |---|---|---|
 | 0 | Empty | Pass, unchanged |
 | Non-zero | Empty | Park with the existing exit-code error finding and command output |
-| 0 | Valid report | Any `error` parks the gate; warnings and info attach without failing the command verdict |
-| Non-zero | Valid report | Park with the reported findings and command output |
+| 0 | Valid report | Any `error` fails the gate; warnings and info attach without failing the command verdict. Apply the repair and approval policy below |
+| Non-zero | Valid report | Fail with the reported findings and command output. Apply the repair and approval policy below |
 | Any | Invalid or over-cap report | Park with one `error` finding explaining the problem, action `ask-user` |
 
 A report is limited to 1 MiB and 500 findings. The final encoded findings payload, including the command and log summary, must fit the portion of half the existing 1 MiB IPC frame left after the run's persisted findings and the refusal space reserved for every configured gate. The other half remains available for the envelope and other run state. JSON escaping can make the effective file cap lower than 1 MiB. A payload that cannot fit parks with one `error` finding naming its encoded size and the remaining transport budget, action `ask-user`; findings are never truncated to make a report fit. This fixed-size transport refusal omits the command summary, whose complete output remains in the gate's step log. Malformed JSON, a missing `findings` array, missing required fields, duplicate or unusable IDs, invalid severities or actions, unknown fields, and an unreadable or non-regular file also fail closed. An empty array is a valid report; an empty file opts out. The temporary directory is removed after the command is checked.
 
-Findings remain available in `axi status`, `axi logs`, and the TUI, and their IDs can be selected with `axi respond --action fix --findings <ids>`. Executor approval policy is unchanged: a zero-exit report containing only warnings or info still goes through the same approval rules as other steps. Warnings park, and an omitted action defaults to `ask-user`. A gate never starts an automatic repair, even when a reported finding says `auto-fix`.
+Findings remain available in `axi status`, `axi logs`, and the TUI, and their IDs can be selected with `axi respond --action fix --findings <ids>`. Executor approval policy is unchanged: a zero-exit report containing only warnings or info still goes through the same approval rules as other steps. An omitted action defaults to `ask-user`. A report containing only `auto-fix` findings can dispatch a bounded automatic repair when trusted [`auto_fix.gates.<name>`](#auto_fix) is positive and attempts remain. A report with at least one `auto-fix` finding and otherwise only `no-op` findings is also eligible. Any `ask-user` finding parks the whole gate; without an eligible repair, warnings and errors park for a decision.
 
 #### Placement
 
@@ -574,7 +574,7 @@ A run resolves this list once when it starts. Adding or removing a gate on the d
 
 #### Failure
 
-A failing gate parks by default. Trusted [`auto_fix.gates.<name>`](#auto_fix) can authorize bounded repairs of auto-fix-eligible findings. Any `ask-user` finding still parks the whole gate. The current exit-code-only failure is `ask-user`, so the budget has no effect until the [structured findings follow-up](https://github.com/kunchenguid/no-mistakes/issues/1027) supplies auto-fix-eligible findings.
+A failing gate parks by default. Trusted [`auto_fix.gates.<name>`](#auto_fix) can authorize bounded repairs of structured `auto-fix` findings when no finding is `ask-user`. A repair parks if the budget is exhausted or its finding count does not decrease. Exit-code-only failures remain `ask-user`, so they always require an operator decision.
 
 Answering that decision with `fix` is that authorization: the gate then runs a fix turn against the reported findings and the command that must exit `0` without reporting error findings, then re-runs its check. The next verdict describes the repaired worktree. Answering `approve` accepts the change as it stands.
 
@@ -646,7 +646,7 @@ protected_paths:
 
 Patterns use the same syntax as [`ignore_patterns`](#ignore_patterns). Empty or malformed rules fail config loading. Commit this setting to the default branch to enable it; a pushed branch cannot add, remove, or replace the trusted policy for its own run.
 
-Before staging an automatic Review, Test, Document, Lint, or CI repair, an operator-authorized repository gate repair, or a Push leftover commit, the pipeline checks the index and worktree for dirty protected paths. This includes staged and unstaged modifications, deletions, both ends of renames, and individual untracked files inside new directories. A match refuses the entire commit and parks the step at an operator approval gate naming the path and rule. The index and all working files stay as they were; nothing is restored, unstaged, discarded, or partially committed. The Push check also covers formatter changes and residue from earlier steps. [Daemon & Worktrees](/no-mistakes/concepts/daemon/#what-it-does) owns retention across terminal cleanup and crash recovery.
+Before staging an automatic Review, Test, Document, Lint, or CI repair, a repository gate repair, or a Push leftover commit, the pipeline checks the index and worktree for dirty protected paths. This includes staged and unstaged modifications, deletions, both ends of renames, and individual untracked files inside new directories. A match refuses the entire commit and parks the step at an operator approval gate naming the path and rule. The index and all working files stay as they were; nothing is restored, unstaged, discarded, or partially committed. The Push check also covers formatter changes and residue from earlier steps. [Daemon & Worktrees](/no-mistakes/concepts/daemon/#what-it-does) owns retention across terminal cleanup and crash recovery.
 
 A protected-path refusal always requires an explicit response, including under AXI `--yes` and TUI yolo mode. CI does not retry its fixer, and automatic gate reconciliation cannot clear the refusal, even if the PR closes. Approval is rejected because it would skip unfinished work: inspect and resolve the reported edit, then use `no-mistakes axi respond --action fix` to retry the step, including its commit and publication. Deliberate skip and abort behavior is unchanged.
 
@@ -894,7 +894,7 @@ Override the auto-fix commit subject template for this repository.
 
 The value follows the [global `commit.fix_message` template syntax and validation rules](/no-mistakes/reference/global-config/#commitfix_message).
 That includes the 1,024-byte template limit, 16-placeholder limit, 4,096-byte summary and rendered-subject limits, and rejection of bidi and invisible Unicode format characters.
-The setting applies to the Review, Test, Document, Lint, and CI repair paths, plus operator-authorized repository gate repairs. It does not apply to commits created by the Rebase or Push steps.
+The setting applies to the Review, Test, Document, Lint, and CI repair paths, plus repository gate repairs. It does not apply to commits created by the Rebase or Push steps.
 
 This non-executing field is read from the pushed branch, so a branch can adopt its own commit-subject convention without enabling `allow_repo_commands`.
 To apply a machine-local convention without adding it to the repository, see global [`repository_overrides`](/no-mistakes/reference/global-config/#repository_overrides).
