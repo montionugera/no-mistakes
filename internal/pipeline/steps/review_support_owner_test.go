@@ -367,29 +367,35 @@ func TestCIOwnerUsesProviderSourceIdentity(t *testing.T) {
 }
 
 func TestCIOwnerRejectsTargetCommitMovement(t *testing.T) {
-	sctx, receipt := completedReviewSupportFixture(t, pendingReviewCIClaim("run-42", ""))
-	steps, err := sctx.DB.GetStepsByRun(sctx.Run.ID)
-	if err != nil {
-		t.Fatal(err)
+	for _, state := range []scm.PRState{scm.PRStateOpen, scm.PRStateClosed} {
+		t.Run(string(state), func(t *testing.T) {
+			sctx, receipt := completedReviewSupportFixture(t, pendingReviewCIClaim("run-42", ""))
+			steps, err := sctx.DB.GetStepsByRun(sctx.Run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := types.MarshalFindingsJSON(Findings{Items: []Finding{pendingReviewCIClaim("run-42", receipt.LocalHeadSHA)}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := sctx.DB.SetStepFindings(steps[0].ID, encoded); err != nil {
+				t.Fatal(err)
+			}
+			host := &supportCheckHost{facts: scm.PRFacts{PR: scm.PR{URL: receipt.PRURL}, State: state, SourceRepository: receipt.SourceRepo, SourceBranch: receipt.SourceBranch, HeadSHA: receipt.LocalHeadSHA, BaseBranch: receipt.TargetBranch}, checks: []scm.Check{{ProviderID: "run-42", HeadSHA: receipt.LocalHeadSHA, Bucket: scm.CheckBucketPass}}}
+			pr := &scm.PR{URL: receipt.PRURL, Number: "42"}
+			results, err := resolveCIReviewSupport(sctx, host, pr)
+			if err != nil || len(results) != 1 || results[0].Category != types.FindingCategoryReviewSupportResolved || results[0].Support.OwnerResult.Disposition != types.FindingSupportDispositionDisproven {
+				t.Fatalf("unchanged target support = %+v, %v; want disproven", results, err)
+			}
+			gitCmd(t, sctx.WorkDir, "checkout", "main")
+			gitCmd(t, sctx.WorkDir, "commit", "--allow-empty", "-m", "move target")
+			gitCmd(t, sctx.WorkDir, "checkout", "feature")
+			results, err = resolveCIReviewSupport(sctx, host, pr)
+			if err != nil || len(results) != 1 || results[0].Category != types.FindingCategoryReviewSupportUnresolved || results[0].Support.OwnerResult.Disposition != types.FindingSupportDispositionUnresolved || !strings.Contains(results[0].Description, "live target commit, merge base, or diff differs from PR comparison receipt") {
+				t.Fatalf("changed target support = %+v, %v; want target comparison rejection", results, err)
+			}
+		})
 	}
-	encoded, _ := types.MarshalFindingsJSON(Findings{Items: []Finding{pendingReviewCIClaim("run-42", receipt.LocalHeadSHA)}})
-	if err := sctx.DB.SetStepFindings(steps[0].ID, encoded); err != nil {
-		t.Fatal(err)
-	}
-	host := &supportCheckHost{facts: scm.PRFacts{PR: scm.PR{URL: receipt.PRURL}, State: scm.PRStateOpen, SourceRepository: receipt.SourceRepo, SourceBranch: receipt.SourceBranch, HeadSHA: receipt.LocalHeadSHA, BaseBranch: receipt.TargetBranch}, checks: []scm.Check{{ProviderID: "run-42", Bucket: scm.CheckBucketPass}}}
-	gitCmd(t, sctx.WorkDir, "checkout", "main")
-	gitCmd(t, sctx.WorkDir, "commit", "--allow-empty", "-m", "move target")
-	gitCmd(t, sctx.WorkDir, "checkout", "feature")
-	results, err := resolveCIReviewSupport(sctx, host, &scm.PR{URL: receipt.PRURL, Number: "42"})
-	if err != nil || len(results) != 1 || results[0].Category != types.FindingCategoryReviewSupportUnresolved {
-		t.Fatalf("changed target support = %+v, %v; want unresolved", results, err)
-	}
-	host.facts.State = scm.PRStateClosed
-	results, err = resolveCIReviewSupport(sctx, host, &scm.PR{URL: receipt.PRURL, Number: "42"})
-	if err != nil || len(results) != 1 || results[0].Category != types.FindingCategoryReviewSupportUnresolved {
-		t.Fatalf("closed changed-target support = %+v, %v; want unresolved", results, err)
-	}
-
 }
 
 type supportMergedProofHost struct {

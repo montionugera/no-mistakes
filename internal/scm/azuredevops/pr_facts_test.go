@@ -31,31 +31,50 @@ func TestReadPRFactsBindsExactRecordedIdentityAndLiveBase(t *testing.T) {
 	}
 }
 
+func azFactsResponses() map[string]azdoTestResponse {
+	return map[string]azdoTestResponse{
+		"az repos pr show --id 42 --organization " + testOrg + " --output json":                                                                             {stdout: azFacts42},
+		"az repos ref list --filter heads/feature --organization " + testOrg + " --project " + testProject + " --repository " + testRepo + " --output json": {stdout: `[{"name":"refs/heads/feature","objectId":"` + azFactsSHA + `"}]`},
+	}
+}
+
 func TestReadPRFactsRejectsIncompleteAndInconsistentData(t *testing.T) {
-	for _, tc := range []struct{ name, body string }{
-		{"wrong number", strings.Replace(azFacts42, `"pullRequestId":42`, `"pullRequestId":43`, 1)},
-		{"missing head", strings.Replace(azFacts42, `"commitId":"`+azFactsSHA+`"`, `"commitId":""`, 1)},
-		{"short head", strings.Replace(azFacts42, azFactsSHA, "1234", 1)},
-		{"bad source ref", strings.Replace(azFacts42, "refs/heads/feature", "refs/tags/feature", 1)},
-		{"bad target ref", strings.Replace(azFacts42, "refs/heads/develop", "develop", 1)},
-		{"unknown status", strings.Replace(azFacts42, `"status":"active"`, `"status":"unknown"`, 1)},
-		{"foreign target", strings.Replace(azFacts42, `"name":"myrepo"`, `"name":"other"`, 1)},
-		{"bad fork", strings.Replace(azFacts42, `"repository":`, `"forkSource":{"repository":{}},"repository":`, 1)},
+	for _, tc := range []struct{ name, body, wantError string }{
+		{"wrong number", strings.Replace(azFacts42, `"pullRequestId":42`, `"pullRequestId":43`, 1), "different PR identity"},
+		{"missing head", strings.Replace(azFacts42, `"commitId":"`+azFactsSHA+`"`, `"commitId":""`, 1), "lacks a full source commit SHA"},
+		{"short head", strings.Replace(azFacts42, azFactsSHA, "1234", 1), "lacks a full source commit SHA"},
+		{"bad source ref", strings.Replace(azFacts42, "refs/heads/feature", "refs/tags/feature", 1), `invalid Azure branch ref "refs/tags/feature"`},
+		{"bad target ref", strings.Replace(azFacts42, "refs/heads/develop", "develop", 1), `invalid Azure branch ref "develop"`},
+		{"unknown status", strings.Replace(azFacts42, `"status":"active"`, `"status":"unknown"`, 1), `invalid status "unknown"`},
+		{"foreign target", strings.Replace(azFacts42, `"name":"myrepo"`, `"name":"other"`, 1), `repository metadata name "other" does not match configured repository "myrepo"`},
+		{"bad fork", strings.Replace(azFacts42, `"repository":`, `"forkSource":{"repository":{}},"repository":`, 1), "fork source lacks repository project or name"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := newTestHost(map[string]azdoTestResponse{
-				"az repos pr show --id 42 --organization " + testOrg + " --output json": {stdout: tc.body},
-			})
-			if _, err := h.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err == nil {
-				t.Fatal("ReadPRFacts accepted incomplete or inconsistent response")
+			responses := azFactsResponses()
+			h := newTestHost(responses)
+			pr := &scm.PR{Number: "42"}
+			facts, err := h.ReadPRFacts(context.Background(), pr)
+			if err != nil || facts.PR.Number != "42" || facts.HeadSHA != azFactsSHA || facts.BaseBranch != "develop" {
+				t.Fatalf("valid PR facts = %+v, %v", facts, err)
+			}
+			responses["az repos pr show --id 42 --organization "+testOrg+" --output json"] = azdoTestResponse{stdout: tc.body}
+			if _, err := h.ReadPRFacts(context.Background(), pr); err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("ReadPRFacts error = %v, want %q", err, tc.wantError)
 			}
 		})
 	}
-	h := newTestHost(map[string]azdoTestResponse{
-		"az repos pr show --id 42 --organization " + testOrg + " --output json": {stdout: azFacts42},
-	})
-	if _, err := h.ReadPRFacts(context.Background(), &scm.PR{Number: "42", URL: webPRURL(testOrg, testProject, testRepo, "", "43")}); err == nil {
-		t.Fatal("ReadPRFacts accepted mismatched persisted URL")
+}
+
+func TestReadPRFactsRejectsMismatchedPersistedURL(t *testing.T) {
+	h := newTestHost(azFactsResponses())
+	pr := &scm.PR{Number: "42", URL: webPRURL(testOrg, testProject, testRepo, "", "42")}
+	facts, err := h.ReadPRFacts(context.Background(), pr)
+	if err != nil || facts.PR.URL != pr.URL || facts.HeadSHA != azFactsSHA {
+		t.Fatalf("valid recorded PR = %+v, %v", facts, err)
+	}
+	pr.URL = webPRURL(testOrg, testProject, testRepo, "", "43")
+	if _, err := h.ReadPRFacts(context.Background(), pr); err == nil || !strings.Contains(err.Error(), "recorded URL does not match PR identity") {
+		t.Fatalf("ReadPRFacts error = %v, want recorded URL identity rejection", err)
 	}
 }
 
@@ -126,18 +145,27 @@ func TestReadPRFactsRejectsMissingOrAmbiguousLiveSourceRef(t *testing.T) {
 
 func TestFindOpenPRFactsRejectsCorruptAndDuplicateCandidates(t *testing.T) {
 	command := "az repos pr list --source-branch feature --status active --top 100 --skip 0 --organization " + testOrg + " --project " + testProject + " --repository " + testRepo + " --output json"
-	for _, tc := range []struct{ name, body string }{
-		{"null", "null"},
-		{"object", azFacts42},
-		{"missing head", "[" + strings.Replace(azFacts42, azFactsSHA, "", 1) + "]"},
-		{"wrong source branch", "[" + strings.Replace(azFacts42, "refs/heads/feature", "refs/heads/other", 1) + "]"},
-		{"duplicate", "[" + azFacts42 + "," + azFacts42 + "]"},
-		{"foreign target", "[" + azFacts42 + "," + strings.Replace(azFacts42, `"name":"myrepo"`, `"name":"other"`, 1) + "]"},
+	other := strings.Replace(azFacts42, `"pullRequestId":42`, `"pullRequestId":43`, 1)
+	for _, tc := range []struct{ name, body, wantError string }{
+		{"null", "null", "invalid array"},
+		{"object", azFacts42, "invalid array"},
+		{"missing head", "[" + strings.Replace(azFacts42, azFactsSHA, "", 1) + "]", "lacks a full source commit SHA"},
+		{"wrong source branch", "[" + strings.Replace(azFacts42, "refs/heads/feature", "refs/heads/other", 1) + "]", "non-open or mismatched source branch"},
+		{"duplicate", "[" + azFacts42 + "," + strings.Replace(other, `"pullRequestId":43`, `"pullRequestId":42`, 1) + "]", "duplicate PR 42"},
+		{"foreign target", "[" + azFacts42 + "," + strings.Replace(other, `"name":"myrepo"`, `"name":"other"`, 1) + "]", `repository metadata name "other" does not match configured repository "myrepo"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := newTestHost(map[string]azdoTestResponse{command: {stdout: tc.body}})
-			if _, err := h.FindOpenPRFacts(context.Background(), webPRURL(testOrg, testProject, testRepo, "", ""), "feature"); err == nil {
-				t.Fatal("FindOpenPRFacts accepted corrupt or ambiguous result")
+			responses := azFactsResponses()
+			responses[command] = azdoTestResponse{stdout: "[" + azFacts42 + "," + other + "]"}
+			h := newTestHost(responses)
+			source := webPRURL(testOrg, testProject, testRepo, "", "")
+			facts, err := h.FindOpenPRFacts(context.Background(), source, "feature")
+			if err != nil || len(facts) != 2 || facts[0].PR.Number != "42" || facts[1].PR.Number != "43" || facts[0].HeadSHA != azFactsSHA || facts[1].HeadSHA != azFactsSHA {
+				t.Fatalf("valid candidate list = %+v, %v", facts, err)
+			}
+			responses[command] = azdoTestResponse{stdout: tc.body}
+			if _, err := h.FindOpenPRFacts(context.Background(), source, "feature"); err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("FindOpenPRFacts error = %v, want %q", err, tc.wantError)
 			}
 		})
 	}
