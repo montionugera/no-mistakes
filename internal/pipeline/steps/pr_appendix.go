@@ -60,7 +60,8 @@ func wrapValidation(inner string) string {
 }
 
 // minimalTail is the one-line risk level plus the attestation the pipeline
-// section already carries. Ordinary Bitbucket descriptions carry no
+// section already carries, preserving any mandatory accepted-gap audit even
+// when the rest of the evidence is omitted. Ordinary Bitbucket descriptions carry no
 // attestation comment; this does not invent one. An owned Bitbucket body
 // carries that comment inside a text fence, and the fence is kept so the
 // marker stays visible there.

@@ -259,8 +259,8 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 // RespondWithAcceptedGaps is RespondWithOverrides for an approval that may
 // carry an owner-accepted Test gap (strict shipping only). The gap is admitted
 // by db.StepResult.AcceptedGapRefusal and recorded durably before the step
-// completes; approvalReason then doubles as the gap's reason and is not
-// stored as a Test exception reason.
+// completes; its reason comes from gaps and is not stored as a Test exception
+// reason.
 func (e *Executor) RespondWithAcceptedGaps(step types.StepName, action types.ApprovalAction, findingIDs, ignoreFindingIDs []string, instructions map[string]string, addedFindings []types.Finding, approvalReason string, gaps *db.AcceptedGaps) (RespondDispositions, error) {
 	if gaps != nil && (step != types.StepTest || action != types.ActionApprove) {
 		return RespondDispositions{}, fmt.Errorf("an accepted gap applies only to Test approval")
@@ -2083,8 +2083,8 @@ done:
 // instead of recording that plain pass.
 func (e *Executor) applyApprovalOverride(step Step, sctx *StepContext, stepResultID, approvalReason string, gaps *db.AcceptedGaps) error {
 	// An accepted strict-shipping gap is recorded as its own audit row and
-	// deliberately NOT as an approval reason: the step completes as an
-	// ordinary Test pass that carries the gap, and the receipt re-validates it.
+	// deliberately NOT as an approval reason: the step completes normally
+	// with the unresolved gap, and the receipt re-validates the acceptance.
 	if gaps != nil {
 		if _, err := e.db.RecordAcceptedGaps(stepResultID, *gaps, sctx.Run.Shipping != nil); err != nil {
 			return err

@@ -70,9 +70,9 @@ type pipelineAttestationStep struct {
 	// a failing configured commands.test. Omitted for every other step, ordinary
 	// Test completions, and attestations that predate the field.
 	OverrideReason string `json:"override_reason,omitempty"`
-	// AcceptedGaps records the owner-accepted Test gap this strict step
-	// completed with: the accepted finding ids, who approved it and where, and
-	// the covering tests. Omitted when no gap was accepted.
+	// AcceptedGaps binds the owner-accepted Test gap to the human audit block
+	// using finding IDs and digests of the reason and covering tests. Omitted
+	// when no gap was accepted.
 	AcceptedGaps *pipelineAttestationAcceptedGaps `json:"accepted_gaps,omitempty"`
 }
 

@@ -61,6 +61,12 @@ func TestAcceptedGapRefusal(t *testing.T) {
 		{"short reason", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-1"}, Reason: "ok", CoveredBy: "TestX"}, "at least 10 characters"},
 		{"missing covered-by", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-1"}, Reason: "owner approved via first mate"}, "--covered-by"},
 		{"multiline reason", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-1"}, Reason: "owner approved\nvia first mate", CoveredBy: "TestX"}, "single line"},
+		// The audit contract allows 500 characters per field, including
+		// multibyte text, but must reject 501 before recording the gap.
+		{"maximum reason", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-1"}, Reason: strings.Repeat("海", 500), CoveredBy: "TestX"}, ""},
+		{"oversized reason", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-1"}, Reason: strings.Repeat("海", 501), CoveredBy: "TestX"}, "--reason must be at most 500 characters"},
+		{"maximum covered-by", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-1"}, Reason: "owner approved via first mate", CoveredBy: strings.Repeat("海", 500)}, ""},
+		{"oversized covered-by", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-1"}, Reason: "owner approved via first mate", CoveredBy: strings.Repeat("海", 501)}, "--covered-by must be at most 500 characters"},
 		{"verdict mismatch", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-1"}, Reason: "owner approved via first mate", CoveredBy: "TestX", Verdict: "go"}, "does not match"},
 	}
 	for _, tt := range tests {

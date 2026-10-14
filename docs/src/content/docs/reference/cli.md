@@ -243,7 +243,7 @@ After termination, restart from the current target and head; never hand-rebase.
 After the run stops, see [`no-mistakes rerun`](#no-mistakes-rerun) for restart and custody conditions.
 Reattaching with `axi run` while the monitor is still active leaves HEAD unchanged and does not refresh the target comparison.
 Successful outcomes (`checks-passed`, `passed`, `passed-with-override`, and `passed-with-skips`) also carry `help` instructions telling the agent to summarize the run.
-`passed-with-override` is a completed run with an explicitly approved Test exception or a CI approval over still-failing checks.
+`passed-with-override` is a completed run with an explicitly approved Test exception, an [accepted Test gap](/no-mistakes/reference/pipeline-steps/#accepted-test-gaps), or a CI approval over still-failing checks.
 It stays a success but is distinct from a clean `passed`.
 A Test exception is an approval past a failing configured `commands.test`, a `no-go` verdict, an `inconclusive` verdict, or a [`test_agent_timeout`](/no-mistakes/reference/global-config/#test_agent_timeout) budget cut; approving a `no-surface` park records its reason but completes as `passed`.
 `run.test_override_reason` preserves the Test exception explanation in drive and status output, including at the `checks-passed` stopping point; CI overrides retain their separate reason.
@@ -343,14 +343,14 @@ Finding IDs are trimmed before validation. Missing or repeated gate finding IDs 
 
 Every successful fix response echoes what it recorded in a `recorded:` object: `fixed` (the findings selected, including `--add-finding` items under their normalized IDs), `ignored` (the findings explicitly declined), and `kept` (the gate findings omitted that a previous response for this step had already decided). A finding the restored decision dispatched is reported under `fixed`, not also under `kept`. Approve, skip, and abort emit no disposition echo. They are not decision-free: a nonempty gate they resolve is recorded as a decline round, which is what later rounds read as `user_chose_to_ignore`. `--yes` resolution is unchanged: it selects every current finding.
 
-For an explicitly authorized Test exception, use `no-mistakes axi respond --step test --action approve --reason "the operator's explanation"`.
+For an explicitly authorized Test exception in an ordinary run, use `no-mistakes axi respond --step test --action approve --reason "the operator's explanation"`.
 The reason is optional: approval without one remains effective, and a qualifying exception is reported with no operator reason supplied.
 The step retains its findings and exit code, and the reason is durable local evidence in `step_results.approval_reason`.
 Revalidation, a new fix round, or skipping the step clears that current-step approval so a later result cannot inherit it.
 This is separate from the configured-command waiver and trusted repository opt-in used by [PR enforcement](/no-mistakes/reference/pipeline-steps/#pipeline-step-attestation); neither that policy nor approval authority changes.
 `--instructions` remains fix guidance, not an approval-reason input.
 
-A strict-shipping Test parked on an `inconclusive` verdict, where the unreachable scenarios are covered only by mocked tests, cannot be approved or skipped. The owner can accept that specific gap instead:
+A strict-shipping Test parked on an `inconclusive` verdict, where the unreachable scenarios are covered only by mocked tests, refuses plain approval and skip. The owner can accept that specific gap instead:
 
 ```bash
 no-mistakes axi respond --step test --action approve \
@@ -359,7 +359,7 @@ no-mistakes axi respond --step test --action approve \
   --covered-by "TestBrokerTimeoutMocked; internal/broker/timeout_test.go"
 ```
 
-`--accept-gap` requires `--action approve`, a single-line `--reason` of at least 10 characters (up to 500) that names who approved the gap and where, and a non-empty single-line `--covered-by` of at most 500 characters. Both strings are stored verbatim. Every actionable finding on the Test step must be named, and each named finding must be the native `inconclusive` verdict finding; a missing, unknown, or other ID is refused with the missing IDs listed. A `no-go` verdict, a failing `commands.test`, a Test-agent timeout or unvalidated-work finding, a recorded override or skip, and a non-zero exit code are never accepted. Outside strict shipping the flag is refused; use `--reason` there. The step completes normally (not skipped, not an override) and records the gap in `step_results.accepted_gaps_json`; see [strict shipping](/no-mistakes/reference/pipeline-steps/#explicit-strict-shipping-policy) for how it reaches receipts and the PR.
+`--accept-gap` requires `--action approve`, a single-line `--reason` of at least 10 characters (up to 500) that names who approved the gap and where, and a non-empty single-line `--covered-by` of at most 500 characters. Neither field may contain control characters; limits count Unicode characters, not bytes. Both strings are stored verbatim. [Accepted Test gaps](/no-mistakes/reference/pipeline-steps/#accepted-test-gaps) owns eligibility, durable recording, and publication in receipts and the PR.
 
 The same approval command acknowledges a genuine strict `no-surface` Test; [strict shipping](#strict-shipping-and-review-receipts) owns its admission requirements.
 

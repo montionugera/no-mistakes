@@ -82,7 +82,9 @@ func TestAxiRespond_ForwardsAnAcceptedGapVerbatim(t *testing.T) {
 		}
 		return parked(), nil
 	})
-	out, err := executeCmd("axi", "respond", "--action", "approve", "--accept-gap", "test-1, test-2", "--reason", acceptGapReason, "--covered-by", acceptGapCoveredBy, "--wait", "3s")
+	// This checks the forwarded audit payload, not the wait deadline. Allow a
+	// busy test host enough time for the local Git and IPC round trips.
+	out, err := executeCmd("axi", "respond", "--action", "approve", "--accept-gap", "test-1, test-2", "--reason", acceptGapReason, "--covered-by", acceptGapCoveredBy, "--wait", "1m")
 	if err != nil {
 		t.Fatalf("accepted gap refused: %v\n%s", err, out)
 	}
