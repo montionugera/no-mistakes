@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/scm/plugin/fakeplugin"
 )
@@ -64,6 +65,16 @@ func handleFakeCLI(mode string) {
 	}
 
 	switch mode {
+	case "git-status-confirmation-stalled":
+		if fakeGitSubcommand(args) == "ls-remote" {
+			if err := os.WriteFile(os.Getenv("FAKE_CLI_STARTED_FILE"), []byte("ls-remote"), 0600); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			time.Sleep(time.Hour)
+			return
+		}
+		os.Exit(1)
 	case "gh-git-push-reply-lost":
 		if strings.TrimSuffix(filepath.Base(os.Args[0]), filepath.Ext(os.Args[0])) == "git" {
 			cmd := exec.Command(os.Getenv("FAKE_CLI_REAL_GIT"), args...)

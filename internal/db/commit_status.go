@@ -26,7 +26,7 @@ func (d *DB) PutCommitStatusAttempt(runID string, p CommitStatusAttempt) error {
 			WHERE p.host=? AND p.repo=? AND p.sha=? AND
 			(owner.created_at>current.created_at OR (owner.created_at=current.created_at AND owner.id>current.id) OR (owner.id=current.id AND p.retired=1))
 		)) ON CONFLICT(run_id) DO UPDATE SET sha=excluded.sha,host=excluded.host,repo=excluded.repo,target=excluded.target,ref=excluded.ref,validated=excluded.validated,ci_eligible=excluded.ci_eligible,
-		retired=CASE WHEN commit_status_attempts.sha=excluded.sha AND commit_status_attempts.host=excluded.host AND commit_status_attempts.repo=excluded.repo THEN MAX(commit_status_attempts.retired,excluded.retired) ELSE excluded.retired END`, runID, p.SHA, p.Host, p.Repo, p.Target, p.Ref, p.Validated, p.CIEligible, runID, p.Host, p.Repo, p.SHA)
+		retired=excluded.retired`, runID, p.SHA, p.Host, p.Repo, p.Target, p.Ref, p.Validated, p.CIEligible, runID, p.Host, p.Repo, p.SHA)
 	return err
 }
 
@@ -54,18 +54,8 @@ func (d *DB) putCommitStatusPublication(runID string, p CommitStatusPublication,
 		return false, err
 	}
 	defer tx.Rollback()
-	result, err := tx.Exec(`INSERT INTO commit_status_publications (run_id,sha,host,repo,last_state,validated,ci_eligible)
-		SELECT ?,?,?,?,?,?,? WHERE NOT EXISTS (
-			SELECT 1 FROM commit_status_publications p JOIN runs newer ON newer.id=p.run_id JOIN runs current ON current.id=?
-			WHERE p.host=? AND p.repo=? AND p.sha=?
-			AND (newer.created_at>current.created_at OR (newer.created_at=current.created_at AND newer.id>current.id) OR (newer.id=current.id AND p.retired=1))
-		) AND NOT EXISTS (SELECT 1 FROM commit_status_attempts WHERE run_id=? AND sha=? AND host=? AND repo=? AND retired=1)
-		ON CONFLICT(run_id) DO UPDATE SET sha=excluded.sha,host=excluded.host,repo=excluded.repo,last_state=excluded.last_state,validated=excluded.validated,ci_eligible=excluded.ci_eligible,retired=0`, runID, p.SHA, p.Host, p.Repo, p.LastState, p.Validated, p.CIEligible, runID, p.Host, p.Repo, p.SHA, runID, p.SHA, p.Host, p.Repo)
-	if err != nil {
-		return false, err
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
+	if _, err := tx.Exec(`INSERT INTO commit_status_publications (run_id,sha,host,repo,last_state,validated,ci_eligible)
+		VALUES (?,?,?,?,?,?,?) ON CONFLICT(host,repo,sha,run_id) DO UPDATE SET last_state=excluded.last_state,validated=excluded.validated,ci_eligible=excluded.ci_eligible`, runID, p.SHA, p.Host, p.Repo, p.LastState, p.Validated, p.CIEligible); err != nil {
 		return false, err
 	}
 	for _, table := range []string{"commit_status_attempts", "commit_status_publications"} {
@@ -83,22 +73,43 @@ func (d *DB) putCommitStatusPublication(runID string, p CommitStatusPublication,
 			return false, err
 		}
 	}
-	return changed != 0, tx.Commit()
+	var retired bool
+	if err := tx.QueryRow(`SELECT retired FROM commit_status_publications WHERE run_id=? AND host=? AND repo=? AND sha=?`, runID, p.Host, p.Repo, p.SHA).Scan(&retired); err != nil {
+		return false, err
+	}
+	return !retired, tx.Commit()
 }
 
-func (d *DB) GetCommitStatusPublication(runID string) (*CommitStatusPublication, error) {
-	p := &CommitStatusPublication{}
-	err := d.sql.QueryRow(`SELECT sha,host,repo,last_state,validated,ci_eligible FROM commit_status_publications WHERE run_id=? AND retired=0`, runID).Scan(&p.SHA, &p.Host, &p.Repo, &p.LastState, &p.Validated, &p.CIEligible)
+func (d *DB) GetCommitStatusPublication(ctx context.Context, runID string, p CommitStatusPublication) (*CommitStatusPublication, error) {
+	current := &CommitStatusPublication{}
+	err := d.sql.QueryRowContext(ctx, `SELECT sha,host,repo,last_state,validated,ci_eligible FROM commit_status_publications WHERE run_id=? AND host=? AND repo=? AND sha=? AND retired=0`, runID, p.Host, p.Repo, p.SHA).Scan(&current.SHA, &current.Host, &current.Repo, &current.LastState, &current.Validated, &current.CIEligible)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	return p, err
+	return current, err
+}
+
+func (d *DB) GetCommitStatusPublications(ctx context.Context, runID string) ([]CommitStatusPublication, error) {
+	rows, err := d.sql.QueryContext(ctx, `SELECT sha,host,repo,last_state,validated,ci_eligible FROM commit_status_publications WHERE run_id=? AND retired=0 ORDER BY rowid`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var publications []CommitStatusPublication
+	for rows.Next() {
+		var p CommitStatusPublication
+		if err := rows.Scan(&p.SHA, &p.Host, &p.Repo, &p.LastState, &p.Validated, &p.CIEligible); err != nil {
+			return nil, err
+		}
+		publications = append(publications, p)
+	}
+	return publications, rows.Err()
 }
 
 // CommitStatusRecoveryRunIDs includes terminal runs whose durable outcome has
 // not reached the forge. Selection shares the reporting deadline.
 func (d *DB) CommitStatusRecoveryRunIDs(ctx context.Context) ([]string, error) {
-	rows, err := d.sql.QueryContext(ctx, `SELECT r.id FROM runs r LEFT JOIN commit_status_publications p ON p.run_id=r.id AND p.retired=0 LEFT JOIN commit_status_attempts a ON a.run_id=r.id AND a.retired=0 WHERE r.status IN ('completed','failed','cancelled') AND (a.run_id IS NOT NULL OR (p.run_id IS NOT NULL AND p.last_state != CASE WHEN r.status='completed' AND p.validated=1 THEN 'success' ELSE 'failure' END)) ORDER BY r.created_at,r.id`)
+	rows, err := d.sql.QueryContext(ctx, `SELECT DISTINCT r.id FROM runs r LEFT JOIN commit_status_publications p ON p.run_id=r.id AND p.retired=0 LEFT JOIN commit_status_attempts a ON a.run_id=r.id AND a.retired=0 WHERE r.status IN ('completed','failed','cancelled') AND (a.run_id IS NOT NULL OR (p.run_id IS NOT NULL AND p.last_state != CASE WHEN r.status='completed' AND p.validated=1 THEN 'success' ELSE 'failure' END)) ORDER BY r.created_at,r.id`)
 	if err != nil {
 		return nil, err
 	}

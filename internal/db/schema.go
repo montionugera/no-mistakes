@@ -67,9 +67,10 @@ CREATE TABLE IF NOT EXISTS commit_status_attempts (
 );
 
 CREATE TABLE IF NOT EXISTS commit_status_publications (
- run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+ run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
  sha TEXT NOT NULL, host TEXT NOT NULL, repo TEXT NOT NULL,
- last_state TEXT NOT NULL DEFAULT '', retired INTEGER NOT NULL DEFAULT 0, validated INTEGER NOT NULL DEFAULT 0, ci_eligible INTEGER NOT NULL DEFAULT 0
+ last_state TEXT NOT NULL DEFAULT '', retired INTEGER NOT NULL DEFAULT 0, validated INTEGER NOT NULL DEFAULT 0, ci_eligible INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY (host, repo, sha, run_id)
 );
 
 CREATE TABLE IF NOT EXISTS step_results (
@@ -258,17 +259,6 @@ CREATE TABLE IF NOT EXISTS uncertified_pipeline_ranges (
 // were created before the referenced columns existed. Each statement must be
 // idempotent via its error being tolerated when the column already exists.
 var migrationStatements = []string{
-	`ALTER TABLE commit_status_publications ADD COLUMN ci_eligible INTEGER NOT NULL DEFAULT 0`,
-	`ALTER TABLE commit_status_publications ADD COLUMN retired INTEGER NOT NULL DEFAULT 0`,
-	`ALTER TABLE commit_status_attempts ADD COLUMN retired INTEGER NOT NULL DEFAULT 0`,
-	`UPDATE commit_status_attempts SET retired=1 WHERE EXISTS (
-		SELECT 1 FROM commit_status_publications p JOIN runs newer ON newer.id=p.run_id JOIN runs older ON older.id=commit_status_attempts.run_id
-		WHERE p.host=commit_status_attempts.host AND p.repo=commit_status_attempts.repo AND p.sha=commit_status_attempts.sha
-		AND (newer.created_at>older.created_at OR (newer.created_at=older.created_at AND newer.id>older.id)))`,
-	`UPDATE commit_status_publications SET retired=1 WHERE EXISTS (
-		SELECT 1 FROM commit_status_publications p JOIN runs newer ON newer.id=p.run_id JOIN runs older ON older.id=commit_status_publications.run_id
-		WHERE p.host=commit_status_publications.host AND p.repo=commit_status_publications.repo AND p.sha=commit_status_publications.sha
-		AND (newer.created_at>older.created_at OR (newer.created_at=older.created_at AND newer.id>older.id)))`,
 	`ALTER TABLE runs ADD COLUMN verification_plan TEXT`,
 	`CREATE TRIGGER IF NOT EXISTS runs_verification_plan_immutable BEFORE UPDATE OF verification_plan ON runs WHEN NEW.verification_plan IS NOT OLD.verification_plan BEGIN SELECT RAISE(ABORT, 'run verification plan is immutable'); END`,
 	`ALTER TABLE runs ADD COLUMN shipping_options TEXT`,

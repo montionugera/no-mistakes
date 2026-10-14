@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
-	"sync"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
@@ -16,7 +15,22 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
-var commitStatusMu sync.Mutex
+var commitStatusLock = make(chan struct{}, 1)
+
+const commitStatusOperationTimeout = 15 * time.Second
+
+func acquireCommitStatusLock(ctx context.Context) error {
+	select {
+	case commitStatusLock <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-commitStatusLock
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // Plugins currently expose PR/CI operations, but no commit-status capability.
 // Their host ownership must also apply to persisted publications from older runs.
@@ -51,15 +65,18 @@ func recordCommitStatusAttempt(sctx *pipeline.StepContext, sha, target, ref stri
 
 // reconcileCommitStatusAttempt promotes only an attempted SHA observed at the
 // recorded target ref. It never infers publication from the mutable run head.
-func reconcileCommitStatusAttempt(sctx *pipeline.StepContext) (bool, error) {
-	commitStatusMu.Lock()
-	defer commitStatusMu.Unlock()
-	if err := sctx.Ctx.Err(); err != nil {
-		return false, err
+func reconcileCommitStatusAttempt(sctx *pipeline.StepContext) (*db.CommitStatusPublication, error) {
+	ctx, cancel := context.WithTimeout(sctx.Ctx, commitStatusOperationTimeout)
+	defer cancel()
+	if err := acquireCommitStatusLock(ctx); err != nil {
+		return nil, err
 	}
+	defer func() { <-commitStatusLock }()
+	bounded := *sctx
+	bounded.Ctx = ctx
 	attempt, err := sctx.DB.GetCommitStatusAttempt(sctx.Run.ID)
 	if err != nil || attempt == nil {
-		return false, err
+		return nil, err
 	}
 	target := attempt.Target
 	if sctx.Repo != nil {
@@ -67,36 +84,32 @@ func reconcileCommitStatusAttempt(sctx *pipeline.StepContext) (bool, error) {
 			target = current
 		}
 	}
-	remote, err := lsRemoteSHA(func(args ...string) (string, error) { return stepGitRun(sctx, args...) }, target, attempt.Ref)
+	remote, err := lsRemoteSHA(func(args ...string) (string, error) { return stepGitRun(&bounded, args...) }, target, attempt.Ref)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if remote != attempt.SHA {
-		return false, nil
+		return nil, nil
 	}
-	return sctx.DB.ConfirmCommitStatusAttempt(sctx.Run.ID, attempt.CommitStatusPublication)
+	confirmed, err := sctx.DB.ConfirmCommitStatusAttempt(sctx.Run.ID, attempt.CommitStatusPublication)
+	if err != nil || !confirmed {
+		return nil, err
+	}
+	return &attempt.CommitStatusPublication, nil
 }
 
 func beginPublishedCommitStatus(sctx *pipeline.StepContext) func(string) {
 	if suppressPluginCommitStatus(sctx) {
 		return func(string) {}
 	}
-	confirmed, err := reconcileCommitStatusAttempt(sctx)
+	publication, err := reconcileCommitStatusAttempt(sctx)
 	if err != nil {
 		statusWarning(sctx.Log, "confirm pushed head", err)
-	}
-	if !confirmed {
-		return func(string) {}
-	}
-	publication, err := sctx.DB.GetCommitStatusPublication(sctx.Run.ID)
-	if err != nil {
-		statusWarning(sctx.Log, "read pushed head", err)
 	}
 	if publication == nil {
 		return func(string) {}
 	}
 	report := commitStatusReporter(sctx, publication)
-	sctx.Shared.SetCommitStatusReporter(report)
 	update := func(state string) { report(sctx.Ctx, state, "", sctx.Log) }
 	update("pending")
 	return update
@@ -121,17 +134,19 @@ func commitStatusReporter(sctx *pipeline.StepContext, publication *db.CommitStat
 		if suppressPluginCommitStatus(sctx, statusHost) {
 			return
 		}
-		commitStatusMu.Lock()
-		defer commitStatusMu.Unlock()
-		if ctx.Err() != nil {
+		bounded, cancel := context.WithTimeout(ctx, commitStatusOperationTimeout)
+		defer cancel()
+		if err := acquireCommitStatusLock(bounded); err != nil {
+			statusWarning(log, "wait for reporting", err)
 			return
 		}
-		current, err := sctx.DB.GetCommitStatusPublication(sctx.Run.ID)
+		defer func() { <-commitStatusLock }()
+		current, err := sctx.DB.GetCommitStatusPublication(bounded, sctx.Run.ID, db.CommitStatusPublication{SHA: sha, Host: statusHost, Repo: statusRepo})
 		if err != nil {
 			statusWarning(log, "read publication ownership", err)
 			return
 		}
-		if current == nil || current.SHA != sha || current.Host != statusHost || current.Repo != statusRepo {
+		if current == nil {
 			return
 		}
 		publication := current
@@ -158,8 +173,6 @@ func commitStatusReporter(sctx *pipeline.StepContext, publication *db.CommitStat
 		case "failure":
 			description = "no-mistakes pipeline failed or cancelled"
 		}
-		bounded, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
 		if err := host.PostCommitStatus(bounded, sha, state, description, targetURL); err != nil {
 			statusWarning(log, state+" for "+sha, err)
 			return
@@ -180,23 +193,17 @@ func (*PushStep) ReportPublishedHeadStatus(sctx *pipeline.StepContext, state, va
 	if err != nil {
 		statusWarning(sctx.Log, "reconcile push attempt", err)
 	}
-	if !confirmed && sctx.Shared.ReportCommitStatus(sctx.Ctx, state, validatedSHA, sctx.Log) {
-		return
+	if confirmed != nil {
+		commitStatusReporter(sctx, confirmed)(sctx.Ctx, "pending", "", sctx.Log)
 	}
-	publication, err := sctx.DB.GetCommitStatusPublication(sctx.Run.ID)
+	publications, err := sctx.DB.GetCommitStatusPublications(sctx.Ctx, sctx.Run.ID)
 	if err != nil {
-		statusWarning(sctx.Log, "read pushed head", err)
+		statusWarning(sctx.Log, "read pushed heads", err)
 		return
 	}
-	if publication == nil {
-		return
+	for _, publication := range publications {
+		commitStatusReporter(sctx, &publication)(sctx.Ctx, state, validatedSHA, sctx.Log)
 	}
-	report := commitStatusReporter(sctx, publication)
-	sctx.Shared.SetCommitStatusReporter(report)
-	if confirmed {
-		report(sctx.Ctx, "pending", "", sctx.Log)
-	}
-	report(sctx.Ctx, state, validatedSHA, sctx.Log)
 }
 
 // A skipped or overridden local gate cannot claim that all local validation

@@ -27,6 +27,201 @@ import (
 
 type statusRequest struct{ Path, State, Context, Description, TargetURL string }
 
+func TestCommitStatusTerminalReportsEveryOwnedSHA(t *testing.T) {
+	for _, retired := range []bool{false, true} {
+		t.Run(fmt.Sprint(retired), func(t *testing.T) {
+			dir, base, head := setupGitRepo(t)
+			sc := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, base, head, config.Commands{})
+			sc.ForgeContext = &forgecontext.Context{Provider: scm.ProviderGitHub, Host: "github.com"}
+			for _, sha := range []string{head, base} {
+				if err := sc.DB.PutCommitStatusPublication(sc.Run.ID, db.CommitStatusPublication{SHA: sha, Host: "github.com", Repo: "test/repo", Validated: true, LastState: "success"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if retired {
+				newer, err := sc.DB.InsertRun(sc.Repo.ID, "other-feature", head, base)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := sc.DB.PutCommitStatusPublication(newer.ID, db.CommitStatusPublication{SHA: head, Host: "github.com", Repo: "test/repo", Validated: true, LastState: "success"}); err != nil {
+					t.Fatal(err)
+				}
+				if err := sc.DB.UpdateRunStatus(newer.ID, types.RunCompleted); err != nil {
+					t.Fatal(err)
+				}
+			}
+			sc.Run.Status = types.RunFailed
+			if err := sc.DB.UpdateRunStatus(sc.Run.ID, types.RunFailed); err != nil {
+				t.Fatal(err)
+			}
+			var mu sync.Mutex
+			var requests []statusRequest
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var payload struct{ State, Context string }
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Error(err)
+				}
+				if r.Method != "POST" || payload.Context != "no-mistakes" {
+					t.Errorf("unexpected status request: %s %+v", r.Method, payload)
+				}
+				mu.Lock()
+				requests = append(requests, statusRequest{Path: r.URL.Path, State: payload.State})
+				mu.Unlock()
+				w.WriteHeader(http.StatusCreated)
+			}))
+			defer server.Close()
+			env, _ := fakeGH(t, "")
+			sc.Env = append(env, "FAKE_CLI_STATUS_API_URL="+server.URL)
+			(&PushStep{}).ReportPublishedHeadStatus(sc, "failure", "")
+			ids, err := sc.DB.CommitStatusRecoveryRunIDs(sc.Ctx)
+			if err != nil || len(ids) != 0 {
+				t.Fatalf("unfinished terminal publications = %v, %v", ids, err)
+			}
+			want := []statusRequest{}
+			if !retired {
+				want = append(want, statusRequest{Path: "/repos/test/repo/statuses/" + head, State: "failure"})
+			}
+			want = append(want, statusRequest{Path: "/repos/test/repo/statuses/" + base, State: "failure"})
+			mu.Lock()
+			defer mu.Unlock()
+			if fmt.Sprint(requests) != fmt.Sprint(want) {
+				t.Fatalf("terminal requests = %+v, want %+v", requests, want)
+			}
+		})
+	}
+}
+
+func TestCommitStatusRemoteConfirmationHasOwnDeadline(t *testing.T) {
+	dir, base, head := setupGitRepo(t)
+	sc := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, base, head, config.Commands{})
+	publication := db.CommitStatusPublication{SHA: head, Host: "github.com", Repo: "test/repo", Validated: true}
+	if err := sc.DB.PutCommitStatusAttempt(sc.Run.ID, db.CommitStatusAttempt{CommitStatusPublication: publication, Target: "https://github.com/test/repo", Ref: "refs/heads/feature"}); err != nil {
+		t.Fatal(err)
+	}
+	binDir := fakeCLIBinDir(t)
+	linkTestBinary(t, binDir, "git")
+	marker := filepath.Join(t.TempDir(), "remote-started")
+	sc.Env = fakeCLIEnv(binDir, map[string]string{"FAKE_CLI_MODE": "git-status-confirmation-stalled", "FAKE_CLI_STARTED_FILE": marker})
+	sc.Ctx = context.Background()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p, err := reconcileCommitStatusAttempt(sc)
+		if err == nil || p != nil {
+			t.Errorf("stalled confirmation = %+v, %v; want unpublished with error", p, err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(commitStatusOperationTimeout + 3*time.Second):
+		t.Fatal("remote confirmation was not bounded independently of the caller")
+	}
+	if out, err := os.ReadFile(marker); err != nil || string(out) != "ls-remote" {
+		t.Fatalf("confirmation command marker = %q, %v", out, err)
+	}
+	if err := acquireCommitStatusLock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-commitStatusLock
+}
+
+func TestCommitStatusLateAttemptAfterRepairStaysRetired(t *testing.T) {
+	dir, base, head := setupGitRepo(t)
+	sc := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, base, head, config.Commands{})
+	sc.ForgeContext = &forgecontext.Context{Provider: scm.ProviderGitHub, Host: "github.com"}
+	newer, err := sc.DB.InsertRun(sc.Repo.ID, "other-feature", head, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := db.CommitStatusPublication{SHA: head, Host: "github.com", Repo: "test/repo", Validated: true, LastState: "success"}
+	repair := original
+	repair.SHA = base
+	for _, p := range []db.CommitStatusPublication{original, repair} {
+		if err := sc.DB.PutCommitStatusPublication(newer.ID, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sc.DB.PutCommitStatusAttempt(sc.Run.ID, db.CommitStatusAttempt{CommitStatusPublication: original, Target: "https://github.com/test/repo", Ref: "refs/heads/feature"}); err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := sc.DB.GetCommitStatusAttempt(sc.Run.ID)
+	if err != nil || attempt != nil {
+		t.Fatalf("late attempt = %+v, %v; want retired", attempt, err)
+	}
+	if confirmed, err := sc.DB.ConfirmCommitStatusAttempt(sc.Run.ID, original); err != nil || confirmed {
+		t.Fatalf("late confirmation = %v, %v; want refused", confirmed, err)
+	}
+	for _, p := range []db.CommitStatusPublication{original, repair} {
+		stored, err := sc.DB.GetCommitStatusPublication(sc.Ctx, newer.ID, p)
+		if err != nil || stored == nil || stored.LastState != "success" {
+			t.Fatalf("newer ownership for %s = %+v, %v", p.SHA, stored, err)
+		}
+	}
+	if err := sc.DB.UpdateRunStatus(sc.Run.ID, types.RunFailed); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.DB.UpdateRunStatus(newer.ID, types.RunCompleted); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := sc.DB.CommitStatusRecoveryRunIDs(sc.Ctx)
+	if err != nil || len(ids) != 0 {
+		t.Fatalf("recovery selected obsolete ownership: %v, %v", ids, err)
+	}
+	env, logFile := fakeGH(t, "")
+	sc.Env = env
+	(&PushStep{}).ReportPublishedHeadStatus(sc, "failure", "")
+	if out, err := os.ReadFile(logFile); err == nil && len(out) != 0 {
+		t.Fatalf("late attempt invoked gh: %s", out)
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
+func TestCommitStatusLockWaitHonorsContext(t *testing.T) {
+	dir, base, head := setupGitRepo(t)
+	sc := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, base, head, config.Commands{})
+	publication := db.CommitStatusPublication{SHA: head, Host: "github.com", Repo: "test/repo", Validated: true}
+	if err := sc.DB.PutCommitStatusPublication(sc.Run.ID, publication); err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{"confirmation", "reporting"} {
+		for _, ending := range []string{"cancel", "deadline"} {
+			t.Run(operation+"/"+ending, func(t *testing.T) {
+				if err := acquireCommitStatusLock(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				defer func() { <-commitStatusLock }()
+				ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+				defer cancel()
+				bounded := *sc
+				bounded.Ctx = ctx
+				done, started := make(chan struct{}), make(chan struct{})
+				go func() {
+					defer close(done)
+					close(started)
+					if operation == "confirmation" {
+						_, err := reconcileCommitStatusAttempt(&bounded)
+						if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+							t.Errorf("confirmation error = %v", err)
+						}
+					} else {
+						commitStatusReporter(&bounded, &publication)(ctx, "failure", "", bounded.Log)
+					}
+				}()
+				<-started
+				if ending == "cancel" {
+					cancel()
+				}
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatal("cancelled reporter remained blocked on shared lock")
+				}
+			})
+		}
+	}
+}
+
 func TestCommitStatusCIReadinessSurvivesPostFailure(t *testing.T) {
 	dir, base, head := setupGitRepo(t)
 	sc := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, base, head, config.Commands{})
@@ -126,9 +321,11 @@ func TestCommitStatusSerializesRecoveryAndNewPublication(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("recovery POST did not reach the endpoint")
 	}
-	if commitStatusMu.TryLock() {
-		commitStatusMu.Unlock()
-		t.Fatal("recovery POST did not hold the shared status mutex")
+	select {
+	case commitStatusLock <- struct{}{}:
+		<-commitStatusLock
+		t.Fatal("recovery POST did not hold the shared status lock")
+	default:
 	}
 	newContext := *sc
 	newContext.Run = newer
@@ -187,6 +384,7 @@ func TestCommitStatusNewerPublicationOwnsStatus(t *testing.T) {
 				defer server.Close()
 				env, _ := fakeGH(t, "")
 				sc.Env = append(env, "FAKE_CLI_STATUS_API_URL="+server.URL)
+				var cachedReport func(context.Context, string, string, func(string))
 				if path == "attempt" {
 					if err := sc.DB.PutCommitStatusAttempt(sc.Run.ID, db.CommitStatusAttempt{CommitStatusPublication: publication, Target: target, Ref: "refs/heads/feature"}); err != nil {
 						t.Fatal(err)
@@ -203,7 +401,7 @@ func TestCommitStatusNewerPublicationOwnsStatus(t *testing.T) {
 						t.Fatal(err)
 					}
 					if path == "cached" {
-						sc.Shared.SetCommitStatusReporter(commitStatusReporter(sc, &publication))
+						cachedReport = commitStatusReporter(sc, &publication)
 					}
 				}
 				newer, err := sc.DB.InsertRun(sc.Repo.ID, "other-feature", head, base)
@@ -271,11 +469,13 @@ func TestCommitStatusNewerPublicationOwnsStatus(t *testing.T) {
 				(&PushStep{}).ReportPublishedHeadStatus(sc, "failure", "")
 				if scope == "same" || scope == "repair head" {
 					beginPublishedCommitStatus(sc)("success")
-					sc.Shared.ReportCommitStatus(sc.Ctx, "success", head, sc.Log)
-					sc.Shared.ReportCommitStatus(sc.Ctx, "failure", "", sc.Log)
+					if cachedReport != nil {
+						cachedReport(sc.Ctx, "success", head, sc.Log)
+						cachedReport(sc.Ctx, "failure", "", sc.Log)
+					}
 				}
 				if path == "attempt" && (scope == "same" || scope == "repair head") {
-					p, err := sc.DB.GetCommitStatusPublication(sc.Run.ID)
+					p, err := sc.DB.GetCommitStatusPublication(sc.Ctx, sc.Run.ID, publication)
 					if err != nil || p != nil {
 						t.Fatalf("old attempt credited with newer push: %+v, %v", p, err)
 					}
@@ -628,8 +828,7 @@ func TestCommitStatusPluginOwnershipSuppressesOrdinaryPosting(t *testing.T) {
 	var warnings []string
 	sc.Log = func(message string) { warnings = append(warnings, message) }
 	// Even an already-installed built-in reporter must yield to plugin ownership.
-	sc.Shared.SetCommitStatusReporter(commitStatusReporter(sc, &publication))
-	sc.Shared.ReportCommitStatus(sc.Ctx, "failure", "", sc.Log)
+	commitStatusReporter(sc, &publication)(sc.Ctx, "failure", "", sc.Log)
 	(&PushStep{}).ReportPublishedHeadStatus(sc, "failure", "")
 	update := beginPublishedCommitStatus(sc)
 	update("success")

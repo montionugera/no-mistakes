@@ -24,31 +24,6 @@ type PublishedHeadStatusReporter interface {
 	ReportPublishedHeadStatus(*StepContext, string, string)
 }
 
-// SetCommitStatusReporter binds a reporter to the exact head just pushed. A
-// later push replaces it; it never derives a SHA from mutable worktree HEAD.
-func (s *RunShared) SetCommitStatusReporter(report func(context.Context, string, string, func(string))) {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.commitStatusReporter = report
-}
-
-func (s *RunShared) ReportCommitStatus(ctx context.Context, state, validatedSHA string, log func(string)) bool {
-	if s == nil {
-		return false
-	}
-	s.mu.Lock()
-	report := s.commitStatusReporter
-	s.mu.Unlock()
-	if report == nil {
-		return false
-	}
-	report(ctx, state, validatedSHA, log)
-	return true
-}
-
 func (e *Executor) reportPublishedHeadStatus(runCtx context.Context, run *db.Run, repo *db.Repo, state string, validatedSHAs ...string) {
 	ctx, cancel := context.WithTimeout(runCtx, commitStatusTimeout)
 	defer cancel()

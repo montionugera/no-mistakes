@@ -103,7 +103,7 @@ func TestRecoverOnStartup_ReplacesPublishedSuccessWithFailure(t *testing.T) {
 					}
 				}
 				(&steps.PushStep{}).ReportPublishedHeadStatus(&pipeline.StepContext{Ctx: context.Background(), DB: d, Run: run, Repo: repo, ForgeContext: forge}, "success", "")
-				publication, err := d.GetCommitStatusPublication(run.ID)
+				publication, err := d.GetCommitStatusPublication(context.Background(), run.ID, db.CommitStatusPublication{SHA: "pushed-head", Host: "github.com", Repo: "test/repo"})
 				if err != nil || publication.LastState != "success" {
 					t.Fatalf("initial publication = %+v, %v", publication, err)
 				}
@@ -190,18 +190,20 @@ func TestStatusRecoveryBounds(t *testing.T) {
 				t.Fatal(err)
 			}
 			var runs []*db.Run
+			paths := make(map[string]bool)
 			for i := 0; i < 10; i++ {
-				run, err := d.InsertRun(repo.ID, fmt.Sprintf("feature-%d", i), "head", "base")
+				run, err := d.InsertRun(repo.ID, fmt.Sprintf("feature-%d", i), fmt.Sprintf("pushed-head-%d", i), "base")
 				if err != nil {
 					t.Fatal(err)
 				}
 				if err := d.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
 					t.Fatal(err)
 				}
-				if err := d.PutCommitStatusPublication(run.ID, db.CommitStatusPublication{SHA: "pushed-head", Host: "github.com", Repo: "test/repo", Validated: true, LastState: "success"}); err != nil {
+				if err := d.PutCommitStatusPublication(run.ID, db.CommitStatusPublication{SHA: run.HeadSHA, Host: "github.com", Repo: "test/repo", Validated: true, LastState: "success"}); err != nil {
 					t.Fatal(err)
 				}
 				runs = append(runs, run)
+				paths["/repos/test/repo/statuses/"+run.HeadSHA] = true
 			}
 			binDir := t.TempDir()
 			cmd := exec.Command("go", "build", "-o", filepath.Join(binDir, "gh"), "../pipeline/fakecli")
@@ -217,7 +219,7 @@ func TestStatusRecoveryBounds(t *testing.T) {
 				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 					t.Error(err)
 				}
-				if r.Method != "POST" || r.URL.Path != "/repos/test/repo/statuses/pushed-head" || payload.State != "failure" || payload.Context != "no-mistakes" {
+				if r.Method != "POST" || !paths[r.URL.Path] || payload.State != "failure" || payload.Context != "no-mistakes" {
 					t.Errorf("request = %s %s %+v", r.Method, r.URL.Path, payload)
 				}
 				requested <- struct{}{}
@@ -288,7 +290,7 @@ func TestStatusRecoveryBounds(t *testing.T) {
 				}
 			}
 			for _, run := range runs {
-				publication, err := d.GetCommitStatusPublication(run.ID)
+				publication, err := d.GetCommitStatusPublication(context.Background(), run.ID, db.CommitStatusPublication{SHA: run.HeadSHA, Host: "github.com", Repo: "test/repo"})
 				if err != nil || publication == nil || publication.LastState != "success" {
 					t.Fatalf("failed posting must preserve the last posted state: %+v, %v", publication, err)
 				}
@@ -390,7 +392,7 @@ func TestRecoverCommitStatusPushAttempt(t *testing.T) {
 				if err != nil || attempt != nil {
 					t.Fatalf("confirmed attempt = %+v, %v", attempt, err)
 				}
-				publication, err := d.GetCommitStatusPublication(run.ID)
+				publication, err := d.GetCommitStatusPublication(context.Background(), run.ID, db.CommitStatusPublication{SHA: head, Host: "github.com", Repo: "test/repo"})
 				if err != nil || publication == nil || publication.SHA != head || publication.LastState != "failure" {
 					t.Fatalf("publication = %+v, %v", publication, err)
 				}
