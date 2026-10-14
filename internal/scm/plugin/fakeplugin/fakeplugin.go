@@ -49,8 +49,8 @@ type State struct {
 	MalformedOn string `json:"malformed_on,omitempty"`
 	// Checks are reported for every PR.
 	Checks []Check `json:"checks"`
-	// MergeWhenChecksPass marks a PR merged at the head the CI step asked
-	// about once a "pr checks" call sees every check passing.
+	// MergeWhenChecksPass marks a PR merged at its observed published head
+	// once a "pr checks" call sees every check passing.
 	MergeWhenChecksPass bool   `json:"merge_when_checks_pass,omitempty"`
 	MergeSHA            string `json:"merge_sha,omitempty"`
 	FailedLogs          string `json:"failed_logs,omitempty"`

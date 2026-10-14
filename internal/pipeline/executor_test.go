@@ -699,7 +699,7 @@ func TestExecutor_SkippedPRStepWithClosingIssueRefsFails(t *testing.T) {
 			exec := NewExecutor(database, p, nil, nil, []Step{pr}, nil)
 			exec.SetSkippedSteps([]types.StepName{types.StepPR})
 
-			err := exec.Execute(context.Background(), run, repo, t.TempDir())
+			err := exec.Execute(context.Background(), run, repo, completionFixture(t, database, run))
 			if got := pr.callCount(); got != 0 {
 				t.Fatalf("skipped PR step executed %d times, want 0", got)
 			}
@@ -739,7 +739,7 @@ func TestExecutor_SkipRemainingPastPRStepWithClosingIssueRefsFails(t *testing.T)
 			pr := newPassStep(types.StepPR)
 			exec := NewExecutor(database, p, nil, nil, []Step{rebase, pr}, nil)
 
-			err := exec.Execute(context.Background(), run, repo, t.TempDir())
+			err := exec.Execute(context.Background(), run, repo, completionFixture(t, database, run))
 			if got := pr.callCount(); got != 0 {
 				t.Fatalf("PR step executed %d times, want 0", got)
 			}
