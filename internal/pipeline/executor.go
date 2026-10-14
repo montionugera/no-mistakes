@@ -1283,9 +1283,10 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			fmt.Fprintln(logFile, text)
 			touchLogActivity(text, true)
 		},
-		CIReadinessChanged: ciReadinessChanged,
-		MarkRunning:        markRunning,
-		OnPRMerged:         e.onPRMerged,
+		CIReadinessChanged:     ciReadinessChanged,
+		PublishedHeadValidated: func(sha string) { e.reportPublishedHeadStatus(ctx, run, repo, "success", sha) },
+		MarkRunning:            markRunning,
+		OnPRMerged:             e.onPRMerged,
 	}
 	if stepName == types.StepReview {
 		BindUncertifiedPipelineRange(sctx)
@@ -2272,6 +2273,7 @@ func (e *Executor) failRun(run *db.Run, repo *db.Repo, err error, ctxs ...contex
 	}
 	run.Status = runStatus
 	run.Error = &errMsg
+	e.ReportPublishedHeadFailure(context.Background(), run, repo)
 	e.emitRunEvent(ipc.EventRunCompleted, run, repo)
 	return err
 }
@@ -2291,6 +2293,7 @@ func (e *Executor) completeRun(run *db.Run, repo *db.Repo) error {
 		run.HeadSHA = verifiedHead
 	}
 	run.Status = types.RunCompleted
+	e.reportPublishedHeadStatus(context.Background(), run, repo, "success")
 	e.emitRunEvent(ipc.EventRunCompleted, run, repo)
 	return nil
 }

@@ -1,6 +1,8 @@
 package pipeline
 
-import "sync"
+import (
+	"sync"
+)
 
 // HousekeepingLintResult is the lint assessment produced by the combined
 // document+lint housekeeping pass: the document step performs both duties in

@@ -637,6 +637,9 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 					check.StartedAt = parsed
 				}
 			case "StatusContext":
+				if strings.TrimSpace(node.Context) == CommitStatusContext {
+					continue
+				}
 				check.Kind = scm.CheckKindStatus
 				check.Name = strings.TrimSpace(node.Context)
 				if node.ID != "" {

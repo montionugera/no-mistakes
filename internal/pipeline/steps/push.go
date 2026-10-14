@@ -14,6 +14,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
+	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/shipping"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -85,6 +86,18 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	if err != nil {
 		return nil, fmt.Errorf("resolve head before push: %w", err)
 	}
+	if resolvedProvider(sctx) == scm.ProviderGitHub && scm.ExtractHost(resolvePushURL(sctx)) != "" {
+		approved, err := sctx.DB.GetRun(sctx.Run.ID)
+		if err != nil {
+			return nil, err
+		}
+		if newHeadSHA != "" || (approved.ReviewApprovedHeadSHA != nil && *approved.ReviewApprovedHeadSHA != headBeingPushed) {
+			if err := recordAgentFixHead(sctx, s.Name(), headBeingPushed); err != nil {
+				return nil, err
+			}
+			return &pipeline.StepOutcome{RestartFrom: types.StepReview}, nil
+		}
+	}
 	if sctx.Run.Shipping != nil {
 		approved, err := sctx.DB.GetRun(sctx.Run.ID)
 		if err != nil {
@@ -150,7 +163,7 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 // attestation's own step statuses forward (a CI repair published without
 // revalidation); pass this run's current steps (sctx.DB.GetStepsByRun) for
 // the ordinary Push step.
-func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate string, attestationSteps []*db.StepResult) error {
+func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate string, attestationSteps []*db.StepResult) (publicationErr error) {
 	ctx := sctx.Ctx
 	ref := normalizedBranchRef(sctx.Run.Branch)
 	branch := strings.TrimPrefix(ref, "refs/heads/")
@@ -201,6 +214,11 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 		return err
 	}
 
+	if !decision.upToDate {
+		if err := recordCommitStatusAttempt(sctx, headBeingPushed, pushURL, ref, attestationSteps != nil && localValidationPassed(sctx, headBeingPushed), attestationSteps == nil && localValidationPassed(sctx, "")); err != nil {
+			statusWarning(sctx.Log, "record publication before push", err)
+		}
+	}
 	switch {
 	case decision.newBranch, decision.fastForward:
 		// A branch absent from the remote creates it, and an append-only update
@@ -222,12 +240,37 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 			return fmt.Errorf("push to %s: %w", pushTarget, err)
 		}
 	}
+	// Resume status reporting for this run's recorded attempt, including a
+	// push whose response was lost. A head already upstream without an attempt
+	// never earns a status.
+	reportStatus := func(string) {}
+	defer func() {
+		if publicationErr != nil {
+			reportStatus("failure")
+		}
+	}()
+	attempt, err := sctx.DB.GetCommitStatusAttempt(sctx.Run.ID)
+	if err != nil {
+		statusWarning(sctx.Log, "read push attempt", err)
+	}
+	if err == nil && attempt != nil && attempt.SHA == headBeingPushed && attempt.Target == safeurl.Redact(pushURL) && attempt.Ref == ref {
+		reportStatus = beginPublishedCommitStatus(sctx)
+	}
 	verifiedRemote, err := lsRemoteSHA(gitRun, pushURL, ref)
 	if err != nil || verifiedRemote != headBeingPushed {
 		if err != nil {
 			return fmt.Errorf("verify successful push to %s: %w", pushTarget, err)
 		}
 		return fmt.Errorf("verify successful push to %s: remote head %s does not equal pushed head %s", pushTarget, verifiedRemote, headBeingPushed)
+	}
+	publication, err := confirmVerifiedCommitStatus(sctx, verifiedRemote, pushURL, ref)
+	if err != nil {
+		statusWarning(sctx.Log, "record verified publication", err)
+	}
+	if publication != nil {
+		report := commitStatusReporter(sctx, publication)
+		reportStatus = func(state string) { report(sctx.Ctx, state, "", sctx.Log) }
+		reportStatus("pending")
 	}
 	// Settle the gate mirror BEFORE recording the publication. The remote
 	// already has the head, but a run is only "published" once the gate mirror
@@ -236,8 +279,8 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 	// a later rerun silently omits.
 	//
 	// Ordering it here is what makes a mirror failure retryable instead of
-	// having to choose between two wrong answers. Nothing durable has been
-	// written yet, so the caller's next attempt re-enters this path, finds the
+	// having to choose between two wrong answers. The custody publication
+	// binding has not been written yet, so the caller's next attempt finds the
 	// remote already at this head (an up-to-date no-op push), and retries the
 	// mirror. The alternative orderings both lose: recording first and
 	// returning the error makes the CI monitor treat an already published
@@ -262,6 +305,9 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 		return err
 	}
 	sctx.Run.HeadSHA = headBeingPushed
+	if attestationSteps != nil && localValidationPassed(sctx, headBeingPushed) {
+		reportStatus("success")
+	}
 	return nil
 }
 

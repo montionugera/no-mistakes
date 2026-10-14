@@ -861,6 +861,9 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					if len(checks) == 0 {
 						passedMsg = ciNoChecksPassedMsg
 					}
+					if sctx.PublishedHeadValidated != nil {
+						sctx.PublishedHeadValidated(pr.HeadSHA)
+					}
 					lastMonitorLog = logCIMonitorStatus(sctx, passedMsg, lastMonitorLog)
 				default:
 					clearCIMonitorReady(sctx)

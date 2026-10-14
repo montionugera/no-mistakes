@@ -119,6 +119,8 @@ type StepContext struct {
 	// step in the same run (e.g. the combined document+lint pass).
 	Shared             *RunShared
 	CIReadinessChanged func(ready, declaredNoCI bool)
+	// PublishedHeadValidated reports the exact forge head whose checks passed.
+	PublishedHeadValidated func(sha string)
 	// MarkRunning tells the executor that a step re-executing as a fix round
 	// has finished its repair and is executing normally again, so the step's
 	// status returns from fixing to running before Execute returns. The CI

@@ -90,14 +90,20 @@ func TestShippingNoSurfaceManagerAdmission(t *testing.T) {
 					}
 					step := &noSurfaceApprovalStep{findings: raw, exit: exit}
 					var final ipc.Event
+					gateReady := make(chan struct{}, 1)
 					executor := pipeline.NewExecutor(database, p, nil, nil, []pipeline.Step{step}, func(event ipc.Event) {
+						if event.Type == ipc.EventStepCompleted && event.StepName != nil && *event.StepName == types.StepTest && event.Status != nil && *event.Status == string(types.StepStatusAwaitingApproval) {
+							gateReady <- struct{}{}
+						}
 						if event.Type == ipc.EventRunCompleted {
 							final = event
 						}
 					})
 					manager := NewRunManager(database, p, nil)
 					manager.executors[run.ID] = executor
-					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					// Gate events follow both registration and persistence, including
+					// recovery. The deadline detects hangs, not admission latency.
+					ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 					defer cancel()
 					done := make(chan error, 1)
 					if recovered {
@@ -121,33 +127,36 @@ func TestShippingNoSurfaceManagerAdmission(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						go func() { done <- executor.Resume(ctx, run, repo, dir) }()
+						go func() {
+							defer close(done)
+							done <- executor.Resume(ctx, run, repo, dir)
+						}()
 					} else {
-						go func() { done <- executor.Execute(ctx, run, repo, dir) }()
+						go func() {
+							defer close(done)
+							done <- executor.Execute(ctx, run, repo, dir)
+						}()
 					}
-					var parked *db.StepResult
-					deadline := time.Now().Add(5 * time.Second)
-					for time.Now().Before(deadline) {
-						select {
-						case err := <-done:
-							t.Fatalf("executor exited before acknowledgment: %v", err)
-						default:
+					defer func() {
+						cancel()
+						for range done {
 						}
-						rows, err := database.GetStepsByRun(run.ID)
-						if err != nil {
-							t.Fatal(err)
-						}
-						if len(rows) == 1 && rows[0].Status == types.StepStatusAwaitingApproval {
-							if err := executor.Respond(types.StepReview, types.ActionApprove, nil); err != nil && strings.Contains(err.Error(), "step mismatch") {
-								parked = rows[0]
-								break
-							}
-						}
-						time.Sleep(time.Millisecond)
-					}
-					if parked == nil {
+					}()
+					select {
+					case <-gateReady:
+					case err := <-done:
+						t.Fatalf("executor exited before acknowledgment: %v", err)
+					case <-ctx.Done():
 						t.Fatal("Test did not park")
 					}
+					rows, err := database.GetStepsByRun(run.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(rows) != 1 || rows[0].Status != types.StepStatusAwaitingApproval || rows[0].FindingsJSON == nil {
+						t.Fatalf("gate event without persisted Test evidence: %+v", rows)
+					}
+					parked := rows[0]
 					original := *parked.FindingsJSON
 					if kind == "override" {
 						if err := database.SetStepOverrideReason(parked.ID, "Recorded override"); err != nil {

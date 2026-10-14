@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/scm/plugin/fakeplugin"
 )
@@ -58,8 +60,69 @@ func handleFakeCLI(mode string) {
 		}
 	}
 	logFakeCLIStdinBody(args, logFile)
+	if forwardCommitStatus(args) {
+		return
+	}
 
 	switch mode {
+	case "git-status-confirmation-pipe-child":
+		time.Sleep(time.Hour)
+		return
+	case "git-status-confirmation-stalled":
+		if fakeGitSubcommand(args) == "ls-remote" {
+			if os.Getenv("FAKE_CLI_INHERITED_PIPE_CHILD") == "1" {
+				child := exec.Command(os.Args[0])
+				child.Env = append(os.Environ(), "FAKE_CLI_MODE=git-status-confirmation-pipe-child")
+				child.Stdout = os.Stdout
+				child.Stderr = os.Stderr
+				if err := child.Start(); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
+			}
+			if err := os.WriteFile(os.Getenv("FAKE_CLI_STARTED_FILE"), []byte("ls-remote"), 0600); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			time.Sleep(time.Hour)
+			return
+		}
+		os.Exit(1)
+	case "gh-git-push-reply-lost", "gh-git-status-confirmation-timeout":
+		if strings.TrimSuffix(filepath.Base(os.Args[0]), filepath.Ext(os.Args[0])) == "git" {
+			statePath := os.Getenv("FAKE_CLI_STATUS_CONFIRMATION_STATE")
+			if mode == "gh-git-status-confirmation-timeout" && fakeGitSubcommand(args) == "ls-remote" {
+				if state, err := os.ReadFile(statePath); err == nil && string(state) == "armed" {
+					if err := os.WriteFile(statePath, []byte("timed-out"), 0600); err != nil {
+						fmt.Fprintln(os.Stderr, err)
+						os.Exit(1)
+					}
+					time.Sleep(time.Hour)
+					return
+				}
+			}
+			cmd := exec.Command(os.Getenv("FAKE_CLI_REAL_GIT"), args...)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			if fakeGitSubcommand(args) == "push" {
+				if mode == "gh-git-push-reply-lost" {
+					fmt.Fprintln(os.Stderr, "lost push response after remote update")
+					os.Exit(1)
+				}
+				if _, err := os.Stat(statePath); os.IsNotExist(err) {
+					if err := os.WriteFile(statePath, []byte("armed"), 0600); err != nil {
+						fmt.Fprintln(os.Stderr, err)
+						os.Exit(1)
+					}
+				}
+			}
+			return
+		}
+		fakeGHHandler(args)
 	case "gh":
 		fakeGHHandler(args)
 	case "glab":
@@ -1107,4 +1170,65 @@ func fakeGraphQLRepo(args []string) string {
 		return ""
 	}
 	return owner + "/" + name
+}
+
+// forwardCommitStatus sends the fake gh API invocation to a local HTTP server.
+// This keeps provider tests at the request boundary without a real gh login.
+func forwardCommitStatus(args []string) bool {
+	base := os.Getenv("FAKE_CLI_STATUS_API_URL")
+	if base == "" || len(args) == 0 || args[0] != "api" {
+		return false
+	}
+	endpoint, method := "", "GET"
+	body := map[string]string{}
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--hostname":
+			i++
+		case "--method", "-X":
+			i++
+			method = args[i]
+		case "-f", "--raw-field":
+			i++
+			k, v, _ := strings.Cut(args[i], "=")
+			body[k] = v
+		default:
+			if strings.HasPrefix(args[i], "repos/") {
+				endpoint = args[i]
+			}
+		}
+	}
+	if !strings.Contains(endpoint, "/statuses/") {
+		return false
+	}
+	if required := os.Getenv("FAKE_CLI_STATUS_REQUIRED_GH_CONFIG_DIR"); required != "" {
+		if os.Getenv("GH_CONFIG_DIR") != required {
+			fmt.Fprintln(os.Stderr, "status requires profile-only GitHub login")
+			os.Exit(1)
+		}
+		for _, key := range []string{"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GH_REPO"} {
+			if _, present := os.LookupEnv(key); present {
+				fmt.Fprintln(os.Stderr, "status profile must suppress ambient GitHub environment")
+				os.Exit(1)
+			}
+		}
+	}
+	data, _ := json.Marshal(body)
+	req, err := http.NewRequest(method, base+"/"+endpoint, strings.NewReader(string(data)))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	io.Copy(os.Stdout, resp.Body)
+	if resp.StatusCode >= 300 {
+		os.Exit(1)
+	}
+	return true
 }
