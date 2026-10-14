@@ -16,19 +16,80 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
-// beginPublishedCommitStatus binds status updates to the immutable SHA sent to
-// git push, and to its target repository (the fork, when configured).
-func beginPublishedCommitStatus(sctx *pipeline.StepContext, sha, target string, validated, ciEligible bool) func(string) {
-	if resolvedProvider(sctx) != scm.ProviderGitHub || scm.ExtractHost(target) == "" {
+// Plugins currently expose PR/CI operations, but no commit-status capability.
+// Their host ownership must also apply to persisted publications from older runs.
+func suppressPluginCommitStatus(sctx *pipeline.StepContext, hosts ...string) bool {
+	name, owned := "", false
+	if sctx.Repo != nil {
+		name, owned = providerPluginForStep(sctx)
+	}
+	if !owned && sctx.Config != nil {
+		for _, host := range hosts {
+			if name, owned = sctx.Config.ProviderPlugins.Select(host, nil); owned {
+				break
+			}
+		}
+	}
+	if owned {
+		statusWarning(sctx.Log, "suppressed", fmt.Errorf("provider plugin %q does not support commit statuses", name))
+	}
+	return owned
+}
+
+func recordCommitStatusAttempt(sctx *pipeline.StepContext, sha, target, ref string, validated, ciEligible bool) error {
+	if suppressPluginCommitStatus(sctx) || resolvedProvider(sctx) != scm.ProviderGitHub || scm.ExtractHost(target) == "" {
+		return nil
+	}
+	p := db.CommitStatusAttempt{CommitStatusPublication: db.CommitStatusPublication{SHA: sha, Host: resolvedHost(sctx, target), Repo: github.RepoSlug(target), Validated: validated, CIEligible: ciEligible}, Target: safeurl.Redact(target), Ref: ref}
+	if p.Repo == "" {
+		return nil
+	}
+	return sctx.DB.PutCommitStatusAttempt(sctx.Run.ID, p)
+}
+
+// reconcileCommitStatusAttempt promotes only an attempted SHA observed at the
+// recorded target ref. It never infers publication from the mutable run head.
+func reconcileCommitStatusAttempt(sctx *pipeline.StepContext) (bool, error) {
+	attempt, err := sctx.DB.GetCommitStatusAttempt(sctx.Run.ID)
+	if err != nil || attempt == nil {
+		return false, err
+	}
+	target := attempt.Target
+	if sctx.Repo != nil {
+		if current := resolvePushURL(sctx); safeurl.Redact(current) == target {
+			target = current
+		}
+	}
+	remote, err := lsRemoteSHA(func(args ...string) (string, error) { return stepGitRun(sctx, args...) }, target, attempt.Ref)
+	if err != nil {
+		return false, err
+	}
+	if remote != attempt.SHA {
+		return false, nil
+	}
+	if err := sctx.DB.ConfirmCommitStatusAttempt(sctx.Run.ID, attempt.CommitStatusPublication); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func beginPublishedCommitStatus(sctx *pipeline.StepContext) func(string) {
+	if suppressPluginCommitStatus(sctx) {
 		return func(string) {}
 	}
-	hostName := resolvedHost(sctx, target)
-	publication := &db.CommitStatusPublication{SHA: sha, Host: hostName, Repo: github.RepoSlug(target), Validated: validated, CIEligible: ciEligible}
-	if publication.Repo == "" {
+	confirmed, err := reconcileCommitStatusAttempt(sctx)
+	if err != nil {
+		statusWarning(sctx.Log, "confirm pushed head", err)
+	}
+	if !confirmed {
 		return func(string) {}
 	}
-	if err := sctx.DB.PutCommitStatusPublication(sctx.Run.ID, *publication); err != nil {
-		statusWarning(sctx.Log, "record pushed head", err)
+	publication, err := sctx.DB.GetCommitStatusPublication(sctx.Run.ID)
+	if err != nil {
+		statusWarning(sctx.Log, "read pushed head", err)
+	}
+	if publication == nil {
+		return func(string) {}
 	}
 	report := commitStatusReporter(sctx, publication)
 	sctx.Shared.SetCommitStatusReporter(report)
@@ -54,6 +115,9 @@ func commitStatusReporter(sctx *pipeline.StepContext, publication *db.CommitStat
 	var mu sync.Mutex
 	lastState := publication.LastState
 	report := func(ctx context.Context, state, validatedSHA string, log func(string)) {
+		if suppressPluginCommitStatus(sctx, publication.Host) {
+			return
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		if state == "success" && publication.CIEligible && validatedSHA == publication.SHA {
@@ -91,7 +155,14 @@ func commitStatusReporter(sctx *pipeline.StepContext, publication *db.CommitStat
 }
 
 func (*PushStep) ReportPublishedHeadStatus(sctx *pipeline.StepContext, state, validatedSHA string) {
-	if sctx.Shared.ReportCommitStatus(sctx.Ctx, state, validatedSHA, sctx.Log) {
+	if suppressPluginCommitStatus(sctx) {
+		return
+	}
+	confirmed, err := reconcileCommitStatusAttempt(sctx)
+	if err != nil {
+		statusWarning(sctx.Log, "reconcile push attempt", err)
+	}
+	if !confirmed && sctx.Shared.ReportCommitStatus(sctx.Ctx, state, validatedSHA, sctx.Log) {
 		return
 	}
 	publication, err := sctx.DB.GetCommitStatusPublication(sctx.Run.ID)
@@ -104,6 +175,9 @@ func (*PushStep) ReportPublishedHeadStatus(sctx *pipeline.StepContext, state, va
 	}
 	report := commitStatusReporter(sctx, publication)
 	sctx.Shared.SetCommitStatusReporter(report)
+	if confirmed {
+		report(sctx.Ctx, "pending", "", sctx.Log)
+	}
 	report(sctx.Ctx, state, validatedSHA, sctx.Log)
 }
 

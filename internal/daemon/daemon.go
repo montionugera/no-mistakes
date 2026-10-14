@@ -518,12 +518,26 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 func reportRecoveredCommitStatuses(parent context.Context, d *db.DB, p *paths.Paths, mgr *RunManager, runs []*db.Run, timeout time.Duration) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
+	ids, err := d.CommitStatusRecoveryRunIDs(ctx)
+	if err != nil {
+		slog.Warn("failed to read terminal commit status updates", "error", err)
+		return
+	}
+	seen := make(map[string]bool, len(ids))
+	for _, run := range runs {
+		seen[run.ID] = true
+	}
+	for _, id := range ids {
+		if !seen[id] {
+			runs = append(runs, &db.Run{ID: id})
+		}
+	}
 	for _, stale := range runs {
 		if ctx.Err() != nil {
 			return
 		}
 		run, err := d.GetRun(stale.ID)
-		if err != nil || run == nil || run.Status != types.RunFailed {
+		if err != nil || run == nil || (run.Status != types.RunFailed && run.Status != types.RunCancelled && run.Status != types.RunCompleted) {
 			continue
 		}
 		repo, err := d.GetRepo(run.RepoID)
@@ -531,7 +545,7 @@ func reportRecoveredCommitStatuses(parent context.Context, d *db.DB, p *paths.Pa
 			slog.Warn("failed to read repository for commit status recovery", "run", run.ID, "error", err)
 			continue
 		}
-		pipeline.NewExecutor(d, p, nil, nil, []pipeline.Step{&steps.PushStep{}}, mgr.broadcast).ReportPublishedHeadFailure(ctx, run, repo)
+		pipeline.NewExecutor(d, p, nil, nil, []pipeline.Step{&steps.PushStep{}}, mgr.broadcast).ReportRecoveredPublishedHeadStatus(ctx, run, repo)
 	}
 }
 

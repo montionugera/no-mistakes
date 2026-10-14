@@ -64,6 +64,22 @@ func handleFakeCLI(mode string) {
 	}
 
 	switch mode {
+	case "gh-git-push-reply-lost":
+		if strings.TrimSuffix(filepath.Base(os.Args[0]), filepath.Ext(os.Args[0])) == "git" {
+			cmd := exec.Command(os.Getenv("FAKE_CLI_REAL_GIT"), args...)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			if fakeGitSubcommand(args) == "push" {
+				fmt.Fprintln(os.Stderr, "lost push response after remote update")
+				os.Exit(1)
+			}
+			return
+		}
+		fakeGHHandler(args)
 	case "gh":
 		fakeGHHandler(args)
 	case "glab":

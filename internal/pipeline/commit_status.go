@@ -12,6 +12,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/forgecontext"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
+	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -61,6 +62,7 @@ func (e *Executor) reportPublishedHeadStatus(runCtx context.Context, run *db.Run
 		}
 		e.emitLogChunk(run, repo, types.StepPush, message+"\n")
 	}
+	statusConfig := e.config
 	forge := e.forge
 	if forge == nil {
 		var profiles config.ForgeProfiles
@@ -73,6 +75,19 @@ func (e *Executor) reportPublishedHeadStatus(runCtx context.Context, run *db.Run
 			global, err = config.LoadGlobal(e.paths.ConfigFile())
 			if err == nil {
 				profiles, plugins = global.ForgeProfiles, global.ProviderPlugins
+				statusConfig = config.Merge(global, &config.RepoConfig{})
+			}
+		}
+		if err == nil {
+			remote := repo.UpstreamURL
+			if remote == "" && run.PRURL != nil {
+				remote = *run.PRURL
+			}
+			if name, owned := plugins.Select(scm.ExtractHost(remote), func() string { return scm.ResolveHost(ctx, remote) }); owned {
+				message := fmt.Sprintf("warning: no-mistakes commit status suppressed: provider plugin %q does not support commit statuses", name)
+				slog.Warn(message)
+				log(message)
+				return
 			}
 		}
 		if err == nil {
@@ -88,7 +103,7 @@ func (e *Executor) reportPublishedHeadStatus(runCtx context.Context, run *db.Run
 			return
 		}
 	}
-	sctx := &StepContext{Ctx: ctx, Run: run, Repo: repo, DB: e.db, Config: e.config, ForgeContext: forge, WorkDir: e.workDir, Shared: e.shared, Log: log}
+	sctx := &StepContext{Ctx: ctx, Run: run, Repo: repo, DB: e.db, Config: statusConfig, ForgeContext: forge, WorkDir: e.workDir, Shared: e.shared, Log: log}
 	for _, step := range e.steps {
 		if reporter, ok := step.(PublishedHeadStatusReporter); ok {
 			validatedSHA := ""
@@ -102,4 +117,17 @@ func (e *Executor) reportPublishedHeadStatus(runCtx context.Context, run *db.Run
 
 func (e *Executor) ReportPublishedHeadFailure(ctx context.Context, run *db.Run, repo *db.Repo) {
 	e.reportPublishedHeadStatus(ctx, run, repo, "failure")
+}
+
+// ReportRecoveredPublishedHeadStatus reconciles the durable terminal outcome,
+// including runs terminalized before a crash that interrupted their final POST.
+func (e *Executor) ReportRecoveredPublishedHeadStatus(ctx context.Context, run *db.Run, repo *db.Repo) {
+	if info, err := os.Stat(repo.WorkingPath); err == nil && info.IsDir() {
+		e.workDir = repo.WorkingPath
+	}
+	state := "failure"
+	if run.Status == types.RunCompleted {
+		state = "success"
+	}
+	e.reportPublishedHeadStatus(ctx, run, repo, state)
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -15,17 +16,19 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/forgecontext"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
+	"github.com/kunchenguid/no-mistakes/internal/testgit"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 type statusRequest struct{ Path, State, Context, Description, TargetURL string }
 
 func TestPipeline_GitHubCommitStatuses(t *testing.T) {
-	for _, scenario := range []string{"pass", "fail after push", "cancel after push", "no push", "forgejo", "bitbucket", "repair head", "posting fails", "already upstream", "fork", "formatter head", "recovered failure", "CI repair readiness", "Test no-go exception", "Test inconclusive exception", "skipped Test", "late Document", "late Lint", "stale tested head"} {
+	for _, scenario := range []string{"pass", "push reply lost", "fail after push", "cancel after push", "no push", "forgejo", "bitbucket", "repair head", "posting fails", "already upstream", "attempt already upstream", "fork", "formatter head", "recovered failure", "CI repair readiness", "Test no-go exception", "Test inconclusive exception", "skipped Test", "late Document", "late Lint", "stale tested head"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir, base, head := setupGitRepo(t)
 			remote := t.TempDir()
@@ -34,7 +37,7 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 			sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, base, head, config.Commands{})
 			gitCmd(t, dir, "remote", "set-url", "origin", "https://github.com/test/repo")
 			sctx.Repo.URLsVerified = true
-			if scenario == "already upstream" {
+			if scenario == "already upstream" || scenario == "attempt already upstream" {
 				gitCmd(t, dir, "push", "origin", "HEAD:refs/heads/feature")
 			}
 			if scenario == "fork" {
@@ -75,6 +78,21 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 			env = append(env, "FAKE_CLI_STATUS_API_URL="+server.URL)
 			for key, value := range environmentEntries(t, env) {
 				t.Setenv(key, value)
+			}
+			if scenario == "push reply lost" {
+				gh, err := exec.LookPath("gh")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Link(gh, filepath.Join(filepath.Dir(gh), "git")); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("FAKE_CLI_MODE", "gh-git-push-reply-lost")
+				realGit, err := testgit.RealGit()
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("FAKE_CLI_REAL_GIT", realGit)
 			}
 			provider := scm.ProviderGitHub
 			if scenario == "forgejo" {
@@ -196,6 +214,11 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 				}
 				return &pipeline.StepOutcome{}, nil
 			}})
+			if scenario == "attempt already upstream" {
+				if err := sctx.DB.PutCommitStatusAttempt(sctx.Run.ID, db.CommitStatusAttempt{CommitStatusPublication: db.CommitStatusPublication{SHA: head, Host: "github.com", Repo: "test/repo", Validated: true}, Target: "https://github.com/test/repo", Ref: "refs/heads/feature"}); err != nil {
+					t.Fatal(err)
+				}
+			}
 			appPaths := paths.WithRoot(t.TempDir())
 			if err := appPaths.EnsureDirs(); err != nil {
 				t.Fatal(err)
@@ -236,7 +259,7 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 			} else {
 				err = exec.Execute(context.Background(), sctx.Run, sctx.Repo, dir)
 			}
-			wantError := scenario == "fail after push" || scenario == "cancel after push"
+			wantError := scenario == "push reply lost" || scenario == "fail after push" || scenario == "cancel after push"
 			if (err != nil) != wantError {
 				t.Fatalf("Execute = %v, wantError %v", err, wantError)
 			}
@@ -267,6 +290,12 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 				}
 				if scenario == "repair head" || scenario == "CI repair readiness" {
 					want = append(want, statusRequest{Path: "/repos/test/repo/statuses/" + repaired, State: "pending"}, statusRequest{Path: "/repos/test/repo/statuses/" + repaired, State: "success"})
+				}
+			}
+			if scenario == "push reply lost" {
+				want = []statusRequest{{Path: "/repos/test/repo/statuses/" + head, State: "pending"}, {Path: "/repos/test/repo/statuses/" + head, State: "failure"}}
+				if ciCalls != 0 {
+					t.Fatal("CI ran after a lost push response")
 				}
 			}
 			if uncertified {
@@ -309,5 +338,34 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCommitStatusPluginOwnershipSuppressesOrdinaryPosting(t *testing.T) {
+	dir, base, head := setupGitRepo(t)
+	sc := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, base, head, config.Commands{})
+	sc.Config.ProviderPlugins = config.ProviderPlugins{"custom": {Command: "unavailable-plugin", Hosts: []string{"github.com"}}}
+	sc.ForgeContext = &forgecontext.Context{Provider: scm.ProviderGitHub, Host: "github.com"}
+	env, logFile := fakeGH(t, "")
+	sc.Env = env
+	publication := db.CommitStatusPublication{SHA: head, Host: "github.com", Repo: "test/repo", Validated: true}
+	if err := sc.DB.PutCommitStatusPublication(sc.Run.ID, publication); err != nil {
+		t.Fatal(err)
+	}
+	var warnings []string
+	sc.Log = func(message string) { warnings = append(warnings, message) }
+	// Even an already-installed built-in reporter must yield to plugin ownership.
+	sc.Shared.SetCommitStatusReporter(commitStatusReporter(sc, &publication))
+	sc.Shared.ReportCommitStatus(sc.Ctx, "failure", "", sc.Log)
+	(&PushStep{}).ReportPublishedHeadStatus(sc, "failure", "")
+	update := beginPublishedCommitStatus(sc)
+	update("success")
+	if out, err := os.ReadFile(logFile); err == nil && len(out) != 0 {
+		t.Fatalf("plugin-owned ordinary posting invoked gh: %s", out)
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(warnings) == 0 || !strings.Contains(strings.Join(warnings, "\n"), "does not support commit statuses") {
+		t.Fatalf("missing suppression warning: %v", warnings)
 	}
 }

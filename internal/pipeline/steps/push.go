@@ -214,6 +214,11 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 		return err
 	}
 
+	if !decision.upToDate {
+		if err := recordCommitStatusAttempt(sctx, headBeingPushed, pushURL, ref, attestationSteps != nil && localValidationPassed(sctx, headBeingPushed), attestationSteps == nil && localValidationPassed(sctx, "")); err != nil {
+			return fmt.Errorf("record publication before push: %w", err)
+		}
+	}
 	switch {
 	case decision.newBranch, decision.fastForward:
 		// A branch absent from the remote creates it, and an append-only update
@@ -235,10 +240,16 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 			return fmt.Errorf("push to %s: %w", pushTarget, err)
 		}
 	}
-	// Record only an actual successful push, never a SHA found already upstream.
+	// Resume status reporting for this run's recorded attempt, including a
+	// push whose response was lost. A head already upstream without an attempt
+	// never earns a status.
 	reportStatus := func(string) {}
-	if !decision.upToDate {
-		reportStatus = beginPublishedCommitStatus(sctx, headBeingPushed, pushURL, attestationSteps != nil && localValidationPassed(sctx, headBeingPushed), attestationSteps == nil && localValidationPassed(sctx, ""))
+	attempt, err := sctx.DB.GetCommitStatusAttempt(sctx.Run.ID)
+	if err != nil {
+		statusWarning(sctx.Log, "read push attempt", err)
+	}
+	if err == nil && attempt != nil && attempt.SHA == headBeingPushed && attempt.Target == safeurl.Redact(pushURL) && attempt.Ref == ref {
+		reportStatus = beginPublishedCommitStatus(sctx)
 		defer func() {
 			if publicationErr != nil {
 				reportStatus("failure")
@@ -259,8 +270,8 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 	// a later rerun silently omits.
 	//
 	// Ordering it here is what makes a mirror failure retryable instead of
-	// having to choose between two wrong answers. Nothing durable has been
-	// written yet, so the caller's next attempt re-enters this path, finds the
+	// having to choose between two wrong answers. The custody publication
+	// binding has not been written yet, so the caller's next attempt finds the
 	// remote already at this head (an up-to-date no-op push), and retries the
 	// mirror. The alternative orderings both lose: recording first and
 	// returning the error makes the CI monitor treat an already published
