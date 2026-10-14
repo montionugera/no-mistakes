@@ -43,9 +43,9 @@ import (
 // test files. The harness setup is the expensive part; reusing it across
 // scenarios keeps the suite tight.
 func TestUserJourney(t *testing.T) {
-	// Subtests run sequentially: each one calls t.Setenv to point env
-	// vars at its own temp dirs, and t.Setenv is incompatible with
-	// t.Parallel. Keep the package timeout sized for all serial runs.
+	// Subtests run sequentially within a process: each one calls t.Setenv to
+	// point env vars at its own temp dirs, and t.Setenv is incompatible with
+	// t.Parallel. The e2e wrapper partitions these cases across processes.
 	for _, agentName := range []string{"claude", "codex", "grok", "opencode", "antigravity"} {
 		agentName := agentName
 		t.Run(agentName, func(t *testing.T) {
