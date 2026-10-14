@@ -286,7 +286,7 @@ Check the [Provider Integration](/no-mistakes/guides/provider-integration/) requ
 - Self-hosted Gitea isn't detected because `tea` has no login configured for the host; run `tea logins add --url https://your-gitea.example.com --token <token> --name <name>` so detection finds it. See [Self-hosted Gitea](/no-mistakes/guides/provider-integration/#self-hosted-gitea).
 - Self-hosted Forgejo reached over an SSH origin isn't detected until `FORGEJO_BASE_URL` is set in the daemon's environment; when the instance serves SSH from a hostname other than its web host (Forgejo's `SSH_DOMAIN` setting), also set `FORGEJO_SSH_DOMAIN`, or the origin still fails to match the instance. See [Forgejo](/no-mistakes/guides/provider-integration/#forgejo).
 - `FORGEJO_SSH_DOMAIN` is set, but a `tea` login for the same host, such as one left from an earlier split-host workaround, is matched first and routes the repository to Gitea; with `tea` not installed or not logged in, ordinary guarded network runs fail at PR-context resolution with `tea CLI is not installed` or `tea CLI is not authenticated`. Remove the login with `tea logins delete <name>`. See [`FORGEJO_SSH_DOMAIN`](/no-mistakes/reference/environment/#forgejo_ssh_domain).
-- A non-GitHub repo record has a fork URL set; fork MR/PR routing is currently GitHub-only
+- A non-GitHub repo record has a fork URL set; host construction refuses this unsupported route, so an ordinary guarded run fails before Rebase. Fork MR/PR routing is currently GitHub-only
 - You pushed the effective PR base branch (see the [PR step's skip rules](/no-mistakes/reference/pipeline-steps/#pr))
 
 ## CI step stuck or timed out

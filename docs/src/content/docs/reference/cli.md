@@ -732,8 +732,8 @@ no-mistakes doctor
 Checks:
 
 - `git` binary
-- `gh` CLI (optional, needed for GitHub PR and CI steps)
-- `az` CLI (optional, needed for Azure DevOps PR and CI steps)
+- `gh` CLI (reported as optional by `doctor`; required for guarded GitHub network runs, including PR and CI)
+- `az` CLI (reported as optional by `doctor`; required for guarded Azure DevOps network runs, including PR and CI)
 - Data directory (`~/.no-mistakes/`)
 - SQLite database
 - Daemon status

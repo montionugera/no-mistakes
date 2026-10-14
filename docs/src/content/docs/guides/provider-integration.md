@@ -106,7 +106,7 @@ The GitHub PR step opens PRs with a fork-qualified head such as `your-user:featu
 Re-running `no-mistakes init` later preserves the stored fork URL unless you pass a new `--fork-url`.
 
 Fork routing currently requires both `origin` and `--fork-url` to be GitHub remotes with owner/repo paths.
-GitLab, Forgejo, Bitbucket, Azure DevOps, Gitea, and provider plugins do not implement fork MR/PR routing yet; if a legacy or manually edited repo record has `fork_url` set for those providers, PR creation skips instead of opening an unsafe self PR.
+GitLab, Forgejo, Bitbucket, Azure DevOps, Gitea, and provider plugins do not implement fork MR/PR routing yet. If a legacy or manually edited repo record has `fork_url` set for those providers, host construction refuses the routing and an ordinary guarded run fails at PR-context resolution before Rebase. The PR and CI delivery adapters can record a skip if reached directly; that adapter behavior does not bypass the comparison guard or open a PR from the upstream repository to itself.
 
 #### Workflow-file changes require the `workflow` scope
 
@@ -154,7 +154,7 @@ FORGEJO_BASE_URL=https://forgejo.example forgejo-axi status --json
 
 Failed-log retrieval uses forgejo-axi's stable `run view --log-failed --json` command only when the runtime probe advertises commit statuses, Actions runs, run jobs, and job logs. `no-mistakes` accepts only a failing status's canonical native Actions target, verifies the exact run and freshly polled PR head, validates every returned job's run identity, and returns non-empty failed-job logs in deterministic order under the aggregate 1 MiB ceiling. Live testing against Forgejo 16.0.1 proves identity-matched retrieval through those routes. On Forgejo 15.0.5, commit-status gating, mergeability checks, and merged-state proof remain available when job and log routes are unavailable.
 
-Fork PR routing is not implemented for Forgejo; a configured `fork_url` makes the PR step skip rather than opening a self PR.
+Fork PR routing is not implemented for Forgejo. A configured `fork_url` makes host construction refuse the routing, so an ordinary guarded run fails at PR-context resolution before Rebase. See the [fork-routing contract](#github-fork-contributions) above.
 
 ## Bitbucket Cloud
 

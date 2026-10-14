@@ -318,9 +318,10 @@ These built-in-provider features have no plugin subcommand:
 
 - Fork PR routing: the adapter refuses a repository with a fork URL with the
   reason `fork PR routing for provider plugin "<name>" is not implemented`.
-  PR-context resolution fails on that refusal; if encountered in a delivery
-  step, it is recorded as a skip. It never opens a PR from the upstream
-  repository to itself.
+  Ordinary guarded runs fail at PR-context resolution before Rebase on that
+  refusal. Only the PR and CI delivery adapters record a skip if reached;
+  that skip does not bypass the comparison guard. It never opens a PR from
+  the upstream repository to itself.
 - Review-bot findings and transient-check reruns at the CI gate.
 - `axi run --closes` closing references (refused, as on every provider that does
   not declare the closing-reference capability) and GitHub media attachments.

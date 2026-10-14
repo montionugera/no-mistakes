@@ -293,7 +293,7 @@ Creates or updates a pull request.
 
 **Adapter skip rules:**
 
-Ordinary guarded network runs check provider availability before Rebase and at later comparison boundaries. An unsupported host, missing tools or credentials, or an unavailable plugin fails that check instead of completing with skipped delivery. The availability skips below describe the PR adapter if reached; a later boundary still fails if the provider remains unavailable.
+Ordinary guarded network runs check provider availability before Rebase and at later comparison boundaries. An unsupported host or fork route, missing tools or credentials, or an unavailable plugin fails that check instead of completing with skipped delivery. The availability skips below describe the PR adapter if reached; a later boundary still fails if the provider remains unavailable.
 
 - The branch is the effective PR base described in the scope rules at the top of this page
 - The upstream host is not GitHub, GitLab, Forgejo, Bitbucket Cloud (`bitbucket.org`), Azure DevOps (`dev.azure.com` / `*.visualstudio.com`), or Gitea, and no [provider plugin](/no-mistakes/reference/provider-plugin-protocol/) claims it
@@ -302,7 +302,7 @@ Ordinary guarded network runs check provider availability before Rebase and at l
 - The provider CLI is not authenticated for GitHub, GitLab, Forgejo, or Gitea (GitHub reports a timed-out or interrupted `gh auth status` separately from auth failure; either still skips)
 - Bitbucket Cloud credentials are missing (`NO_MISTAKES_BITBUCKET_EMAIL` or `NO_MISTAKES_BITBUCKET_API_TOKEN`)
 - The `az` CLI with the `azure-devops` extension is not installed or not authenticated for Azure DevOps
-- A legacy or manually edited non-GitHub repo record has `fork_url` set, because fork MR/PR routing is currently GitHub-only (this includes provider-plugin hosts)
+- A legacy or manually edited non-GitHub repo record has `fork_url` set, because fork MR/PR routing is currently GitHub-only (this includes provider-plugin hosts). Host construction refuses that route, so ordinary guarded runs fail before Rebase; only the delivery adapter itself records a skip if reached
 
 **Behavior:**
 - Checks for an existing PR on the branch, matching by branch alone rather than filtering by base, so a still-open PR against a since-changed [`pr.base_branch`](/no-mistakes/reference/repo-config/#prbase_branch) is found and updated instead of orphaned behind a duplicate

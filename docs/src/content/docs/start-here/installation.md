@@ -82,7 +82,7 @@ This fork's source build uses its release-please version baseline and records th
 
 - **git** - required
 - **One supported agent runner** - `claude`, `codex`, `grok`, `acli` (Rovo Dev), `opencode`, `pi`, `omp`, `copilot`, or `agy` (Antigravity), or a configured Cursor, Devin, or other ACP runner such as `agent: cursor` or `agent: devin`; see [Global Config](/no-mistakes/reference/global-config/) for ACP requirements
-- **Optional, for PRs and CI:**
+- **Required for guarded network runs, including PRs and CI; choose the matching provider:**
   - `gh` CLI (GitHub)
   - `glab` CLI (GitLab)
   - `forgejo-axi` (Forgejo)
@@ -94,7 +94,7 @@ This fork's source build uses its release-please version baseline and records th
 Run `no-mistakes doctor` to check native agents, ACP aliases such as `cursor` and `devin`, provider tools, configured provider plugins, and whether the configured global runner can start a validation gate.
 Every validation gate requires a runnable pipeline agent and otherwise fails before its first pipeline step.
 
-See [Provider Integration](/no-mistakes/guides/provider-integration/) for PR and CI setup per host.
+Ordinary guarded network runs fail before Rebase when their provider is unavailable or routing is unsupported, even when delivery steps are skipped. Eligible local-only targets can run without a provider; [Provider Integration](/no-mistakes/guides/provider-integration/) owns setup and the local-only exception.
 
 ## Update
 
