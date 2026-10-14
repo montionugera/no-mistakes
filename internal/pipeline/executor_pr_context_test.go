@@ -10,6 +10,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/git"
+	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -75,7 +76,15 @@ func TestExecutorParkedApprovalRevalidatesPRTargetBeforeFinalStepCompletes(t *te
 			return &StepOutcome{ReviewedPaths: []string{"main.go"}, ReviewablePaths: []string{"main.go"}, ReviewApprovedHeadSHA: sctx.Run.HeadSHA, ReviewComparisonGeneration: reviewComparison.Generation}, nil
 		}},
 	}
-	executor := NewExecutor(database, p, nil, nil, steps, nil)
+	var executor *Executor
+	executor = NewExecutor(database, p, nil, nil, steps, func(event ipc.Event) {
+		if event.Type == ipc.EventStepCompleted && event.StepName != nil && *event.StepName == types.StepReview &&
+			event.Status != nil && *event.Status == string(types.StepStatusAwaitingApproval) {
+			if err := executor.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
 	checks := 0
 	executor.SetPRContextGuard(func(_ *StepContext, name types.StepName) (PRContextDecision, error) {
 		checks++
@@ -87,9 +96,6 @@ func TestExecutorParkedApprovalRevalidatesPRTargetBeforeFinalStepCompletes(t *te
 		}
 		return PRContextDecision{Target: PRTargetSelection{TargetBranch: "develop"}}, nil
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	done := make(chan error, 1)
 	workDir := completionFixture(t, database, run)
 	if err := os.WriteFile(workDir+"/main.go", []byte("package main\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -101,20 +107,7 @@ func TestExecutorParkedApprovalRevalidatesPRTargetBeforeFinalStepCompletes(t *te
 		t.Fatal(err)
 	}
 	advanceCompletionFixture(t, database, run, workDir)
-	go func() { done <- executor.Execute(ctx, run, repo, workDir) }()
-	for approvals := 0; approvals < 2; approvals++ {
-		deadline := time.Now().Add(3 * time.Second)
-		for {
-			if err := executor.Respond(types.StepReview, types.ActionApprove, nil); err == nil {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("review never parked for approval")
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-	if err := <-done; err != nil {
+	if err := executor.Execute(context.Background(), run, repo, workDir); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(observed, []types.StepName{types.StepRebase, types.StepReview, types.StepRebase, types.StepReview}) {
@@ -210,9 +203,7 @@ func TestExecutorReviewPendingTestClaimAdvancesToOwnerStep(t *testing.T) {
 				return &StepOutcome{Findings: findings}, nil
 			}},
 		}, nil)
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		err := executor.Execute(ctx, run, repo, workDir)
+		err := executor.Execute(context.Background(), run, repo, workDir)
 		if !missingProof {
 			if err != nil {
 				t.Fatalf("valid completion baseline: %v", err)
@@ -889,7 +880,22 @@ func TestExecutorRecoveredApprovalRevalidatesMovedPRTargetBeforeUsingParkedVerdi
 			return &StepOutcome{ReviewedPaths: []string{"main.go"}, ReviewablePaths: []string{"main.go"}, ReviewApprovedHeadSHA: run.HeadSHA, ReviewComparisonGeneration: reviewComparison.Generation}, nil
 		}},
 	}
-	executor := NewExecutor(database, p, nil, nil, steps, nil)
+	var executor *Executor
+	executor = NewExecutor(database, p, nil, nil, steps, func(event ipc.Event) {
+		if event.Type == ipc.EventStepCompleted && event.StepName != nil && *event.StepName == types.StepReview &&
+			event.Status != nil && *event.Status == string(types.StepStatusAwaitingApproval) {
+			rounds, err := database.GetRoundsByStep(review.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rounds) != 2 {
+				t.Fatalf("approval used parked review before revalidation: rounds=%d", len(rounds))
+			}
+			if err := executor.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
 	executor.workDir = workDir
 	checks := 0
 	executor.SetPRContextGuard(func(_ *StepContext, name types.StepName) (PRContextDecision, error) {
@@ -902,35 +908,9 @@ func TestExecutorRecoveredApprovalRevalidatesMovedPRTargetBeforeUsingParkedVerdi
 		}
 		return PRContextDecision{Target: PRTargetSelection{TargetBranch: "develop"}}, nil
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- executor.Resume(ctx, run, repo, workDir) }()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		rounds, err := database.GetRoundsByStep(review.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		currentReview, err := database.GetStepResult(review.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(rounds) == 2 && currentReview.Status == types.StepStatusAwaitingApproval {
-			if err := executor.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
-				t.Fatal(err)
-			}
-			break
-		}
-		if len(rounds) == 2 && currentReview.Status == types.StepStatusCompleted {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("fresh review did not complete or park: rounds=%d status=%s", len(rounds), currentReview.Status)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if err := <-done; err != nil {
+	// A carried warning may park the fresh review. Answer its gate event above
+	// rather than imposing a wall-clock deadline on the restart's DB writes.
+	if err := executor.Resume(context.Background(), run, repo, workDir); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(observed, []types.StepName{types.StepRebase, types.StepReview}) {

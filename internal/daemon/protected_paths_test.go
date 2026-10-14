@@ -320,9 +320,6 @@ func (s *protectedPathPushRetryStep) Execute(sctx *pipeline.StepContext) (*pipel
 }
 
 func TestProtectedPathPushApprovalCannotSkipPublicationOrDiscardEdits(t *testing.T) {
-	// Keep the push's attestation lookup inside the test: without a stub gh it
-	// leaves the machine (see writeMockGHNoPR).
-	t.Setenv("PATH", writeMockGHNoPR(t, t.TempDir())+string(os.PathListSeparator)+os.Getenv("PATH"))
 	p, database := startTestDaemonWithSteps(t, func() []pipeline.Step {
 		return []pipeline.Step{&protectedPathPushRetryStep{}}
 	})
@@ -346,7 +343,9 @@ func TestProtectedPathPushApprovalCannotSkipPublicationOrDiscardEdits(t *testing
 	t.Logf("trusted main config:\n%s\npushed feature config:\n%s", gitOutput(t, p.RepoDir(repo.ID), "show", "refs/heads/main:.no-mistakes.yaml"), gitOutput(t, p.RepoDir(repo.ID), "show", "refs/heads/feature:.no-mistakes.yaml"))
 	publicationDir := filepath.Join(t.TempDir(), "published.git")
 	gitCmd(t, "", "init", "--bare", publicationDir)
-	if _, err := database.UpdateRepoForkURL(repo.ID, publicationDir); err != nil {
+	// Both comparison and publication are local Git operations; this fixture
+	// has no forge or PR whose source identity needs an attestation lookup.
+	if _, err := database.UpdateRepoMetadataWithFork(repo.ID, p.RepoDir(repo.ID), publicationDir, repo.DefaultBranch); err != nil {
 		t.Fatal(err)
 	}
 	client, err := ipc.Dial(p.Socket())
