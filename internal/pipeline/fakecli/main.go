@@ -1142,6 +1142,18 @@ func forwardCommitStatus(args []string) bool {
 	if !strings.Contains(endpoint, "/statuses/") {
 		return false
 	}
+	if required := os.Getenv("FAKE_CLI_STATUS_REQUIRED_GH_CONFIG_DIR"); required != "" {
+		if os.Getenv("GH_CONFIG_DIR") != required {
+			fmt.Fprintln(os.Stderr, "status requires profile-only GitHub login")
+			os.Exit(1)
+		}
+		for _, key := range []string{"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GH_REPO"} {
+			if _, present := os.LookupEnv(key); present {
+				fmt.Fprintln(os.Stderr, "status profile must suppress ambient GitHub environment")
+				os.Exit(1)
+			}
+		}
+	}
 	data, _ := json.Marshal(body)
 	req, err := http.NewRequest(method, base+"/"+endpoint, strings.NewReader(string(data)))
 	if err != nil {

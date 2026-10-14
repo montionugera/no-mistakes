@@ -3,11 +3,15 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/forgecontext"
+	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -57,7 +61,34 @@ func (e *Executor) reportPublishedHeadStatus(runCtx context.Context, run *db.Run
 		}
 		e.emitLogChunk(run, repo, types.StepPush, message+"\n")
 	}
-	sctx := &StepContext{Ctx: ctx, Run: run, Repo: repo, DB: e.db, Config: e.config, ForgeContext: e.forge, WorkDir: e.workDir, Shared: e.shared, Log: log}
+	forge := e.forge
+	if forge == nil {
+		var profiles config.ForgeProfiles
+		var plugins config.ProviderPlugins
+		var err error
+		if e.config != nil {
+			profiles, plugins = e.config.ForgeProfiles, e.config.ProviderPlugins
+		} else if e.paths != nil {
+			var global *config.GlobalConfig
+			global, err = config.LoadGlobal(e.paths.ConfigFile())
+			if err == nil {
+				profiles, plugins = global.ForgeProfiles, global.ProviderPlugins
+			}
+		}
+		if err == nil {
+			forge, err = forgecontext.Resolve(ctx, profiles, repo.UpstreamURL, repo.ForkURL)
+		}
+		if err == nil {
+			err = forgecontext.RefuseProviderPluginOverlap(ctx, forge, plugins, repo.UpstreamURL)
+		}
+		if err != nil {
+			message := safeurl.RedactText(fmt.Sprintf("warning: no-mistakes commit status resolve forge profile: %v", err))
+			slog.Warn(message)
+			log(message)
+			return
+		}
+	}
+	sctx := &StepContext{Ctx: ctx, Run: run, Repo: repo, DB: e.db, Config: e.config, ForgeContext: forge, WorkDir: e.workDir, Shared: e.shared, Log: log}
 	for _, step := range e.steps {
 		if reporter, ok := step.(PublishedHeadStatusReporter); ok {
 			validatedSHA := ""
