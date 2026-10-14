@@ -337,26 +337,24 @@ func TestEquivalentButDivergedClassification(t *testing.T) {
 				t.Fatalf("state = %#v", state)
 			}
 			if tc.wantSafe == "blocked_diverged" {
-				if state.NextAction == nil {
-					t.Fatalf("next action = nil, want a command that reaches %s", f.pushed)
-				}
-				if tc.name != "same path pipeline overwrite after represented work" {
-					if want := "git checkout --detach " + f.pushed; state.NextAction.Command != want {
-						t.Fatalf("next action command = %q, want %q", state.NextAction.Command, want)
-					}
-					return
+				want := "git log --oneline --left-right HEAD..." + f.pushed
+				if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" || state.NextAction.Command != want {
+					t.Fatalf("next action = %+v, want read-only inspection %q", state.NextAction, want)
 				}
 				branchRef := mustRun(t, f.local, "symbolic-ref", "HEAD")
 				localHead := mustRun(t, f.local, "rev-parse", "HEAD")
-				mustRun(t, f.local, strings.Fields(state.NextAction.Command)[1:]...)
-				if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.pushed {
-					t.Fatalf("HEAD after %q = %s, want %s", state.NextAction.Command, got, f.pushed)
+				status := mustRun(t, f.local, "status", "--porcelain")
+				if output := mustRun(t, f.local, strings.Fields(state.NextAction.Command)[1:]...); output == "" {
+					t.Fatal("history inspection returned no diverged commits")
 				}
-				if got := mustRun(t, f.local, "rev-parse", branchRef); got != localHead {
-					t.Fatalf("%s after %q = %s, want %s", branchRef, state.NextAction.Command, got, localHead)
+				if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != localHead {
+					t.Fatalf("HEAD after inspection = %s, want %s", got, localHead)
 				}
-				if _, err := gitpkg.Run(f.ctx, f.local, "symbolic-ref", "-q", "HEAD"); err == nil {
-					t.Fatalf("HEAD still on a branch after %q", state.NextAction.Command)
+				if got := mustRun(t, f.local, "symbolic-ref", "HEAD"); got != branchRef {
+					t.Fatalf("branch after inspection = %s, want %s", got, branchRef)
+				}
+				if got := mustRun(t, f.local, "status", "--porcelain"); got != status {
+					t.Fatalf("worktree status after inspection = %q, want %q", got, status)
 				}
 			}
 		})
