@@ -1010,11 +1010,53 @@ func TestCommitAgentFixes_DocumentDoesNotPersistUncertifiedRange(t *testing.T) {
 	ag := &mockAgent{name: "test"}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.ReviewStartingHeadSHA = headSHA
+	sctx.Run.ExternalCIOwner = types.ExternalCIOwnerControllerShipPR
 	if err := os.WriteFile(filepath.Join(dir, "docs-fix.txt"), []byte("fixed"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := commitAgentFixes(sctx, types.StepDocument, "apply fix", "fallback"); err != nil {
 		t.Fatal(err)
+	}
+	if sctx.Run.HeadSHA == headSHA {
+		t.Fatal("document correction did not advance the head")
+	}
+	if err := sctx.DB.ValidatePipelineHeadForward(sctx.Run.ID, headSHA, sctx.Run.HeadSHA); err != nil {
+		t.Fatalf("document correction has no exact parent proof: %v", err)
+	}
+	got, err := sctx.DB.GetUncertifiedPipelineRange(sctx.Repo.ID, sctx.Run.Branch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("document persist = %#v, want no uncertified range", got)
+	}
+}
+
+func TestCommitAgentFixes_ExternalCommitBeforeCorrectionCannotEarnHandoff(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", headSHA)
+
+	ag := &mockAgent{name: "test"}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.ReviewStartingHeadSHA = headSHA
+	sctx.Run.ExternalCIOwner = types.ExternalCIOwnerControllerShipPR
+	if err := os.WriteFile(filepath.Join(dir, "user.txt"), []byte("user change"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "user.txt")
+	gitCmd(t, dir, "commit", "-m", "user commit")
+	if err := os.WriteFile(filepath.Join(dir, "docs-fix.txt"), []byte("fixed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitAgentFixes(sctx, types.StepDocument, "apply fix", "fallback"); err != nil {
+		t.Fatal(err)
+	}
+	if sctx.Run.HeadSHA == headSHA {
+		t.Fatal("document correction did not advance the head")
+	}
+	if err := sctx.DB.ValidatePipelineHeadForward(sctx.Run.ID, headSHA, sctx.Run.HeadSHA); err == nil {
+		t.Fatal("pipeline correction laundered an external parent")
 	}
 	got, err := sctx.DB.GetUncertifiedPipelineRange(sctx.Repo.ID, sctx.Run.Branch)
 	if err != nil {

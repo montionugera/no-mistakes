@@ -350,11 +350,19 @@ func TestFindPRReturnsCLIError(t *testing.T) {
 func TestFindPRRejectsURLForDifferentProject(t *testing.T) {
 	t.Parallel()
 
-	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+	responses := map[string]gitlabTestResponse{
 		"glab mr list --source-branch feature/refactor --target-branch main --output json": {
 			stdout: `[{"iid":42,"web_url":"https://gitlab.example.com/group/other/-/merge_requests/42"}]` + "\n",
 		},
-	}), nil, "gitlab.example.com", "group/project")
+	}
+	host := New(gitlabTestCmdFactory(responses), nil, "gitlab.example.com", "group/project")
+	bad := responses["glab mr list --source-branch feature/refactor --target-branch main --output json"]
+	responses["glab mr list --source-branch feature/refactor --target-branch main --output json"] = gitlabTestResponse{stdout: `[{"iid":42,"web_url":"https://gitlab.example.com/group/project/-/merge_requests/42"}]`}
+	baseline, baselineErr := host.FindPR(context.Background(), "feature/refactor", "main")
+	if baselineErr != nil || baseline == nil || baseline.Number != "42" {
+		t.Fatalf("valid baseline failed: %v", baselineErr)
+	}
+	responses["glab mr list --source-branch feature/refactor --target-branch main --output json"] = bad
 
 	pr, err := host.FindPR(context.Background(), "feature/refactor", "main")
 	if err == nil {
@@ -763,11 +771,19 @@ func TestGetChecksPreservesProviderCommitForNamedProof(t *testing.T) {
 func TestGetChecksRejectsConflictingJobAndPipelineCommitEvidence(t *testing.T) {
 	const current = "2222222222222222222222222222222222222222"
 	const old = "1111111111111111111111111111111111111111"
-	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+	responses := map[string]gitlabTestResponse{
 		"glab ci status --mr 123 --output json": {
 			stdout: `[{"id":1,"name":"build","status":"success","commit":{"id":"` + current + `"},"pipeline":{"sha":"` + old + `"}}]`,
 		},
-	}), nil, "", "")
+	}
+	host := New(gitlabTestCmdFactory(responses), nil, "", "")
+	bad := responses["glab ci status --mr 123 --output json"]
+	responses["glab ci status --mr 123 --output json"] = gitlabTestResponse{stdout: `[{"id":1,"name":"build","status":"success","commit":{"id":"` + current + `"},"pipeline":{"sha":"` + current + `"}}]`}
+	baseline, baselineErr := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
+	if baselineErr != nil || len(baseline) != 1 || baseline[0].HeadSHA != current {
+		t.Fatalf("valid baseline failed: %v", baselineErr)
+	}
+	responses["glab ci status --mr 123 --output json"] = bad
 	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
 	if err != nil || len(checks) != 1 || checks[0].HeadSHA != "" {
 		t.Fatalf("ambiguous job commit = %+v, %v", checks, err)
@@ -942,11 +958,12 @@ func TestGetChecksRejectsUnreadableJobs(t *testing.T) {
 					responses := map[string]gitlabTestResponse{
 						"glab ci status --mr 123 --output json": {stdout: tt.output},
 					}
+					jobsCommand := "glab ci status --mr 123 --output json"
 					projectPath := ""
 					if route != "primary" {
 						responses["glab ci status --mr 123 --output json"] = gitlabTestResponse{stderr: "unknown flag: --mr\n", code: 1}
 						responses["glab mr view 123 --output json"] = gitlabTestResponse{stdout: `{"head_pipeline":{"id":77}}`}
-						jobsCommand := "glab ci get --pipeline-id 77 --output json --with-job-details"
+						jobsCommand = "glab ci get --pipeline-id 77 --output json --with-job-details"
 						if route == "REST fallback" {
 							projectPath = "group/project"
 							jobsCommand = "glab api --paginate projects/group%2Fproject/pipelines/77/jobs"
@@ -954,6 +971,13 @@ func TestGetChecksRejectsUnreadableJobs(t *testing.T) {
 						responses[jobsCommand] = gitlabTestResponse{stdout: tt.output}
 					}
 					host := New(gitlabTestCmdFactory(responses), nil, "", projectPath)
+					bad := responses[jobsCommand]
+					responses[jobsCommand] = gitlabTestResponse{stdout: `[{"id":1,"name":"build","status":"success"}]`}
+					baseline, baselineErr := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
+					if baselineErr != nil || len(baseline) != 1 {
+						t.Fatalf("valid jobs baseline = %+v, %v", baseline, baselineErr)
+					}
+					responses[jobsCommand] = bad
 					checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
 					if err == nil {
 						t.Fatalf("GetChecks() = (%+v, nil), want a read error for %q", checks, tt.output)
@@ -986,14 +1010,23 @@ func TestGetChecksRequiresExplicitPipelineMetadata(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+			responses := map[string]gitlabTestResponse{
 				"glab ci status --mr 123 --output json": {stderr: "unknown flag: --mr\n", code: 1},
 				"glab mr view 123 --output json":        {stdout: tt.output},
 				// The old code passed a negative ID on to the jobs reader. Give
 				// that call a successful answer, so the test fails unless the ID
 				// itself is refused.
 				"glab ci get --pipeline-id -1 --output json --with-job-details": {stdout: `[]`},
-			}), nil, "", "")
+				"glab ci get --pipeline-id 77 --output json --with-job-details": {stdout: `[{"id":1,"name":"build","status":"success"}]`},
+			}
+			host := New(gitlabTestCmdFactory(responses), nil, "", "")
+			bad := responses["glab mr view 123 --output json"]
+			responses["glab mr view 123 --output json"] = gitlabTestResponse{stdout: `{"head_pipeline":{"id":77}}`}
+			baseline, baselineErr := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
+			if baselineErr != nil || len(baseline) != 1 {
+				t.Fatalf("valid metadata = %+v, %v", baseline, baselineErr)
+			}
+			responses["glab mr view 123 --output json"] = bad
 			checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
 			if err == nil {
 				t.Fatalf("GetChecks() = (%+v, nil), want a read error for %q", checks, tt.output)
@@ -1087,7 +1120,7 @@ func gitlabMRAtHead(sourceSHA, pipelineSHA, pipelineRef string) gitlabTestRespon
 func TestGetChecksRejectsAHeadPipelineThatRanAtADifferentCommit(t *testing.T) {
 	t.Parallel()
 
-	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+	responses := map[string]gitlabTestResponse{
 		// The unbound legacy path would return exactly these green jobs; a
 		// build that still takes it for a named head fails this test.
 		"glab ci status --mr 123 --output json": {
@@ -1097,9 +1130,18 @@ func TestGetChecksRejectsAHeadPipelineThatRanAtADifferentCommit(t *testing.T) {
 		"glab api --paginate projects/group%2Fproject/pipelines/77/jobs": {
 			stdout: `[{"id":1,"name":"build","status":"success"}]` + "\n",
 		},
-	}), nil, "gitlab.example.com", "group/project")
+	}
+	host := New(gitlabTestCmdFactory(responses), nil, "gitlab.example.com", "group/project")
 
+	bad := responses["glab mr view 123 --output json"]
+	responses["glab mr view 123 --output json"] = gitlabMRAtHead(deliveredSHA, deliveredSHA, "refs/heads/feature")
 	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
+	if err != nil || len(checks) != 1 || checks[0].HeadSHA != deliveredSHA {
+		t.Fatalf("valid baseline = %+v, %v", checks, err)
+	}
+	responses["glab mr view 123 --output json"] = bad
+
+	checks, err = host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
 	if err == nil {
 		t.Fatalf("GetChecks() = %+v, err = nil; want an error for a pipeline that ran at %s, not %s", checks, otherSHA, deliveredSHA)
 	}
@@ -1144,14 +1186,24 @@ func TestGetChecksRejectsAMergeRequestThatIsNotAtTheDeliveredCommit(t *testing.T
 	// The merge request's own source revision is authoritative: when it is not
 	// the commit being delivered, its pipeline cannot speak for that commit,
 	// even if the pipeline matches the merge request's revision.
-	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+	responses := map[string]gitlabTestResponse{
 		"glab ci status --mr 123 --output json": {
 			stdout: `[{"id":1,"name":"build","status":"success"}]` + "\n",
 		},
-		"glab mr view 123 --output json": gitlabMRAtHead(otherSHA, otherSHA, "refs/heads/feature"),
-	}), nil, "", "")
+		"glab mr view 123 --output json":                                gitlabMRAtHead(otherSHA, deliveredSHA, "refs/heads/feature"),
+		"glab ci get --pipeline-id 77 --output json --with-job-details": {stdout: `{"jobs":[{"id":1,"name":"build","status":"success"}]}`},
+	}
+	host := New(gitlabTestCmdFactory(responses), nil, "", "")
 
+	bad := responses["glab mr view 123 --output json"]
+	responses["glab mr view 123 --output json"] = gitlabMRAtHead(deliveredSHA, deliveredSHA, "refs/heads/feature")
 	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
+	if err != nil || len(checks) != 1 || checks[0].HeadSHA != deliveredSHA {
+		t.Fatalf("valid baseline = %+v, %v", checks, err)
+	}
+	responses["glab mr view 123 --output json"] = bad
+
+	checks, err = host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
 	if err == nil {
 		t.Fatalf("GetChecks() = %+v, err = nil; want a head-change error", checks)
 	}
@@ -1170,6 +1222,19 @@ func TestGetChecksRejectsAMoveOfTheSourceCommitDuringCheckDiscovery(t *testing.T
 	// moved while the jobs were being listed - the same window the GitHub
 	// adapter rejects, because the observation no longer describes the commit
 	// that will be certified.
+	valid := New(gitlabSequenceCmdFactory(t, map[string][]gitlabTestResponse{
+		"glab mr view 123 --output json": {
+			gitlabMRAtHead(deliveredSHA, deliveredSHA, "refs/heads/feature"),
+			gitlabMRAtHead(deliveredSHA, deliveredSHA, "refs/heads/feature"),
+		},
+		"glab api --paginate projects/group%2Fproject/pipelines/77/jobs": {
+			{stdout: `[{"id":1,"name":"build","status":"success"}]` + "\n"},
+		},
+	}), nil, "gitlab.example.com", "group/project")
+	baseline, baselineErr := valid.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
+	if baselineErr != nil || len(baseline) != 1 {
+		t.Fatalf("valid stable observation = %+v, %v", baseline, baselineErr)
+	}
 	host := New(gitlabSequenceCmdFactory(t, map[string][]gitlabTestResponse{
 		"glab mr view 123 --output json": {
 			gitlabMRAtHead(deliveredSHA, deliveredSHA, "refs/heads/feature"),
@@ -1242,7 +1307,7 @@ func TestGetChecksRejectsJobCommitsOutsideTheVerifiedPipeline(t *testing.T) {
 		{"source commit instead of merged commit", mergeRefSHA, `"commit":{"id":"` + deliveredSHA + `"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+			responses := map[string]gitlabTestResponse{
 				"glab mr view 123 --output json": gitlabMRAtHead(deliveredSHA, tc.pipelineSHA, "refs/merge-requests/123/merge"),
 				"glab api projects/group%2Fproject/repository/commits/" + mergeRefSHA: {
 					stdout: fmt.Sprintf(`{"id":%q,"parent_ids":[%q,%q]}`, mergeRefSHA, targetSHA, deliveredSHA),
@@ -1250,7 +1315,21 @@ func TestGetChecksRejectsJobCommitsOutsideTheVerifiedPipeline(t *testing.T) {
 				"glab api --paginate projects/group%2Fproject/pipelines/77/jobs": {
 					stdout: `[{"id":1,"name":"build","status":"success",` + tc.jobEvidence + `}]`,
 				},
-			}), nil, "gitlab.example.com", "group/project")
+			}
+			host := New(gitlabTestCmdFactory(responses), nil, "gitlab.example.com", "group/project")
+			command := "glab api --paginate projects/group%2Fproject/pipelines/77/jobs"
+			bad := responses[command]
+			good := bad
+			good.stdout = strings.ReplaceAll(good.stdout, otherSHA, tc.pipelineSHA)
+			if tc.pipelineSHA == mergeRefSHA {
+				good.stdout = strings.ReplaceAll(good.stdout, deliveredSHA, mergeRefSHA)
+			}
+			responses[command] = good
+			baseline, baselineErr := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
+			if baselineErr != nil || len(baseline) != 1 || baseline[0].HeadSHA != deliveredSHA {
+				t.Fatalf("valid job identity baseline = %+v, %v", baseline, baselineErr)
+			}
+			responses[command] = bad
 			checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
 			if !errors.Is(err, scm.ErrHeadChanged) || len(checks) != 0 {
 				t.Fatalf("GetChecks() = (%+v, %v), want no checks and a head-change refusal", checks, err)
@@ -1265,18 +1344,25 @@ func TestGetChecksRejectsAMergedResultsPipelineThatDoesNotIncludeTheDeliveredCom
 	// The merge-results pipeline predates the latest source commit: its
 	// temporary commit carries an older source revision, so a green run there
 	// says nothing about the delivered commit.
-	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+	responses := map[string]gitlabTestResponse{
 		"glab ci status --mr 123 --output json": {
 			stdout: `[{"id":1,"name":"build","status":"success"}]` + "\n",
 		},
 		"glab mr view 123 --output json": gitlabMRAtHead(deliveredSHA, mergeRefSHA, "refs/merge-requests/123/merge"),
 		"glab api projects/group%2Fproject/repository/commits/" + mergeRefSHA: {
-			stdout: fmt.Sprintf(`{"id":%q,"parent_ids":[%q,%q]}`, mergeRefSHA, targetSHA, otherSHA) + "\n",
+			stdout: fmt.Sprintf(`{"id":%q,"parent_ids":[%q,%q]}`, mergeRefSHA, targetSHA, deliveredSHA) + "\n",
 		},
-	}), nil, "gitlab.example.com", "group/project")
+		"glab api --paginate projects/group%2Fproject/pipelines/77/jobs": {stdout: fmt.Sprintf(`[{"id":1,"name":"build","status":"success","commit":{"id":%q},"pipeline":{"sha":%q}}]`, mergeRefSHA, mergeRefSHA)},
+	}
+	host := New(gitlabTestCmdFactory(responses), nil, "gitlab.example.com", "group/project")
 
 	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
-	if err == nil {
+	if err != nil || len(checks) != 1 || checks[0].HeadSHA != deliveredSHA {
+		t.Fatalf("valid merged-results baseline = %+v, %v", checks, err)
+	}
+	responses["glab api projects/group%2Fproject/repository/commits/"+mergeRefSHA] = gitlabTestResponse{stdout: fmt.Sprintf(`{"id":%q,"parent_ids":[%q,%q]}`, mergeRefSHA, targetSHA, otherSHA)}
+	checks, err = host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
+	if !errors.Is(err, scm.ErrHeadChanged) || !strings.Contains(err.Error(), "does not include") {
 		t.Fatalf("GetChecks() = %+v, err = nil; want an error for a merged-results pipeline that does not include %s", checks, deliveredSHA)
 	}
 	if len(checks) != 0 {
@@ -1290,12 +1376,21 @@ func TestGetChecksFailsClosedWhenMergedResultsProvenanceCannotBeRead(t *testing.
 	// Without a project path the merge-result commit cannot be read, so its
 	// provenance cannot be proven. Failing closed keeps an unprovable pipeline
 	// from being graded; the jobs read below must never be reached.
-	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+	responses := map[string]gitlabTestResponse{
 		"glab mr view 123 --output json": gitlabMRAtHead(deliveredSHA, mergeRefSHA, "refs/merge-requests/123/merge"),
 		"glab ci get --pipeline-id 77 --output json --with-job-details": {
 			stdout: `[{"id":1,"name":"build","status":"success"}]` + "\n",
 		},
-	}), nil, "", "")
+		"glab api projects/group%2Fproject/repository/commits/" + mergeRefSHA: {stdout: fmt.Sprintf(`{"id":%q,"parent_ids":[%q,%q]}`, mergeRefSHA, targetSHA, deliveredSHA)},
+		"glab api --paginate projects/group%2Fproject/pipelines/77/jobs":      {stdout: `[{"id":1,"name":"build","status":"success"}]`},
+	}
+	valid := New(gitlabTestCmdFactory(responses), nil, "gitlab.example.com", "group/project")
+	baseline, baselineErr := valid.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
+	if baselineErr != nil || len(baseline) != 1 || baseline[0].HeadSHA != deliveredSHA {
+		t.Fatalf("valid merge proof = %+v, %v", baseline, baselineErr)
+	}
+
+	host := New(gitlabTestCmdFactory(responses), nil, "", "")
 
 	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
 	if err == nil {
@@ -1314,7 +1409,7 @@ func TestGetChecksFailsClosedWhenTheHeadPipelineReportsNoCommit(t *testing.T) {
 
 	// An omitted commit is not an absent pipeline: the binding cannot be shown,
 	// so the read fails closed instead of grading jobs whose commit is unknown.
-	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+	responses := map[string]gitlabTestResponse{
 		"glab ci status --mr 123 --output json": {
 			stdout: `[{"id":1,"name":"build","status":"success"}]` + "\n",
 		},
@@ -1324,7 +1419,16 @@ func TestGetChecksFailsClosedWhenTheHeadPipelineReportsNoCommit(t *testing.T) {
 		"glab api --paginate projects/group%2Fproject/pipelines/77/jobs": {
 			stdout: `[{"id":1,"name":"build","status":"success"}]` + "\n",
 		},
-	}), nil, "gitlab.example.com", "group/project")
+	}
+	host := New(gitlabTestCmdFactory(responses), nil, "gitlab.example.com", "group/project")
+
+	bad := responses["glab mr view 123 --output json"]
+	responses["glab mr view 123 --output json"] = gitlabMRAtHead(deliveredSHA, deliveredSHA, "refs/heads/feature")
+	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
+	if err != nil || len(checks) != 1 || checks[0].HeadSHA != deliveredSHA {
+		t.Fatalf("valid baseline = %+v, %v", checks, err)
+	}
+	responses["glab mr view 123 --output json"] = bad
 
 	if _, err := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA}); err == nil {
 		t.Fatal("GetChecks() error = nil, want a fail-closed error for a pipeline with no commit")
@@ -1334,16 +1438,26 @@ func TestGetChecksFailsClosedWhenTheHeadPipelineReportsNoCommit(t *testing.T) {
 func TestGetChecksFailsClosedWhenTheMergeRequestReportsNoSourceCommit(t *testing.T) {
 	t.Parallel()
 
-	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+	responses := map[string]gitlabTestResponse{
 		"glab ci status --mr 123 --output json": {
 			stdout: `[{"id":1,"name":"build","status":"success"}]` + "\n",
 		},
 		"glab mr view 123 --output json": {
 			stdout: `{"iid":123,"head_pipeline":{"id":77,"sha":"` + deliveredSHA + `"}}` + "\n",
 		},
-	}), nil, "", "")
+		"glab ci get --pipeline-id 77 --output json --with-job-details": {stdout: `{"jobs":[{"id":1,"name":"build","status":"success"}]}`},
+	}
+	host := New(gitlabTestCmdFactory(responses), nil, "", "")
 
-	if _, err := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA}); err == nil {
+	bad := responses["glab mr view 123 --output json"]
+	responses["glab mr view 123 --output json"] = gitlabMRAtHead(deliveredSHA, deliveredSHA, "refs/heads/feature")
+	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
+	if err != nil || len(checks) != 1 || checks[0].HeadSHA != deliveredSHA {
+		t.Fatalf("valid baseline = %+v, %v", checks, err)
+	}
+	responses["glab mr view 123 --output json"] = bad
+
+	if _, err := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA}); err == nil || !strings.Contains(err.Error(), "no source commit") {
 		t.Fatal("GetChecks() error = nil, want a fail-closed error for an unnamed source commit")
 	}
 }
@@ -1401,16 +1515,24 @@ func TestFetchFailedCheckTargetLogsRejectsAPipelineThatRanAtADifferentCommit(t *
 	// same-named job from the pipeline that is currently the merge request's
 	// head would attach another commit's log to this selection, so the fetch
 	// must fail closed instead.
-	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+	responses := map[string]gitlabTestResponse{
 		"glab mr view 123 --output json": gitlabMRAtHead(deliveredSHA, otherSHA, "refs/heads/feature"),
 		"glab ci get --pipeline-id 77 --output json --with-job-details": {
 			stdout: `{"jobs":[{"id":55,"name":"lint","status":"failed"}]}` + "\n",
 		},
 		"glab ci trace 55": {stdout: "lint failed\n"},
-	}), nil, "", "")
+	}
+	host := New(gitlabTestCmdFactory(responses), nil, "", "")
+	bad := responses["glab mr view 123 --output json"]
+	responses["glab mr view 123 --output json"] = gitlabMRAtHead(deliveredSHA, deliveredSHA, "refs/heads/feature")
+	baseline, baselineErr := host.FetchFailedCheckTargetLogs(context.Background(), &scm.PR{Number: "123"}, "", deliveredSHA, []scm.CheckTarget{{Name: "lint"}})
+	if baselineErr != nil || len(baseline) != 1 || baseline[0].Output == "" {
+		t.Fatalf("valid baseline failed: %v", baselineErr)
+	}
+	responses["glab mr view 123 --output json"] = bad
 
 	logs, err := host.FetchFailedCheckTargetLogs(context.Background(), &scm.PR{Number: "123"}, "", deliveredSHA, []scm.CheckTarget{{Name: "lint"}})
-	if err == nil {
+	if !errors.Is(err, scm.ErrHeadChanged) {
 		t.Fatalf("FetchFailedCheckTargetLogs() = %+v, err = nil; want a binding error", logs)
 	}
 	for _, log := range logs {
@@ -1521,12 +1643,23 @@ func TestGetChecksRejectsAMergedResultsPipelineWhoseCommitIsNotACommitID(t *test
 
 	// The merge-result commit is interpolated into a repository API path, so a
 	// value that is not a commit id is refused before any request is built.
-	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+	responses := map[string]gitlabTestResponse{
 		"glab ci status --mr 123 --output json": {
 			stdout: `[{"id":1,"name":"build","status":"success"}]` + "\n",
 		},
-		"glab mr view 123 --output json": gitlabMRAtHead(deliveredSHA, "not-a-commit", "refs/merge-requests/123/merge"),
-	}), nil, "gitlab.example.com", "group/project")
+		"glab mr view 123 --output json":                                      gitlabMRAtHead(deliveredSHA, "not-a-commit", "refs/merge-requests/123/merge"),
+		"glab api projects/group%2Fproject/repository/commits/" + mergeRefSHA: {stdout: fmt.Sprintf(`{"id":%q,"parent_ids":[%q,%q]}`, mergeRefSHA, targetSHA, deliveredSHA)},
+		"glab api projects/group%2Fproject/repository/commits/not-a-commit":   {stdout: fmt.Sprintf(`{"id":"not-a-commit","parent_ids":[%q,%q]}`, targetSHA, deliveredSHA)},
+		"glab api --paginate projects/group%2Fproject/pipelines/77/jobs":      {stdout: `[{"id":1,"name":"build","status":"success"}]`},
+	}
+	host := New(gitlabTestCmdFactory(responses), nil, "gitlab.example.com", "group/project")
+	bad := responses["glab mr view 123 --output json"]
+	responses["glab mr view 123 --output json"] = gitlabMRAtHead(deliveredSHA, mergeRefSHA, "refs/merge-requests/123/merge")
+	baseline, baselineErr := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
+	if baselineErr != nil || len(baseline) != 1 || baseline[0].HeadSHA != deliveredSHA {
+		t.Fatalf("valid baseline failed: %v", baselineErr)
+	}
+	responses["glab mr view 123 --output json"] = bad
 
 	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: deliveredSHA})
 	if err == nil {
@@ -1547,7 +1680,7 @@ func TestGetChecksRejectsAHeadPipelineStrandedByAHeadMoveWithoutAPipeline(t *tes
 
 	// The delivered commit has no pipeline; the head pipeline belongs to the
 	// commit before it, where one job passed and one failed.
-	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+	responses := map[string]gitlabTestResponse{
 		"glab ci status --mr 1 --output json": {
 			stdout: `[{"id":646,"name":"green-on-head","status":"success"},{"id":647,"name":"fails-on-purpose","status":"failed"}]` + "\n",
 		},
@@ -1558,7 +1691,21 @@ func TestGetChecksRejectsAHeadPipelineStrandedByAHeadMoveWithoutAPipeline(t *tes
 			stdout: `[{"id":646,"name":"green-on-head","status":"success"},{"id":647,"name":"fails-on-purpose","status":"failed"}]` + "\n",
 		},
 		"glab ci trace 647": {stdout: "this job fails on purpose for CI_COMMIT_SHA=" + otherSHA + "\n"},
-	}), nil, "gitlab.example.com", "group/project")
+	}
+	host := New(gitlabTestCmdFactory(responses), nil, "gitlab.example.com", "group/project")
+	bad := responses["glab mr view 1 --output json"]
+	good := bad
+	good.stdout = strings.ReplaceAll(good.stdout, otherSHA, deliveredSHA)
+	responses["glab mr view 1 --output json"] = good
+	baseline, baselineErr := host.GetChecks(context.Background(), &scm.PR{Number: "1", HeadSHA: deliveredSHA})
+	if baselineErr != nil || len(baseline) != 2 {
+		t.Fatalf("valid head pipeline = %+v, %v", baseline, baselineErr)
+	}
+	baselineLogs, baselineErr := host.FetchFailedCheckTargetLogs(context.Background(), &scm.PR{Number: "1"}, "", deliveredSHA, []scm.CheckTarget{{Name: "fails-on-purpose"}})
+	if baselineErr != nil || len(baselineLogs) != 1 || baselineLogs[0].Output == "" {
+		t.Fatalf("valid head logs = %+v, %v", baselineLogs, baselineErr)
+	}
+	responses["glab mr view 1 --output json"] = bad
 
 	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "1", HeadSHA: deliveredSHA})
 	if err == nil {
@@ -1593,6 +1740,20 @@ func TestGetChecksRejectsAHeadPipelineStrandedByAHeadMoveWithoutAPipeline(t *tes
 func TestFetchFailedCheckTargetLogsRejectsAHeadMoveDuringLogRetrieval(t *testing.T) {
 	t.Parallel()
 
+	valid := New(gitlabSequenceCmdFactory(t, map[string][]gitlabTestResponse{
+		"glab mr view 1 --output json": {
+			gitlabMRAtHead(deliveredSHA, deliveredSHA, "refs/heads/feature"),
+			gitlabMRAtHead(deliveredSHA, deliveredSHA, "refs/heads/feature"),
+		},
+		"glab api --paginate projects/group%2Fproject/pipelines/77/jobs": {
+			{stdout: `[{"id":647,"name":"fails-on-purpose","status":"failed"}]` + "\n"},
+		},
+		"glab ci trace 647": {{stdout: "this job fails on purpose\n"}},
+	}), nil, "gitlab.example.com", "group/project")
+	baseline, baselineErr := valid.FetchFailedCheckTargetLogs(context.Background(), &scm.PR{Number: "1"}, "", deliveredSHA, []scm.CheckTarget{{Name: "fails-on-purpose"}})
+	if baselineErr != nil || len(baseline) != 1 {
+		t.Fatalf("valid stable observation = %+v, %v", baseline, baselineErr)
+	}
 	host := New(gitlabSequenceCmdFactory(t, map[string][]gitlabTestResponse{
 		"glab mr view 1 --output json": {
 			gitlabMRAtHead(deliveredSHA, deliveredSHA, "refs/heads/feature"),
@@ -1736,12 +1897,20 @@ func TestUpdatePRRejectsMissingLiveTitle(t *testing.T) {
 		`{"iid":9,"title":null}` + "\n",
 		`{"iid":9,"title":"  "}` + "\n",
 	} {
-		host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+		responses := map[string]gitlabTestResponse{
 			"glab mr view 9 --output json": {
 				stdout: response,
 			},
-			"glab mr update 9 --title fix: x --description body --yes": {},
-		}), nil, "", "")
+			"glab mr update 9 --title fix: x --description body": {},
+		}
+		host := New(gitlabTestCmdFactory(responses), nil, "", "")
+		bad := responses["glab mr view 9 --output json"]
+		responses["glab mr view 9 --output json"] = gitlabTestResponse{stdout: `{"iid":9,"title":"old"}`}
+		_, baselineErr := host.UpdatePR(context.Background(), &scm.PR{Number: "9"}, scm.PRContent{Title: "fix: x", Body: "body"})
+		if baselineErr != nil {
+			t.Fatalf("valid baseline failed: %v", baselineErr)
+		}
+		responses["glab mr view 9 --output json"] = bad
 
 		pr := &scm.PR{Number: "9"}
 		_, err := host.UpdatePR(context.Background(), pr, scm.PRContent{Title: "fix: x", Body: "body"})

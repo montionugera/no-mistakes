@@ -1,6 +1,12 @@
 package db
 
 const schemaSQL = `
+CREATE TABLE IF NOT EXISTS pipeline_commit_heads (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    head_sha TEXT NOT NULL,
+    parent_sha TEXT NOT NULL,
+    PRIMARY KEY (run_id, head_sha)
+);
 CREATE TABLE IF NOT EXISTS review_comparisons (
     run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
     source_repo TEXT NOT NULL, source_branch TEXT NOT NULL,

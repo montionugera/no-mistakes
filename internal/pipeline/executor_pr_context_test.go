@@ -490,7 +490,7 @@ func TestExecutorExternalCIBypassRequiresHandoffSourceIdentity(t *testing.T) {
 	}
 }
 
-func TestExecutorExternalCIBypassRejectsPostReviewDocumentCommit(t *testing.T) {
+func TestExecutorExternalCIBypassRequiresPipelineAuthoredDescendant(t *testing.T) {
 	database, p, baseRun, repo := setupTest(t)
 	workDir := t.TempDir()
 	initGitRepo(t, workDir)
@@ -561,7 +561,13 @@ func TestExecutorExternalCIBypassRejectsPostReviewDocumentCommit(t *testing.T) {
 	}
 
 	if err := executor.validateReviewSupportOwners(run.ID, types.StepCI); err == nil {
-		t.Fatal("external CI bypass accepted a document commit after Review approval")
+		t.Fatal("external CI bypass accepted an unrecorded descendant")
+	}
+	if err := database.RecordPipelineCommitHead(run.ID, reviewedHead, advancedHead); err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.validateReviewSupportOwners(run.ID, types.StepCI); err != nil {
+		t.Fatalf("pipeline-authored document descendant: %v", err)
 	}
 }
 

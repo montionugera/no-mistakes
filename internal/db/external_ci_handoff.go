@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 
@@ -78,6 +79,9 @@ func (d *DB) PendingExternalCISupport(run *Run) ([]types.PendingCISupport, error
 	if approvedRoundHead == "" || approvedRoundHead != *run.ReviewApprovedHeadSHA {
 		return nil, fmt.Errorf("pending Review CI support has no matching approved Review round")
 	}
+	if err := d.ValidatePipelineHeadForward(run.ID, approvedRoundHead, receipt.LocalHeadSHA); err != nil {
+		return nil, err
+	}
 	result := make([]types.PendingCISupport, 0, len(claims))
 	for _, claim := range claims {
 		result = append(result, types.PendingCISupport{
@@ -90,4 +94,32 @@ func (d *DB) PendingExternalCISupport(run *Run) ([]types.PendingCISupport, error
 		})
 	}
 	return result, nil
+}
+
+func (d *DB) RecordPipelineCommitHead(runID, parentSHA, headSHA string) error {
+	if !validGitSHA(parentSHA) || !validGitSHA(headSHA) || parentSHA == headSHA {
+		return fmt.Errorf("invalid pipeline commit head proof")
+	}
+	_, err := d.sql.Exec(`INSERT INTO pipeline_commit_heads (run_id, head_sha, parent_sha) VALUES (?, ?, ?)`, runID, headSHA, parentSHA)
+	return err
+}
+
+func (d *DB) ValidatePipelineHeadForward(runID, approvedSHA, headSHA string) error {
+	seen := map[string]bool{}
+	for headSHA != approvedSHA {
+		if seen[headSHA] {
+			return fmt.Errorf("cyclic pipeline commit head proof")
+		}
+		seen[headSHA] = true
+		var parent string
+		err := d.sql.QueryRow(`SELECT parent_sha FROM pipeline_commit_heads WHERE run_id = ? AND head_sha = ?`, runID, headSHA).Scan(&parent)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("external CI handoff head has no pipeline-authored path to approved Review")
+		}
+		if err != nil {
+			return fmt.Errorf("read pipeline commit head proof: %w", err)
+		}
+		headSHA = parent
+	}
+	return nil
 }

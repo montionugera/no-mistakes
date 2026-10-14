@@ -444,6 +444,19 @@ func commitAgentFixesWithResult(sctx *pipeline.StepContext, stepName types.StepN
 	if headSHA == headBeforeCommit {
 		sctx.Log("no staged agent changes to commit")
 	} else {
+		if sctx.Run.ExternalCIOwner != "" {
+			parents, err := git.Run(ctx, sctx.WorkDir, "rev-list", "--parents", "-n", "1", headSHA)
+			if err != nil {
+				return false, err
+			}
+			fields := strings.Fields(parents)
+			if len(fields) != 2 || fields[0] != headSHA || fields[1] != headBeforeCommit {
+				return false, fmt.Errorf("pipeline correction commit does not match its starting head")
+			}
+			if err := sctx.DB.RecordPipelineCommitHead(sctx.Run.ID, headBeforeCommit, headSHA); err != nil {
+				return false, err
+			}
+		}
 		sctx.Log(fmt.Sprintf("committed agent fixes: %s", commitMessage))
 	}
 	if err := recordAgentFixHead(sctx, stepName, headSHA); err != nil {

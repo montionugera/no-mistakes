@@ -125,8 +125,21 @@ func TestPendingExternalCISupportBindsCurrentReviewAndReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := d.PendingExternalCISupport(run); err == nil {
+		t.Fatal("accepted an unrecorded external descendant")
+	}
+	if err := d.RecordPipelineCommitHead(run.ID, *run.ReviewApprovedHeadSHA, advancedHead); err != nil {
+		t.Fatal(err)
+	}
 	items, err = d.PendingExternalCISupport(run)
 	if err != nil || len(items) != 1 || items[0].SourceHeadSHA != advancedHead || items[0].ReceiptGeneration != 2 {
 		t.Fatalf("advanced comparison handoff = %+v, %v", items, err)
+	}
+	otherRun, err := d.InsertRun(repo.ID, "other", advancedHead, run.BaseSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ValidatePipelineHeadForward(otherRun.ID, *run.ReviewApprovedHeadSHA, advancedHead); err == nil {
+		t.Fatal("another run reused the pipeline commit proof")
 	}
 }
