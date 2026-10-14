@@ -14,6 +14,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
+	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/shipping"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -85,6 +86,14 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	if err != nil {
 		return nil, fmt.Errorf("resolve head before push: %w", err)
 	}
+	// A GitHub status must not certify changes made after the local gates.
+	// Commit formatter/leftover changes, then validate that new head before push.
+	if newHeadSHA != "" && resolvedProvider(sctx) == scm.ProviderGitHub && scm.ExtractHost(resolvePushURL(sctx)) != "" {
+		if err := recordAgentFixHead(sctx, s.Name(), headBeingPushed); err != nil {
+			return nil, err
+		}
+		return &pipeline.StepOutcome{RestartFrom: types.StepReview}, nil
+	}
 	if sctx.Run.Shipping != nil {
 		approved, err := sctx.DB.GetRun(sctx.Run.ID)
 		if err != nil {
@@ -150,7 +159,7 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 // attestation's own step statuses forward (a CI repair published without
 // revalidation); pass this run's current steps (sctx.DB.GetStepsByRun) for
 // the ordinary Push step.
-func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate string, attestationSteps []*db.StepResult) error {
+func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate string, attestationSteps []*db.StepResult) (publicationErr error) {
 	ctx := sctx.Ctx
 	ref := normalizedBranchRef(sctx.Run.Branch)
 	branch := strings.TrimPrefix(ref, "refs/heads/")
@@ -222,6 +231,16 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 			return fmt.Errorf("push to %s: %w", pushTarget, err)
 		}
 	}
+	// Record only an actual successful push, never a SHA found already upstream.
+	reportStatus := func(string) {}
+	if !decision.upToDate {
+		reportStatus = beginPublishedCommitStatus(sctx, headBeingPushed, pushURL, attestationSteps != nil && localValidationPassed(sctx))
+		defer func() {
+			if publicationErr != nil {
+				reportStatus("failure")
+			}
+		}()
+	}
 	verifiedRemote, err := lsRemoteSHA(gitRun, pushURL, ref)
 	if err != nil || verifiedRemote != headBeingPushed {
 		if err != nil {
@@ -262,6 +281,9 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 		return err
 	}
 	sctx.Run.HeadSHA = headBeingPushed
+	if attestationSteps != nil && localValidationPassed(sctx) {
+		reportStatus("success")
+	}
 	return nil
 }
 

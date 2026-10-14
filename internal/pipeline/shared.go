@@ -1,6 +1,9 @@
 package pipeline
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 // HousekeepingLintResult is the lint assessment produced by the combined
 // document+lint housekeeping pass: the document step performs both duties in
@@ -19,9 +22,10 @@ type HousekeepingLintResult struct {
 // is never persisted: on any process boundary the consuming step simply
 // falls back to doing its own work.
 type RunShared struct {
-	mu               sync.Mutex
-	prepared         bool
-	housekeepingLint *HousekeepingLintResult
+	mu                   sync.Mutex
+	prepared             bool
+	commitStatusReporter func(context.Context, string, string, func(string))
+	housekeepingLint     *HousekeepingLintResult
 }
 
 // EnsurePrepared runs prepare once successfully for this executor lifetime.

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -58,6 +59,9 @@ func handleFakeCLI(mode string) {
 		}
 	}
 	logFakeCLIStdinBody(args, logFile)
+	if forwardCommitStatus(args) {
+		return
+	}
 
 	switch mode {
 	case "gh":
@@ -1107,4 +1111,53 @@ func fakeGraphQLRepo(args []string) string {
 		return ""
 	}
 	return owner + "/" + name
+}
+
+// forwardCommitStatus sends the fake gh API invocation to a local HTTP server.
+// This keeps provider tests at the request boundary without a real gh login.
+func forwardCommitStatus(args []string) bool {
+	base := os.Getenv("FAKE_CLI_STATUS_API_URL")
+	if base == "" || len(args) == 0 || args[0] != "api" {
+		return false
+	}
+	endpoint, method := "", "GET"
+	body := map[string]string{}
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--hostname":
+			i++
+		case "--method", "-X":
+			i++
+			method = args[i]
+		case "-f", "--raw-field":
+			i++
+			k, v, _ := strings.Cut(args[i], "=")
+			body[k] = v
+		default:
+			if strings.HasPrefix(args[i], "repos/") {
+				endpoint = args[i]
+			}
+		}
+	}
+	if !strings.Contains(endpoint, "/statuses/") {
+		return false
+	}
+	data, _ := json.Marshal(body)
+	req, err := http.NewRequest(method, base+"/"+endpoint, strings.NewReader(string(data)))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	io.Copy(os.Stdout, resp.Body)
+	if resp.StatusCode >= 300 {
+		os.Exit(1)
+	}
+	return true
 }

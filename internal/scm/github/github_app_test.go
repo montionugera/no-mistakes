@@ -52,3 +52,28 @@ func TestGetChecksCarriesCheckSuiteAppSlug(t *testing.T) {
 		}
 	}
 }
+
+func TestGetChecksIgnoresOwnStatusButKeepsSameNamedCheckRun(t *testing.T) {
+	t.Parallel()
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh pr view 123 --repo test/repo --json headRefOid --jq .headRefOid": {stdout: "deadbeef\n"},
+		githubCommitChecksCommand("", "test/repo", "deadbeef"): {stdout: githubCommitChecksResponse(`[
+   {"__typename":"StatusContext","id":"owned","context":"no-mistakes","state":"PENDING"},
+   {"__typename":"StatusContext","id":"external","context":"ci/external","state":"SUCCESS"},
+   {"__typename":"CheckRun","databaseId":2,"name":"no-mistakes","status":"COMPLETED","conclusion":"SUCCESS"}
+  ]`)},
+		"gh api --method GET repos/test/repo/actions/runs -f head_sha=deadbeef -f per_page=100 --paginate --slurp": {stdout: `[{"total_count":0,"workflow_runs":[]}]`},
+	}), nil, "", "test/repo")
+	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: "deadbeef"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checks) != 2 {
+		t.Fatalf("checks = %+v, want external status and same-named check run", checks)
+	}
+	for _, check := range checks {
+		if check.Bucket != scm.CheckBucketPass || check.ProviderID == "github-status:owned" {
+			t.Fatalf("unexpected check %+v", check)
+		}
+	}
+}

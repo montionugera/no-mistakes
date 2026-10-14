@@ -242,6 +242,12 @@ When `commands.lint` is empty, unresolved findings from the combined pass pause 
 
 Pushes the validated branch to the configured push target.
 
+For GitHub targets, an actual push posts a plain commit status with context `no-mistakes` on the exact pushed SHA. It posts `pending` immediately after the push, then `success` once publication settles and Review, Test, Document, and Lint have completed without overrides. Success precedes CI monitoring: external approval can require this status while no-mistakes continues to monitor the repository's CI. The status links to the pushed commit, including when the target is a fork.
+
+If Push commits formatter or leftover changes for a GitHub target, it restarts validation at Review before publishing that new head. A CI repair published without local revalidation stays pending until CI proves readiness for that exact head. The monitor excludes the pipeline's own status from its check evaluation. A failed or cancelled run posts `failure` for its last pushed head, even after earlier success. The pushed-head status record survives recovery and validation restarts; mutable worktree or PR heads cannot change its SHA.
+
+Status posting uses the run's existing `gh` credentials. Posting or status-record errors produce warnings in the run's Push log and event stream, and leave pipeline execution running. Other providers, pushes that fail before publication, and runs that perform no push post no status. Each later pushed head receives its own status sequence.
+
 **Behavior:**
 
 - If `commands.format` is set, ensures [`commands.prepare`](/no-mistakes/reference/repo-config/#commandsprepare) has succeeded once for the isolated worktree, then runs the formatter
