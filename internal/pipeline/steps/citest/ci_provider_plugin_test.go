@@ -55,7 +55,7 @@ func pluginCIContext(t *testing.T, state fakeplugin.State) (*pipeline.StepContex
 
 func TestCIStep_ProviderPluginMergedPRExitsEarly(t *testing.T) {
 	t.Parallel()
-	sctx, _ := pluginCIContext(t, fakeplugin.State{PRs: []fakeplugin.PR{{Number: "7", URL: pluginPRURL, HeadBranch: "feature", BaseBranch: "main", State: "merged"}}})
+	sctx, _ := pluginCIContext(t, fakeplugin.State{PRs: []fakeplugin.PR{{Number: "7", URL: pluginPRURL, HeadBranch: "feature", BaseBranch: "main", State: "merged", MergeSHA: "0123456789012345678901234567890123456789"}}})
 	var logs []string
 	sctx.Log = func(s string) { logs = append(logs, s) }
 
