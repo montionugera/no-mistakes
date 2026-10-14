@@ -75,7 +75,7 @@ func commitStatusReporter(sctx *pipeline.StepContext, publication *db.CommitStat
 		case "failure":
 			description = "no-mistakes pipeline failed or cancelled"
 		}
-		bounded, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		bounded, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
 		if err := host.PostCommitStatus(bounded, sha, state, description, targetURL); err != nil {
 			statusWarning(log, state+" for "+sha, err)

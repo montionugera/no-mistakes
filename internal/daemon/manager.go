@@ -441,7 +441,7 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 				}
 			}
 			if plan.run.Status == types.RunFailed || plan.run.Status == types.RunCancelled {
-				executor.ReportPublishedHeadFailure(plan.run, plan.repo)
+				executor.ReportPublishedHeadFailure(context.Background(), plan.run, plan.repo)
 			}
 			cancel(nil)
 			_ = plan.agent.Close()
@@ -1825,7 +1825,7 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 				}
 			}
 			if run.Status == types.RunFailed || run.Status == types.RunCancelled {
-				executor.ReportPublishedHeadFailure(run, repo)
+				executor.ReportPublishedHeadFailure(context.Background(), run, repo)
 			}
 			cancel(nil)
 			ag.Close()

@@ -49,7 +49,7 @@ func (s *RunShared) ReportCommitStatus(ctx context.Context, state, validatedSHA 
 }
 
 func (e *Executor) reportPublishedHeadStatus(runCtx context.Context, run *db.Run, repo *db.Repo, state string, validatedSHAs ...string) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(runCtx), commitStatusTimeout)
+	ctx, cancel := context.WithTimeout(runCtx, commitStatusTimeout)
 	defer cancel()
 	log := func(message string) {
 		// Terminal updates use a fresh file handle: the Push step's log is closed.
@@ -100,6 +100,6 @@ func (e *Executor) reportPublishedHeadStatus(runCtx context.Context, run *db.Run
 	}
 }
 
-func (e *Executor) ReportPublishedHeadFailure(run *db.Run, repo *db.Repo) {
-	e.reportPublishedHeadStatus(context.Background(), run, repo, "failure")
+func (e *Executor) ReportPublishedHeadFailure(ctx context.Context, run *db.Run, repo *db.Repo) {
+	e.reportPublishedHeadStatus(ctx, run, repo, "failure")
 }

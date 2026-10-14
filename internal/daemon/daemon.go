@@ -52,6 +52,8 @@ var applyShellEnvToProcess = func(excluded ...string) error {
 var createDaemonPIDTempFile = os.CreateTemp
 var renameDaemonPIDFile = os.Rename
 
+const recoveryCommitStatusTimeout = 60 * time.Second
+
 // Run starts the daemon process. It blocks until a shutdown signal is received
 // or the shutdown IPC method is called. This is called via the hidden
 // `no-mistakes daemon run` entrypoint used by managed and detached services.
@@ -263,7 +265,7 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConf
 	slog.Info("daemon process launched", "pid", pidRecord.PID)
 
 	// Recovery remains exclusive and completes before IPC is bound.
-	recoverOnStartup(d, p, mgr, layout)
+	recoveredRuns := recoverOnStartup(d, p, mgr, layout)
 
 	srv := ipc.NewServer()
 
@@ -274,8 +276,8 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConf
 	doShutdown := func(reason string) {
 		shutdownOnce.Do(func() {
 			slog.Info("shutting down", "reason", reason)
-			mgr.Shutdown()
 			cancel()
+			mgr.Shutdown()
 			srv.Close()
 		})
 	}
@@ -310,6 +312,15 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConf
 		return fmt.Errorf("confirm IPC health: %w", err)
 	}
 	logStartupPhase("ipc_health", healthStarted)
+	reportingDone := make(chan struct{})
+	go func() {
+		defer close(reportingDone)
+		reportRecoveredCommitStatuses(ctx, d, p, mgr, recoveredRuns, recoveryCommitStatusTimeout)
+	}()
+	defer func() {
+		cancel()
+		<-reportingDone
+	}()
 	slog.Info("daemon ready", "socket", socketPath, "pid", os.Getpid(), "startup_ms", time.Since(startupStarted).Milliseconds())
 
 	if err := <-serveErrCh; err != nil {
@@ -399,7 +410,7 @@ func writeDaemonPIDFile(path string, record daemonPIDFile) error {
 // best-effort migrates gate bare repos in place so older installs pick up
 // the per-worktree hookspath isolation introduced for issue #122 when Git
 // supports config --worktree.
-func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktrees.Layout) {
+func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktrees.Layout) []*db.Run {
 	orphanStarted := time.Now()
 	reapOrphanedServers(p)
 	logStartupPhase("orphan_servers", orphanStarted)
@@ -452,19 +463,7 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 		for _, plan := range plans {
 			_ = plan.agent.Close()
 		}
-		return
-	}
-	for _, stale := range staleRuns {
-		run, err := d.GetRun(stale.ID)
-		if err != nil || run == nil || run.Status != types.RunFailed {
-			continue
-		}
-		repo, err := d.GetRepo(run.RepoID)
-		if err != nil || repo == nil {
-			slog.Warn("failed to read repository for commit status recovery", "run", run.ID, "error", err)
-			continue
-		}
-		pipeline.NewExecutor(d, p, nil, nil, []pipeline.Step{&steps.PushStep{}}, mgr.broadcast).ReportPublishedHeadFailure(run, repo)
+		return nil
 	}
 	if count > 0 {
 		slog.Info("recovered stale runs from previous crash", "count", count)
@@ -513,6 +512,27 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 	logStartupPhase("evidence_cleanup", evidenceStarted)
 
 	mgr.resumeRecoveredRuns(plans)
+	return staleRuns
+}
+
+func reportRecoveredCommitStatuses(parent context.Context, d *db.DB, p *paths.Paths, mgr *RunManager, runs []*db.Run, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	for _, stale := range runs {
+		if ctx.Err() != nil {
+			return
+		}
+		run, err := d.GetRun(stale.ID)
+		if err != nil || run == nil || run.Status != types.RunFailed {
+			continue
+		}
+		repo, err := d.GetRepo(run.RepoID)
+		if err != nil || repo == nil {
+			slog.Warn("failed to read repository for commit status recovery", "run", run.ID, "error", err)
+			continue
+		}
+		pipeline.NewExecutor(d, p, nil, nil, []pipeline.Step{&steps.PushStep{}}, mgr.broadcast).ReportPublishedHeadFailure(ctx, run, repo)
+	}
 }
 
 func preserveStaleRunHeads(d *db.DB, p *paths.Paths, excluded map[string]struct{}) {
