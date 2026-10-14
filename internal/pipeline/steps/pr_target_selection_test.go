@@ -2,12 +2,15 @@ package steps
 
 import (
 	"context"
+	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
+	"github.com/kunchenguid/no-mistakes/internal/scm/forgejo"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -474,6 +477,71 @@ func TestFreshRetargetRejectsMovedHeadAndUnsupportedProvider(t *testing.T) {
 			}
 			if len(reader.retargets) != 0 || !sctx.Run.PRBaseBranchRequested {
 				t.Fatalf("unsafe mutation or consumed request: retargets=%v requested=%v", reader.retargets, sctx.Run.PRBaseBranchRequested)
+			}
+		})
+	}
+}
+
+func TestResolvePRTarget_ForgejoSourceUnderURLPrefix(t *testing.T) {
+	isolateForgejoSSHDomainEnv(t)
+	for _, remote := range []string{
+		"git@ssh.forge.example:git/octo/widgets.git",
+		"https://forge.example:3443/git/octo/widgets.git",
+		"git@ssh.forge.example:octo/widgets.git",
+		"https://forge.example:3443/octo/widgets.git",
+	} {
+		t.Run(remote, func(t *testing.T) {
+			sctx, facts := selectionFixture(t)
+			sctx.Run.PRBaseBranch = nil
+			baseURL := forgejoSSHDomainBase
+			if !strings.Contains(remote, "git/octo/") {
+				baseURL = "https://forge.example:3443"
+			}
+			sctx.Repo.UpstreamURL = remote
+			sctx.Env = append(sctx.Env, "FORGEJO_BASE_URL="+baseURL, "FORGEJO_SSH_DOMAIN=ssh.forge.example")
+			facts.PR.URL = baseURL + "/octo/widgets/pulls/42"
+			facts.SourceRepository = "octo/widgets"
+			base, repo, err := forgejo.ResolveRemoteWithSSHDomain(remote, forgejoBaseURLForStep(sctx), scm.ResolveHost(sctx.Ctx, remote), forgejoSSHDomainForStep(sctx))
+			if err != nil || base != baseURL || repo != "octo/widgets" {
+				t.Fatalf("host routing = %s, %s, %v", base, repo, err)
+			}
+			if resolvedProvider(sctx) != scm.ProviderForgejo {
+				t.Fatalf("provider = %s", resolvedProvider(sctx))
+			}
+			host := forgejo.New(forgejo.Options{BaseURL: base, Repository: repo, CommandFactory: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+				if len(args) < 3 || args[0] != "api" || args[1] != "GET" {
+					t.Fatalf("unexpected command %s %v", name, args)
+				}
+				var body string
+				switch args[2] {
+				case "repos/octo/widgets/pulls?state=open&sort=oldest&limit=50&page=1":
+					body = `{"status":200,"data":[{"number":42}]}`
+				case "repos/octo/widgets/pulls?state=open&sort=oldest&limit=50&page=2":
+					body = `{"status":200,"data":[]}`
+				case "repos/octo/widgets/pulls/42":
+					body = fmt.Sprintf(`{"status":200,"data":{"number":42,"html_url":%q,"state":"open","merged":false,"head":{"ref":"feature","sha":%q,"repo":{"full_name":%q}},"base":{"ref":"develop"}}}`, facts.PR.URL, facts.HeadSHA, facts.SourceRepository)
+				default:
+					t.Fatalf("unexpected Forgejo endpoint %s", args[2])
+				}
+				return exec.CommandContext(ctx, "sh", "-c", `printf '%s' "$1"`, "fixture", body)
+			}})
+			selected, err := resolvePRTargetWithReader(sctx, host, false)
+			if err != nil || selected.PRURL != facts.PR.URL || selected.SourceRepo != "octo/widgets" || selected.TargetBranch != "develop" {
+				t.Fatalf("discovery = %+v, %v", selected, err)
+			}
+			sctx.Run.PRURL = &facts.PR.URL
+			selected, err = resolvePRTargetWithReader(sctx, host, false)
+			if err != nil || selected.PRURL != facts.PR.URL || selected.SourceRepo != "octo/widgets" || selected.TargetBranch != "develop" {
+				t.Fatalf("recorded PR = %+v, %v", selected, err)
+			}
+			facts.SourceRepository = "octo/other"
+			if _, err := resolvePRTargetWithReader(sctx, host, false); err == nil || !strings.Contains(err.Error(), "source octo/other") {
+				t.Fatalf("foreign recorded source = %v", err)
+			}
+			sctx.Run.PRURL = nil
+			selected, err = resolvePRTargetWithReader(sctx, host, false)
+			if err != nil || selected.PRURL != "" || selected.SourceRepo != "octo/widgets" || selected.TargetBranch != "configured" {
+				t.Fatalf("foreign discovery = %+v, %v", selected, err)
 			}
 		})
 	}

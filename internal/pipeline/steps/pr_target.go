@@ -9,6 +9,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/scm/azuredevops"
+	"github.com/kunchenguid/no-mistakes/internal/scm/forgejo"
 )
 
 // ResolvePRTarget selects an exact, read-only forge observation before the
@@ -57,6 +58,12 @@ func resolvePRTargetWithReader(sctx *pipeline.StepContext, reader scm.PRFactsRea
 		canonical, err := azuredevops.CanonicalSourceRepository(pushURL)
 		if err != nil {
 			return pipeline.PRTargetSelection{}, fmt.Errorf("canonicalize Azure PR source repository: %w", err)
+		}
+		sourceRepo = canonical
+	} else if resolvedProvider(sctx) == scm.ProviderForgejo {
+		_, canonical, err := forgejo.ResolveRemoteWithSSHDomain(pushURL, forgejoBaseURLForStep(sctx), scm.ResolveHost(sctx.Ctx, pushURL), forgejoSSHDomainForStep(sctx))
+		if err != nil {
+			return pipeline.PRTargetSelection{}, fmt.Errorf("canonicalize Forgejo PR source repository: %w", err)
 		}
 		sourceRepo = canonical
 	}
