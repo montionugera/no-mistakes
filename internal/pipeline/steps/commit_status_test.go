@@ -25,7 +25,7 @@ import (
 type statusRequest struct{ Path, State, Context, Description, TargetURL string }
 
 func TestPipeline_GitHubCommitStatuses(t *testing.T) {
-	for _, scenario := range []string{"pass", "fail after push", "cancel after push", "no push", "forgejo", "bitbucket", "repair head", "posting fails", "already upstream", "fork", "formatter head", "recovered failure", "CI repair readiness", "Test no-go exception", "Test inconclusive exception", "skipped Test"} {
+	for _, scenario := range []string{"pass", "fail after push", "cancel after push", "no push", "forgejo", "bitbucket", "repair head", "posting fails", "already upstream", "fork", "formatter head", "recovered failure", "CI repair readiness", "Test no-go exception", "Test inconclusive exception", "skipped Test", "late Document", "late Lint", "stale tested head"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir, base, head := setupGitRepo(t)
 			remote := t.TempDir()
@@ -83,12 +83,20 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 			if scenario == "bitbucket" {
 				provider = scm.ProviderBitbucket
 			}
+			reviewHeads := []string{}
+			testHeads := []string{}
+			lateHead := ""
 			var steps []pipeline.Step
 			for _, name := range []types.StepName{types.StepReview, types.StepTest, types.StepDocument, types.StepLint} {
 				name := name
 				steps = append(steps, &transitionStep{name: name, execute: func(sc *pipeline.StepContext) (*pipeline.StepOutcome, error) {
 					o := &pipeline.StepOutcome{}
 					if name == types.StepTest {
+						testHeads = append(testHeads, sc.Run.HeadSHA)
+						o.Findings = fmt.Sprintf(`{"findings":[],"tested_head_sha":%q}`, sc.Run.HeadSHA)
+						if scenario == "stale tested head" {
+							o.Findings = fmt.Sprintf(`{"findings":[],"tested_head_sha":%q}`, base)
+						}
 						if scenario == "skipped Test" {
 							o.Skipped = true
 						}
@@ -99,7 +107,27 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 						}
 					}
 					if name == types.StepReview {
+						if lateHead != "" {
+							mu.Lock()
+							posted := len(requests)
+							mu.Unlock()
+							if posted != 0 {
+								t.Fatal("late head posted before revalidation")
+							}
+						}
+						reviewHeads = append(reviewHeads, sc.Run.HeadSHA)
 						o.ReviewApprovedHeadSHA = sc.Run.HeadSHA
+					}
+					if (scenario == "late Document" && name == types.StepDocument || scenario == "late Lint" && name == types.StepLint) && lateHead == "" {
+						if err := os.WriteFile(filepath.Join(dir, "late.txt"), []byte("late edit"), 0600); err != nil {
+							t.Fatal(err)
+						}
+						gitCmd(t, dir, "add", "late.txt")
+						gitCmd(t, dir, "commit", "-m", "late gate edit")
+						lateHead = gitCmd(t, dir, "rev-parse", "HEAD")
+						if err := recordAgentFixHead(sc, name, lateHead); err != nil {
+							return nil, err
+						}
 					}
 					return o, nil
 				}})
@@ -107,7 +135,7 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 			if scenario != "no push" {
 				steps = append(steps, &PushStep{})
 			}
-			uncertified := scenario == "skipped Test" || strings.HasPrefix(scenario, "Test ")
+			uncertified := scenario == "skipped Test" || scenario == "stale tested head" || strings.HasPrefix(scenario, "Test ")
 			ciCalls := 0
 			repaired := ""
 			steps = append(steps, &transitionStep{name: types.StepCI, execute: func(sc *pipeline.StepContext) (*pipeline.StepOutcome, error) {
@@ -246,6 +274,12 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 			}
 			if scenario == "formatter head" {
 				want = []statusRequest{{Path: "/repos/test/repo/statuses/" + repaired, State: "pending"}, {Path: "/repos/test/repo/statuses/" + repaired, State: "success"}}
+			}
+			if strings.HasPrefix(scenario, "late ") {
+				if len(reviewHeads) != 2 || reviewHeads[0] != head || reviewHeads[1] != lateHead || len(testHeads) != 2 || testHeads[0] != head || testHeads[1] != lateHead {
+					t.Fatalf("reviewed %v, tested %v, want original %s then late %s", reviewHeads, testHeads, head, lateHead)
+				}
+				want = []statusRequest{{Path: "/repos/test/repo/statuses/" + lateHead, State: "pending"}, {Path: "/repos/test/repo/statuses/" + lateHead, State: "success"}}
 			}
 			if scenario == "fork" {
 				for i := range want {

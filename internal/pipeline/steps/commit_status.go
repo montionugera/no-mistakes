@@ -110,7 +110,13 @@ func (*PushStep) ReportPublishedHeadStatus(sctx *pipeline.StepContext, state, va
 // A skipped or overridden local gate cannot claim that all local validation
 // passed. CI repairs published without revalidation therefore stay pending
 // until exact-head CI readiness proves completion.
-func localValidationPassed(sctx *pipeline.StepContext) bool {
+func localValidationPassed(sctx *pipeline.StepContext, head string) bool {
+	if head != "" {
+		run, err := sctx.DB.GetRun(sctx.Run.ID)
+		if err != nil || run == nil || run.ReviewApprovedHeadSHA == nil || *run.ReviewApprovedHeadSHA != head {
+			return false
+		}
+	}
 	steps, err := sctx.DB.GetStepsByRun(sctx.Run.ID)
 	if err != nil {
 		return false
@@ -119,6 +125,15 @@ func localValidationPassed(sctx *pipeline.StepContext) bool {
 		passed := false
 		for _, step := range steps {
 			if step.StepName == name && step.Status == types.StepStatusCompleted && step.OverrideReason == nil && step.TestOverrideReason() == "" {
+				if name == types.StepTest && head != "" {
+					if step.FindingsJSON == nil {
+						return false
+					}
+					findings, err := types.ParseFindingsJSON(*step.FindingsJSON)
+					if err != nil || findings.TestedHeadSHA != head {
+						return false
+					}
+				}
 				passed = true
 				break
 			}
