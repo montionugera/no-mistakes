@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
