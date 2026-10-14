@@ -135,3 +135,25 @@ func singleLineText(s string, maxRunes int) string {
 	}
 	return s
 }
+
+func rebindAcceptedGapAudit(body string, steps []*db.StepResult, provider scm.Provider) string {
+	lines := strings.Split(body, "\n")
+	for i := 0; i < len(lines); i++ {
+		if lines[i] != acceptedGapsHeading {
+			continue
+		}
+		end := i + 1
+		for end < len(lines) {
+			line := lines[end]
+			if strings.HasPrefix(line, "## ") || strings.HasPrefix(line, "### ") || strings.HasPrefix(line, "<details>") || strings.HasPrefix(line, "</details>") || strings.HasPrefix(line, pipelineAttestationCommentPrefix) {
+				break
+			}
+			end++
+		}
+		lines = append(lines[:i], lines[end:]...)
+		i--
+	}
+	body = strings.Join(lines, "\n")
+	block := neutralizeAttestationMarkers(provider, buildAcceptedGapsBlock(steps, prBodyFlavorFor(provider)))
+	return joinBlocks(body, block)
+}

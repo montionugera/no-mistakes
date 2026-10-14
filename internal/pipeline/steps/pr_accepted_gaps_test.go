@@ -1,6 +1,7 @@
 package steps
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -198,5 +199,88 @@ func TestAcceptedGapDigestsCoverThePublishedRedactedText(t *testing.T) {
 		if g := item.AcceptedGaps; g == nil || g.ReasonDigest != fmt.Sprintf("%x", sha256.Sum256([]byte(redactedReason))) || g.CoveredByDigest != fmt.Sprintf("%x", sha256.Sum256([]byte(redactedCovered))) {
 			t.Fatalf("digests do not cover the published redacted text: %+v", g)
 		}
+	}
+}
+
+func TestRestampAcceptedGapAuditMatchesCurrentSteps(t *testing.T) {
+	for _, provider := range []scm.Provider{scm.ProviderGitHub, scm.ProviderBitbucket, scm.ProviderAzureDevOps} {
+		for _, mode := range []string{config.PRAppendixFull, config.PRAppendixMinimal, config.PRAppendixCollapsed} {
+			for _, owned := range []bool{false, true} {
+				for _, state := range []string{"missing", "stale", "removed", "repair"} {
+					t.Run(fmt.Sprintf("%s/%s/owned=%t/%s", provider, mode, owned, state), func(t *testing.T) {
+						previous := acceptedGapStepsForTest(t)
+						if state == "missing" {
+							previous[1].AcceptedGapsJSON = nil
+						} else {
+							raw := strings.ReplaceAll(*previous[1].AcceptedGapsJSON, acceptedGapTestReason, "previous owner approval")
+							previous[1].AcceptedGapsJSON = &raw
+						}
+						md, _ := buildPipelineSummaryFor(previous, nil, testPipelineHeadSHA, scm.ProviderGitHub, pipelineAttestationPolicy{})
+						body := appendixEvidence(mode, prBodyHTML, "low risk", "", md, provider)
+						if owned {
+							body = "Author prefix\n\n" + wrapPRAppendix(body) + "\nAuthor suffix"
+						}
+						current := acceptedGapStepsForTest(t)
+						wantReason := acceptedGapTestReason
+						if state == "removed" {
+							current[1].AcceptedGapsJSON = nil
+							wantReason = ""
+						} else if state == "repair" {
+							current = nil
+							wantReason = "previous owner approval"
+						}
+						host := &attestationTestHost{provider: provider, body: body}
+						head := strings.Repeat("ab", 20)
+						if err := restampPRAttestationWithSteps(context.Background(), host, &scm.PR{Number: "42"}, head, current, nil, pipelineAttestationPolicy{}, nil); err != nil {
+							t.Fatal(err)
+						}
+						got := host.body
+						attestation := parsePipelineAttestationForTest(t, got)
+						if attestation.HeadSHA != head {
+							t.Fatal("head not rebound")
+						}
+						var gap *pipelineAttestationAcceptedGaps
+						for _, step := range attestation.Steps {
+							if step.Step == types.StepTest {
+								gap = step.AcceptedGaps
+							}
+						}
+						if wantReason == "" {
+							if gap != nil || strings.Contains(got, acceptedGapsHeading) || strings.Contains(got, "previous owner approval") {
+								t.Fatal("obsolete gap retained")
+							}
+						} else {
+							if strings.Count(got, "Approved: "+wantReason) != 1 || strings.Count(got, "Covered by: "+acceptedGapTestCoveredBy) != 1 || gap == nil || gap.ReasonDigest != fmt.Sprintf("%x", sha256.Sum256([]byte(wantReason))) {
+								t.Fatalf("audit and attestation disagree: %s", got)
+							}
+							if state != "repair" && strings.Contains(got, "previous owner approval") {
+								t.Fatal("stale approval retained")
+							}
+						}
+						if owned {
+							parts, err := parsePROwnedBody(got)
+							if err != nil || parts.before != "Author prefix\n\n" || parts.after != "\nAuthor suffix" {
+								t.Fatalf("ownership changed: %+v %v", parts, err)
+							}
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestRestampAcceptedGapAuditRefusesOrdinaryOverflow(t *testing.T) {
+	steps := acceptedGapStepsForTest(t)
+	old := acceptedGapStepsForTest(t)
+	old[1].AcceptedGapsJSON = nil
+	md, _ := buildPipelineSummaryFor(old, nil, testPipelineHeadSHA, scm.ProviderAzureDevOps, pipelineAttestationPolicy{})
+	body := joinBlocks(strings.Repeat("x", 3900-scm.PRBodyLen(md)), md)
+	host := &attestationTestHost{provider: scm.ProviderAzureDevOps, body: body}
+	if err := restampPRAttestationWithSteps(context.Background(), host, &scm.PR{Number: "42"}, strings.Repeat("ab", 20), steps, nil, pipelineAttestationPolicy{}, nil); err == nil {
+		t.Fatal("impossible audit budget accepted")
+	}
+	if host.updates != 0 || host.body != body {
+		t.Fatal("overflow reached publication")
 	}
 }
