@@ -5,13 +5,16 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/scm/github"
+	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -84,7 +87,13 @@ func reconcileCommitStatusAttempt(sctx *pipeline.StepContext) (*db.CommitStatusP
 			target = current
 		}
 	}
-	remote, err := lsRemoteSHA(func(args ...string) (string, error) { return stepGitRun(&bounded, args...) }, target, attempt.Ref)
+	remote, err := lsRemoteSHA(func(args ...string) (string, error) {
+		cmd := stepCmd(&bounded, "git", args...)
+		cmd.Env = git.NonInteractiveEnvFrom(cmd.Env, bounded.WorkDir)
+		shellenv.ConfigureShellCommand(cmd)
+		out, err := shellenv.OutputShellCommand(cmd)
+		return strings.TrimSpace(string(out)), err
+	}, target, attempt.Ref)
 	if err != nil {
 		return nil, err
 	}

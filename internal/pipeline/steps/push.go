@@ -216,7 +216,7 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 
 	if !decision.upToDate {
 		if err := recordCommitStatusAttempt(sctx, headBeingPushed, pushURL, ref, attestationSteps != nil && localValidationPassed(sctx, headBeingPushed), attestationSteps == nil && localValidationPassed(sctx, "")); err != nil {
-			return fmt.Errorf("record publication before push: %w", err)
+			statusWarning(sctx.Log, "record publication before push", err)
 		}
 	}
 	switch {
@@ -265,7 +265,7 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 	}
 	publication, err := confirmVerifiedCommitStatus(sctx, verifiedRemote, pushURL, ref)
 	if err != nil {
-		return fmt.Errorf("record verified commit status publication: %w", err)
+		statusWarning(sctx.Log, "record verified publication", err)
 	}
 	if publication != nil {
 		report := commitStatusReporter(sctx, publication)

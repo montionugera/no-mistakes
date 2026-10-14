@@ -2,6 +2,7 @@ package steps
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -101,7 +102,7 @@ func TestCommitStatusRemoteConfirmationHasOwnDeadline(t *testing.T) {
 	binDir := fakeCLIBinDir(t)
 	linkTestBinary(t, binDir, "git")
 	marker := filepath.Join(t.TempDir(), "remote-started")
-	sc.Env = fakeCLIEnv(binDir, map[string]string{"FAKE_CLI_MODE": "git-status-confirmation-stalled", "FAKE_CLI_STARTED_FILE": marker})
+	sc.Env = fakeCLIEnv(binDir, map[string]string{"FAKE_CLI_MODE": "git-status-confirmation-stalled", "FAKE_CLI_STARTED_FILE": marker, "FAKE_CLI_INHERITED_PIPE_CHILD": "1"})
 	sc.Ctx = context.Background()
 	done := make(chan struct{})
 	go func() {
@@ -123,6 +124,62 @@ func TestCommitStatusRemoteConfirmationHasOwnDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-commitStatusLock
+}
+
+func TestPushCommitStatusRecordingErrorsOnlyWarn(t *testing.T) {
+	for _, table := range []string{"commit_status_attempts", "commit_status_publications"} {
+		t.Run(table, func(t *testing.T) {
+			dir, base, head := setupGitRepo(t)
+			remote := t.TempDir()
+			gitCmd(t, remote, "init", "--bare", ".")
+			gitCmd(t, dir, "config", "url."+remote+".insteadOf", "https://github.com/test/repo")
+			sc := newTestContext(t, &mockAgent{name: "test"}, dir, base, head, config.Commands{})
+			dbPath := filepath.Join(t.TempDir(), "status.db")
+			database, err := db.Open(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			sc.DB = database
+			sc.Repo, err = database.InsertRepo(dir, "https://github.com/test/repo", "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			sc.Run, err = database.InsertRun(sc.Repo.ID, "refs/heads/feature", head, base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sc.Repo.URLsVerified = true
+			sc.Env, _ = fakeGH(t, "")
+			sc.ForgeContext = &forgecontext.Context{Provider: scm.ProviderGitHub, Host: "github.com"}
+			if err := database.UpdateRunReviewApprovedHeadSHA(sc.Run.ID, head); err != nil {
+				t.Fatal(err)
+			}
+			faults, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer faults.Close()
+			if _, err := faults.Exec("CREATE TRIGGER reject_status BEFORE INSERT ON " + table + " BEGIN SELECT RAISE(FAIL, 'status recording unavailable'); END"); err != nil {
+				t.Fatal(err)
+			}
+			var warnings []string
+			sc.Log = func(message string) { warnings = append(warnings, message) }
+			if err := publishRunHead(sc, head, "", nil); err != nil {
+				t.Fatalf("status recording error failed Push: %v", err)
+			}
+			if got := gitCmd(t, remote, "rev-parse", "refs/heads/feature"); got != head {
+				t.Fatalf("remote head = %s, want %s", got, head)
+			}
+			run, err := database.GetRun(sc.Run.ID)
+			if err != nil || run.LastPushedSHA == nil || *run.LastPushedSHA != head {
+				t.Fatalf("successful push not settled: %+v, %v", run, err)
+			}
+			if !strings.Contains(strings.Join(warnings, "\n"), "warning: no-mistakes commit status") || !strings.Contains(strings.Join(warnings, "\n"), "status recording unavailable") {
+				t.Fatalf("status recording failure not logged: %v", warnings)
+			}
+		})
+	}
 }
 
 func TestCommitStatusLateAttemptAfterRepairStaysRetired(t *testing.T) {
@@ -534,8 +591,9 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 			var requests []statusRequest
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var payload struct {
-					State       string `json:"state"`
-					Context     string `json:"context"`
+					State   string `json:"state"`
+					Context string `json:"context"
+	"database/sql"`
 					Description string `json:"description"`
 					TargetURL   string `json:"target_url"`
 				}

@@ -65,8 +65,21 @@ func handleFakeCLI(mode string) {
 	}
 
 	switch mode {
+	case "git-status-confirmation-pipe-child":
+		time.Sleep(time.Hour)
+		return
 	case "git-status-confirmation-stalled":
 		if fakeGitSubcommand(args) == "ls-remote" {
+			if os.Getenv("FAKE_CLI_INHERITED_PIPE_CHILD") == "1" {
+				child := exec.Command(os.Args[0])
+				child.Env = append(os.Environ(), "FAKE_CLI_MODE=git-status-confirmation-pipe-child")
+				child.Stdout = os.Stdout
+				child.Stderr = os.Stderr
+				if err := child.Start(); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
+			}
 			if err := os.WriteFile(os.Getenv("FAKE_CLI_STARTED_FILE"), []byte("ls-remote"), 0600); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
