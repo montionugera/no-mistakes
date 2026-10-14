@@ -27,6 +27,119 @@ import (
 
 type statusRequest struct{ Path, State, Context, Description, TargetURL string }
 
+func TestCommitStatusNewerPublicationOwnsStatus(t *testing.T) {
+	for _, path := range []string{"attempt", "persisted", "cached"} {
+		for _, scope := range []string{"same", "other SHA", "other repo", "other host"} {
+			t.Run(path+"/"+scope, func(t *testing.T) {
+				dir, base, head := setupGitRepo(t)
+				remote := t.TempDir()
+				gitCmd(t, remote, "init", "--bare", ".")
+				target := "https://github.com/test/repo"
+				gitCmd(t, dir, "config", "url."+remote+".insteadOf", target)
+				gitCmd(t, dir, "push", target, base+":refs/heads/feature")
+				sc := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, base, head, config.Commands{})
+				sc.ForgeContext = &forgecontext.Context{Provider: scm.ProviderGitHub, Host: "github.com"}
+				publication := db.CommitStatusPublication{SHA: head, Host: "github.com", Repo: "test/repo", Validated: true}
+				var mu sync.Mutex
+				var requests []statusRequest
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					var payload struct{ State, Context string }
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Error(err)
+					}
+					if r.Method != "POST" || payload.Context != "no-mistakes" {
+						t.Errorf("unexpected status request: %s %+v", r.Method, payload)
+					}
+					mu.Lock()
+					requests = append(requests, statusRequest{Path: r.URL.Path, State: payload.State})
+					mu.Unlock()
+					w.WriteHeader(http.StatusCreated)
+				}))
+				defer server.Close()
+				env, _ := fakeGH(t, "")
+				sc.Env = append(env, "FAKE_CLI_STATUS_API_URL="+server.URL)
+				if path == "attempt" {
+					if err := sc.DB.PutCommitStatusAttempt(sc.Run.ID, db.CommitStatusAttempt{CommitStatusPublication: publication, Target: target, Ref: "refs/heads/feature"}); err != nil {
+						t.Fatal(err)
+					}
+					(&PushStep{}).ReportPublishedHeadStatus(sc, "failure", "")
+					mu.Lock()
+					posted := len(requests)
+					mu.Unlock()
+					if posted != 0 {
+						t.Fatal("failed push posted a status before remote publication")
+					}
+				} else {
+					if err := sc.DB.PutCommitStatusPublication(sc.Run.ID, publication); err != nil {
+						t.Fatal(err)
+					}
+					if path == "cached" {
+						sc.Shared.SetCommitStatusReporter(commitStatusReporter(sc, &publication))
+					}
+				}
+				newer, err := sc.DB.InsertRun(sc.Repo.ID, sc.Run.Branch, head, base)
+				if err != nil {
+					t.Fatal(err)
+				}
+				gitCmd(t, dir, "push", target, head+":refs/heads/feature")
+				newPublication := publication
+				switch scope {
+				case "other SHA":
+					newPublication.SHA = base
+				case "other repo":
+					newPublication.Repo = "fork/repo"
+				case "other host":
+					newPublication.Host = "enterprise.example.com"
+				}
+				if err := sc.DB.PutCommitStatusPublication(newer.ID, newPublication); err != nil {
+					t.Fatal(err)
+				}
+				newContext := *sc
+				newContext.Run = newer
+				newContext.Shared = &pipeline.RunShared{}
+				newReport := commitStatusReporter(&newContext, &newPublication)
+				newReport(sc.Ctx, "pending", "", sc.Log)
+				newReport(sc.Ctx, "success", "", sc.Log)
+				if err := sc.DB.UpdateRunStatus(sc.Run.ID, types.RunFailed); err != nil {
+					t.Fatal(err)
+				}
+				sc.Run.Status = types.RunFailed
+				if err := sc.DB.UpdateRunStatus(newer.ID, types.RunCompleted); err != nil {
+					t.Fatal(err)
+				}
+				ids, err := sc.DB.CommitStatusRecoveryRunIDs(sc.Ctx)
+				if err != nil || len(ids) != 1 || ids[0] != sc.Run.ID {
+					t.Fatalf("recovery selection = %v, %v; want only older run", ids, err)
+				}
+				(&PushStep{}).ReportPublishedHeadStatus(sc, "failure", "")
+				if scope == "same" {
+					beginPublishedCommitStatus(sc)("success")
+					sc.Shared.ReportCommitStatus(sc.Ctx, "success", head, sc.Log)
+					sc.Shared.ReportCommitStatus(sc.Ctx, "failure", "", sc.Log)
+				}
+				if path == "attempt" && scope == "same" {
+					p, err := sc.DB.GetCommitStatusPublication(sc.Run.ID)
+					if err != nil || p != nil {
+						t.Fatalf("old attempt credited with newer push: %+v, %v", p, err)
+					}
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				want := []statusRequest{{Path: "/repos/" + newPublication.Repo + "/statuses/" + newPublication.SHA, State: "pending"}, {Path: "/repos/" + newPublication.Repo + "/statuses/" + newPublication.SHA, State: "success"}}
+				if scope != "same" {
+					if path == "attempt" {
+						want = append(want, statusRequest{Path: "/repos/test/repo/statuses/" + head, State: "pending"})
+					}
+					want = append(want, statusRequest{Path: "/repos/test/repo/statuses/" + head, State: "failure"})
+				}
+				if fmt.Sprint(requests) != fmt.Sprint(want) {
+					t.Fatalf("status requests = %+v, want %+v", requests, want)
+				}
+			})
+		}
+	}
+}
+
 func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 	for _, scenario := range []string{"pass", "push reply lost", "fail after push", "cancel after push", "no push", "forgejo", "bitbucket", "repair head", "posting fails", "already upstream", "attempt already upstream", "fork", "formatter head", "recovered failure", "CI repair readiness", "Test no-go exception", "Test inconclusive exception", "skipped Test", "late Document", "late Lint", "stale tested head"} {
 		t.Run(scenario, func(t *testing.T) {

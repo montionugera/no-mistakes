@@ -62,6 +62,16 @@ func (d *DB) GetCommitStatusPublication(runID string) (*CommitStatusPublication,
 	return p, err
 }
 
+func (d *DB) HasNewerCommitStatusPublication(ctx context.Context, runID string, p CommitStatusPublication) (bool, error) {
+	var newer bool
+	err := d.sql.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM commit_status_publications p JOIN runs newer ON newer.id=p.run_id
+		WHERE p.host=? AND p.repo=? AND p.sha=?
+		AND (newer.created_at>current.created_at OR (newer.created_at=current.created_at AND newer.id>current.id))
+	) FROM runs current WHERE current.id=?`, p.Host, p.Repo, p.SHA, runID).Scan(&newer)
+	return newer, err
+}
+
 // CommitStatusRecoveryRunIDs includes terminal runs whose durable outcome has
 // not reached the forge. Selection shares the reporting deadline.
 func (d *DB) CommitStatusRecoveryRunIDs(ctx context.Context) ([]string, error) {

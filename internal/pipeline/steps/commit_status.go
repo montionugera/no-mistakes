@@ -54,6 +54,9 @@ func reconcileCommitStatusAttempt(sctx *pipeline.StepContext) (bool, error) {
 	if err != nil || attempt == nil {
 		return false, err
 	}
+	if newer, err := sctx.DB.HasNewerCommitStatusPublication(sctx.Ctx, sctx.Run.ID, attempt.CommitStatusPublication); err != nil || newer {
+		return false, err
+	}
 	target := attempt.Target
 	if sctx.Repo != nil {
 		if current := resolvePushURL(sctx); safeurl.Redact(current) == target {
@@ -120,6 +123,14 @@ func commitStatusReporter(sctx *pipeline.StepContext, publication *db.CommitStat
 		}
 		mu.Lock()
 		defer mu.Unlock()
+		newer, err := sctx.DB.HasNewerCommitStatusPublication(ctx, sctx.Run.ID, *publication)
+		if err != nil {
+			statusWarning(log, "check publication ownership", err)
+			return
+		}
+		if newer {
+			return
+		}
 		if state == "success" && publication.CIEligible && validatedSHA == publication.SHA {
 			publication.Validated = true
 		}
