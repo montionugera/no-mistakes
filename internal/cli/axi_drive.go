@@ -1600,7 +1600,7 @@ func renderDriveResultForRun(cmd *cobra.Command, run *ipc.RunInfo, ciReady bool,
 	}
 
 	if gate, ok := rv.awaitingStep(); ok {
-		fields = append(fields, gateFieldsForRun(gate, runID)...)
+		fields = append(fields, gateFieldsFor(gate, runID, rv.Shipping != nil)...)
 		emitDoc(cmd, fields...)
 		return nil
 	}

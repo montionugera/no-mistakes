@@ -119,6 +119,11 @@ func (s *StepResult) AcceptedGapRefusal(strict bool, gaps AcceptedGaps) string {
 		case item.Category == types.FindingCategoryTestCommand:
 			return "a failing Test command cannot be accepted as a gap"
 		}
+		// Only the native verdict finding may carry the verdict category; a
+		// lookalike from the analyzer or a user is refused outright.
+		if item.Category == types.FindingCategoryTestVerdict && !types.IsNativeTestVerdictFinding(item) {
+			return fmt.Sprintf("finding %q claims the reserved test-verdict category but is not the Test step's own verdict finding", item.ID)
+		}
 		if item.ID != "" {
 			byID[item.ID] = item
 		}
@@ -130,7 +135,7 @@ func (s *StepResult) AcceptedGapRefusal(strict bool, gaps AcceptedGaps) string {
 		if !ok {
 			return fmt.Sprintf("accepted gap names unknown finding %q", id)
 		}
-		if item.Category != types.FindingCategoryTestVerdict {
+		if !types.IsNativeTestVerdictFinding(item) {
 			return fmt.Sprintf("finding %q is not an acceptable gap; only the inconclusive live-validation verdict can be accepted", id)
 		}
 		named[id] = true
@@ -222,4 +227,42 @@ func (d *DB) RecordAcceptedGaps(id string, gaps AcceptedGaps, strict bool) (Acce
 		return AcceptedGaps{}, fmt.Errorf("record accepted gaps: parked Test step not found")
 	}
 	return record, nil
+}
+
+// AcceptableGapIDs returns the finding IDs an accepted-gap approval must name
+// when this parked Test step is eligible for one, otherwise nil. It probes
+// AcceptedGapRefusal with a placeholder reason and covering tests, so gate
+// help and refusal hints can only offer a command the daemon would admit.
+func (s *StepResult) AcceptableGapIDs() []string {
+	if s.StepName != types.StepTest || s.FindingsJSON == nil {
+		return nil
+	}
+	findings, err := types.ParseFindingsJSON(*s.FindingsJSON)
+	if err != nil {
+		return nil
+	}
+	var ids []string
+	for _, item := range findings.Items {
+		if item.ActionOrDefault() != types.ActionNoOp {
+			ids = append(ids, item.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	probe := AcceptedGaps{FindingIDs: ids, Reason: strings.Repeat("x", MinAcceptedGapReasonLen), CoveredBy: "probe"}
+	if s.AcceptedGapRefusal(true, probe) != "" {
+		return nil
+	}
+	return ids
+}
+
+// acceptedGapHint is appended to strict approval refusals of a Test step that
+// an owner-approved accepted gap could complete.
+func (s *StepResult) acceptedGapHint() string {
+	ids := s.AcceptableGapIDs()
+	if len(ids) == 0 {
+		return ""
+	}
+	return "; if the owner has approved this specific gap, use `axi respond --action approve --accept-gap " + strings.Join(ids, ",") + " --reason \"<who approved, where, when>\" --covered-by \"<tests>\"`"
 }

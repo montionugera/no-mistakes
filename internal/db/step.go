@@ -524,7 +524,7 @@ func (s *StepResult) StrictApprovalRefusal(reason string) string {
 		return ""
 	}
 	if reason != "" || s.ApprovalReason != nil {
-		return "strict shipping forbids Test exceptions"
+		return "strict shipping forbids Test exceptions" + s.acceptedGapHint()
 	}
 	if s.FindingsJSON != nil {
 		findings, err := types.ParseFindingsJSON(*s.FindingsJSON)
@@ -536,7 +536,7 @@ func (s *StepResult) StrictApprovalRefusal(reason string) string {
 			}
 		}
 		if err != nil || types.HasActionableFindings(findings) || s.StepName == types.StepTest && (findings.Verdict == types.TestVerdictNoSurface || findings.Verdict == types.TestVerdictNoGo || findings.Verdict == types.TestVerdictInconclusive) {
-			return "strict shipping cannot approve unresolved actionable findings"
+			return "strict shipping cannot approve unresolved actionable findings" + s.acceptedGapHint()
 		}
 	}
 	return ""

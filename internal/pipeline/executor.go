@@ -2085,16 +2085,44 @@ func (e *Executor) applyApprovalOverride(step Step, sctx *StepContext, stepResul
 	// An accepted strict-shipping gap is recorded as its own audit row and
 	// deliberately NOT as an approval reason: the step completes normally
 	// with the unresolved gap, and the receipt re-validates the acceptance.
+	strict := sctx.Run.Shipping != nil
 	if gaps != nil {
-		if _, err := e.db.RecordAcceptedGaps(stepResultID, *gaps, sctx.Run.Shipping != nil); err != nil {
+		if _, err := e.db.RecordAcceptedGaps(stepResultID, *gaps, strict); err != nil {
 			return err
 		}
-	} else if step.Name() == types.StepTest {
-		// Every Test approval keeps its reason; db.StepResult.TestOverrideReason
-		// decides from the parked evidence whether it qualifies completion. Keep
-		// it separate from the command-waiver enforcement marker.
-		if err := e.db.SetTestApprovalReason(stepResultID, approvalReason); err != nil {
+		// The write and the completion are separate statements, so re-check
+		// what the durable row now admits before completing on it.
+		row, err := e.db.GetStepResult(stepResultID)
+		if err != nil {
 			return err
+		}
+		if row == nil || row.ValidAcceptedGaps() == nil {
+			return fmt.Errorf("accepted gap was not durably recorded for step %s", step.Name())
+		}
+		if refusal := row.StrictApprovalRefusal(""); refusal != "" {
+			return errors.New(refusal)
+		}
+	} else if step.Name() == types.StepTest {
+		// A daemon stop between recording a gap and completing the step leaves
+		// the parked row holding a valid durable acceptance. Recovery reuses it:
+		// an ordinary approval reason would invalidate the gap (it forbids Test
+		// exceptions in strict shipping) and strand a run the owner already
+		// approved. Admission refuses a plain approval carrying its own reason.
+		reuse := false
+		if strict {
+			row, err := e.db.GetStepResult(stepResultID)
+			if err != nil {
+				return err
+			}
+			reuse = row != nil && approvalReason == "" && row.ValidAcceptedGaps() != nil && row.StrictApprovalRefusal("") == ""
+		}
+		if !reuse {
+			// Every Test approval keeps its reason; db.StepResult.TestOverrideReason
+			// decides from the parked evidence whether it qualifies completion. Keep
+			// it separate from the command-waiver enforcement marker.
+			if err := e.db.SetTestApprovalReason(stepResultID, approvalReason); err != nil {
+				return err
+			}
 		}
 	}
 	verifier, ok := step.(ApprovalOverrideVerifier)

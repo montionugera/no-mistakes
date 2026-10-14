@@ -621,9 +621,23 @@ func gateFields(gate stepView) []toon.Field {
 // gateFieldsForRun renders the gate with every follow-up command that accepts
 // --run carrying runID, so a caller that selected the run by id keeps naming it.
 func gateFieldsForRun(gate stepView, runID string) []toon.Field {
+	return gateFieldsFor(gate, runID, false)
+}
+
+// gateFieldsFor is gateFieldsForRun that knows whether the run is strict
+// shipping. A strict Test gate parked on an eligible inconclusive verdict
+// cannot be plainly approved, so its help names the accepted-gap command
+// instead of a plain approve that the daemon would refuse.
+func gateFieldsFor(gate stepView, runID string, strict bool) []toon.Field {
 	respond := "no-mistakes axi respond" + runFlag(runID)
+	approve := "Run `" + respond + " --action approve` to accept this step and continue"
+	if strict && gate.Name == string(types.StepTest) {
+		if ids := (&db.StepResult{StepName: types.StepTest, FindingsJSON: &gate.FindingsJSON}).AcceptableGapIDs(); len(ids) > 0 {
+			approve = "Plain approve is refused in strict shipping for this inconclusive Test verdict. Only if the owner has explicitly approved this specific gap (the unreachable scenarios are covered by mocked tests), run `" + respond + " --action approve --accept-gap " + strings.Join(ids, ",") + " --reason \"<who approved, where, when>\" --covered-by \"<tests>\"`; do not use it without that approval. The reason must name who approved and where (at least 10 characters), and every actionable finding must be named"
+		}
+	}
 	help := []string{
-		"Run `" + respond + " --action approve` to accept this step and continue",
+		approve,
 		"Run `" + respond + " --action fix --findings <ids> [--ignore <ids>]` to have the pipeline fix the selected findings (do not edit files yourself); list every finding below in `--findings` or `--ignore`, unless an earlier round of this step already decided it, and a finding that round chose to fix cannot be declined by a later response",
 	}
 	// A review parked in waiting-on-answers is not asking for a verdict: its

@@ -24,15 +24,15 @@ func TestAxiRespond_AcceptGapFlagValidation(t *testing.T) {
 		want string
 	}{
 		{"covered-by without accept-gap", []string{"--action", "approve", "--step", "test", "--reason", acceptGapReason, "--covered-by", "TestX"}, "--covered-by applies only with --accept-gap"},
-		{"fix action", []string{"--action", "fix", "--findings", "test-1", "--step", "test", "--accept-gap", "test-1", "--reason", acceptGapReason, "--covered-by", "TestX"}, "--accept-gap applies only to --action approve"},
-		{"skip action", []string{"--action", "skip", "--step", "test", "--accept-gap", "test-1", "--reason", acceptGapReason, "--covered-by", "TestX"}, "--accept-gap applies only to --action approve"},
-		{"missing reason", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-1", "--covered-by", "TestX"}, "--reason of at least 10 characters"},
-		{"short reason", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-1", "--reason", "ok", "--covered-by", "TestX"}, "--reason of at least 10 characters"},
-		{"missing covered-by", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-1", "--reason", acceptGapReason}, "non-empty --covered-by"},
-		{"blank covered-by", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-1", "--reason", acceptGapReason, "--covered-by", "  "}, "non-empty --covered-by"},
-		{"multiline reason", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-1", "--reason", "owner approved\nvia first mate", "--covered-by", "TestX"}, "single line"},
+		{"fix action", []string{"--action", "fix", "--findings", "test-verdict", "--step", "test", "--accept-gap", "test-verdict", "--reason", acceptGapReason, "--covered-by", "TestX"}, "--accept-gap applies only to --action approve"},
+		{"skip action", []string{"--action", "skip", "--step", "test", "--accept-gap", "test-verdict", "--reason", acceptGapReason, "--covered-by", "TestX"}, "--accept-gap applies only to --action approve"},
+		{"missing reason", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-verdict", "--covered-by", "TestX"}, "--reason of at least 10 characters"},
+		{"short reason", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-verdict", "--reason", "ok", "--covered-by", "TestX"}, "--reason of at least 10 characters"},
+		{"missing covered-by", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-verdict", "--reason", acceptGapReason}, "non-empty --covered-by"},
+		{"blank covered-by", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-verdict", "--reason", acceptGapReason, "--covered-by", "  "}, "non-empty --covered-by"},
+		{"multiline reason", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-verdict", "--reason", "owner approved\nvia first mate", "--covered-by", "TestX"}, "single line"},
 		{"no ids", []string{"--action", "approve", "--step", "test", "--accept-gap", " , ", "--reason", acceptGapReason, "--covered-by", "TestX"}, "at least one finding id"},
-		{"not the Test step", []string{"--action", "approve", "--step", "review", "--accept-gap", "test-1", "--reason", acceptGapReason, "--covered-by", "TestX"}, "applies only to the Test step"},
+		{"not the Test step", []string{"--action", "approve", "--step", "review", "--accept-gap", "test-verdict", "--reason", acceptGapReason, "--covered-by", "TestX"}, "applies only to the Test step"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -84,11 +84,45 @@ func TestAxiRespond_ForwardsAnAcceptedGapVerbatim(t *testing.T) {
 	})
 	// This checks the forwarded audit payload, not the wait deadline. Allow a
 	// busy test host enough time for the local Git and IPC round trips.
-	out, err := executeCmd("axi", "respond", "--action", "approve", "--accept-gap", "test-1, test-2", "--reason", acceptGapReason, "--covered-by", acceptGapCoveredBy, "--wait", "1m")
+	out, err := executeCmd("axi", "respond", "--action", "approve", "--accept-gap", "test-verdict, test-2", "--reason", acceptGapReason, "--covered-by", acceptGapCoveredBy, "--wait", "1m")
 	if err != nil {
 		t.Fatalf("accepted gap refused: %v\n%s", err, out)
 	}
-	if got.Action != types.ActionApprove || got.Step != types.StepTest || strings.Join(got.AcceptGaps, "|") != "test-1|test-2" || got.ApprovalReason != acceptGapReason || got.CoveredBy != acceptGapCoveredBy {
+	if got.Action != types.ActionApprove || got.Step != types.StepTest || strings.Join(got.AcceptGaps, "|") != "test-verdict|test-2" || got.ApprovalReason != acceptGapReason || got.CoveredBy != acceptGapCoveredBy {
 		t.Fatalf("forwarded params = %+v", got)
+	}
+}
+
+func acceptGapGate(t *testing.T, items ...types.Finding) stepView {
+	t.Helper()
+	verdict := types.Finding{ID: types.FindingIDTestVerdict, Category: types.FindingCategoryTestVerdict, Severity: types.FindingSeverityWarning, Action: types.ActionAskUser, Description: "live validation verdict: inconclusive"}
+	raw, err := types.MarshalFindingsJSON(types.Findings{Items: append([]types.Finding{verdict}, items...), Verdict: types.TestVerdictInconclusive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stepView{Name: "test", Status: "awaiting_approval", FindingsJSON: raw}
+}
+
+func TestGateHelpOffersTheAcceptedGapCommandForEligibleStrictTest(t *testing.T) {
+	out := axiDoc(gateFieldsFor(acceptGapGate(t), "run-7", true)...)
+	for _, want := range []string{"--run run-7 --action approve --accept-gap test-verdict", `--reason`, `<who approved, where, when>`, `--covered-by`, `<tests>`, "owner has explicitly approved"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("strict gate help missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "to accept this step and continue") {
+		t.Fatalf("strict gate still suggests a plain approve:\n%s", out)
+	}
+}
+
+func TestGateHelpKeepsPlainApproveWhereAGapIsNotEligible(t *testing.T) {
+	for name, out := range map[string]string{
+		"non-strict run":    axiDoc(gateFieldsFor(acceptGapGate(t), "", false)...),
+		"other unresolved":  axiDoc(gateFieldsFor(acceptGapGate(t, types.Finding{ID: "test-2", Severity: "error", Action: types.ActionAskUser, Description: "defect"}), "", true)...),
+		"command exception": axiDoc(gateFieldsFor(acceptGapGate(t, types.Finding{ID: "cmd", Category: types.FindingCategoryTestCommand, Severity: "error", Action: types.ActionAutoFix, Description: "failed"}), "", true)...),
+	} {
+		if strings.Contains(out, "--accept-gap") {
+			t.Fatalf("%s: gate help offers an accepted gap that would be refused:\n%s", name, out)
+		}
 	}
 }

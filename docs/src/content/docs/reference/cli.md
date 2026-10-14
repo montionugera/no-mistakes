@@ -354,7 +354,7 @@ A strict-shipping Test parked on an `inconclusive` verdict, where the unreachabl
 
 ```bash
 no-mistakes axi respond --step test --action approve \
-  --accept-gap test-1 \
+  --accept-gap test-verdict \
   --reason "owner approved via first mate, 2026-10-14" \
   --covered-by "TestBrokerTimeoutMocked; internal/broker/timeout_test.go"
 ```

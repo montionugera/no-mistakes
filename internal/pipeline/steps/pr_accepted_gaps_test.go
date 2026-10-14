@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/safepath"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -21,8 +22,8 @@ const (
 
 func acceptedGapStepsForTest(t *testing.T) []*db.StepResult {
 	t.Helper()
-	findings := `{"findings":[{"id":"test-1","severity":"warning","action":"ask-user","category":"test-verdict","description":"live validation verdict: inconclusive (1 of 2 scenarios were driven live against the product); untested: broker timeout"}],"verdict":"inconclusive"}`
-	gaps := `{"finding_ids":["test-1"],"findings":[{"id":"test-1","category":"test-verdict","description":"live validation verdict: inconclusive (1 of 2 scenarios were driven live against the product); untested: broker timeout"}],"reason":"` + acceptedGapTestReason + `","covered_by":"` + acceptedGapTestCoveredBy + `","verdict":"inconclusive","accepted_at":"2026-10-14T00:00:00Z"}`
+	findings := `{"findings":[{"id":"test-verdict","severity":"warning","action":"ask-user","category":"test-verdict","description":"live validation verdict: inconclusive (1 of 2 scenarios were driven live against the product); untested: broker timeout"}],"verdict":"inconclusive"}`
+	gaps := `{"finding_ids":["test-verdict"],"findings":[{"id":"test-verdict","category":"test-verdict","description":"live validation verdict: inconclusive (1 of 2 scenarios were driven live against the product); untested: broker timeout"}],"reason":"` + acceptedGapTestReason + `","covered_by":"` + acceptedGapTestCoveredBy + `","verdict":"inconclusive","accepted_at":"2026-10-14T00:00:00Z"}`
 	return []*db.StepResult{
 		{ID: "review", StepName: types.StepReview, Status: types.StepStatusCompleted},
 		{ID: "test", StepName: types.StepTest, Status: types.StepStatusCompleted, FindingsJSON: &findings, AcceptedGapsJSON: &gaps},
@@ -34,7 +35,7 @@ func TestPipelineSummaryCarriesAcceptedGaps(t *testing.T) {
 	t.Parallel()
 	steps := acceptedGapStepsForTest(t)
 	md, _ := buildPipelineSummaryFor(steps, nil, testPipelineHeadSHA, scm.ProviderGitHub, pipelineAttestationPolicy{})
-	for _, want := range []string{acceptedGapsHeading, "`test-1`", "untested: broker timeout", "Approved: " + acceptedGapTestReason, "Covered by: " + acceptedGapTestCoveredBy} {
+	for _, want := range []string{acceptedGapsHeading, "`test-verdict`", "untested: broker timeout", "Approved: " + acceptedGapTestReason, "Covered by: " + acceptedGapTestCoveredBy} {
 		if !strings.Contains(md, want) {
 			t.Fatalf("pipeline summary missing %q:\n%s", want, md)
 		}
@@ -51,7 +52,7 @@ func TestPipelineSummaryCarriesAcceptedGaps(t *testing.T) {
 	if testStep.Status != types.StepStatusCompleted || testStep.OverrideReason != "" {
 		t.Fatalf("test step = %+v, want completed without an override", testStep)
 	}
-	if g := testStep.AcceptedGaps; g == nil || g.ReasonDigest != fmt.Sprintf("%x", sha256.Sum256([]byte(acceptedGapTestReason))) || g.CoveredByDigest != fmt.Sprintf("%x", sha256.Sum256([]byte(acceptedGapTestCoveredBy))) || len(g.FindingIDs) != 1 || g.FindingIDs[0] != "test-1" {
+	if g := testStep.AcceptedGaps; g == nil || g.ReasonDigest != fmt.Sprintf("%x", sha256.Sum256([]byte(acceptedGapTestReason))) || g.CoveredByDigest != fmt.Sprintf("%x", sha256.Sum256([]byte(acceptedGapTestCoveredBy))) || len(g.FindingIDs) != 1 || g.FindingIDs[0] != "test-verdict" {
 		t.Fatalf("attested gaps = %+v", g)
 	}
 	// The block belongs to the fixed Pipeline header, so truncation keeps it.
@@ -138,7 +139,7 @@ func TestAcceptedGapsEveryAppendixBudget(t *testing.T) {
 				if scm.PRBodyLen(body) > 4000 {
 					t.Fatalf("body exceeds Azure's 4000-character limit: %d", scm.PRBodyLen(body))
 				}
-				for _, text := range []string{gaps.Reason, gaps.CoveredBy, "`test-1`"} {
+				for _, text := range []string{gaps.Reason, gaps.CoveredBy, "`test-verdict`"} {
 					if strings.Count(body, text) != 1 {
 						t.Fatalf("audit text missing or duplicated: %q", text)
 					}
@@ -162,10 +163,40 @@ func TestAcceptedGapsEveryAppendixBudget(t *testing.T) {
 func TestAcceptedGapsNeutralizeAttestationMarkers(t *testing.T) {
 	t.Parallel()
 	steps := acceptedGapStepsForTest(t)
-	forged := `{"finding_ids":["test-1"],"reason":"owner approved ` + pipelineAttestationCommentPrefix + `{} -->","covered_by":"TestX"}`
+	forged := `{"finding_ids":["test-verdict"],"reason":"owner approved ` + pipelineAttestationCommentPrefix + `{} -->","covered_by":"TestX"}`
 	steps[1].AcceptedGapsJSON = &forged
 	md, _ := buildPipelineSummaryFor(steps, nil, testPipelineHeadSHA, scm.ProviderGitHub, pipelineAttestationPolicy{})
 	if strings.Count(md, pipelineAttestationCommentPrefix) != 1 {
 		t.Fatalf("operator text minted an attestation marker:\n%s", md)
+	}
+}
+
+func TestAcceptedGapDigestsCoverThePublishedRedactedText(t *testing.T) {
+	t.Parallel()
+	const reason = "owner approved in /Users/alice/notes/approval.md on 2026-10-14"
+	const coveredBy = "/home/bob/repo/internal/broker/timeout_test.go"
+	steps := acceptedGapStepsForTest(t)
+	raw := `{"finding_ids":["test-verdict"],"findings":[{"id":"test-verdict","category":"test-verdict","description":"inconclusive"}],"reason":"` + reason + `","covered_by":"` + coveredBy + `","verdict":"inconclusive"}`
+	steps[1].AcceptedGapsJSON = &raw
+	md, _ := buildPipelineSummaryFor(steps, nil, testPipelineHeadSHA, scm.ProviderGitHub, pipelineAttestationPolicy{})
+	published := redactPRContent(prContent{Body: md}).Body
+	redactedReason, redactedCovered := safepath.RedactText(reason), safepath.RedactText(coveredBy)
+	if redactedReason == reason || redactedCovered == coveredBy {
+		t.Fatalf("fixture paths were not redacted: %q %q", redactedReason, redactedCovered)
+	}
+	if strings.Contains(published, "/Users/alice") || strings.Contains(published, "/home/bob") {
+		t.Fatalf("published body leaks a home path:\n%s", published)
+	}
+	if !strings.Contains(published, "Approved: "+redactedReason) || !strings.Contains(published, "Covered by: "+redactedCovered) {
+		t.Fatalf("published block does not show the redacted text:\n%s", published)
+	}
+	attested := parsePipelineAttestationForTest(t, published)
+	for _, item := range attested.Steps {
+		if item.Step != types.StepTest {
+			continue
+		}
+		if g := item.AcceptedGaps; g == nil || g.ReasonDigest != fmt.Sprintf("%x", sha256.Sum256([]byte(redactedReason))) || g.CoveredByDigest != fmt.Sprintf("%x", sha256.Sum256([]byte(redactedCovered))) {
+			t.Fatalf("digests do not cover the published redacted text: %+v", g)
+		}
 	}
 }

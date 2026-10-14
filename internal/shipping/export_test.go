@@ -396,7 +396,7 @@ func TestExportNoSurfaceAcknowledgment(t *testing.T) {
 }
 
 func TestExportAcceptedTestGap(t *testing.T) {
-	const verdict = `{"id":"test-1","severity":"warning","action":"ask-user","category":"test-verdict","description":"live validation verdict: inconclusive (1 of 2 scenarios were driven live against the product); untested: broker timeout"}`
+	const verdict = `{"id":"test-verdict","severity":"warning","action":"ask-user","category":"test-verdict","description":"live validation verdict: inconclusive (1 of 2 scenarios were driven live against the product); untested: broker timeout"}`
 	const evidence = `{"findings":[` + verdict + `],"verdict":"inconclusive"}`
 	const reason = "owner approved via first mate, 2026-10-14"
 	const coveredBy = "TestBrokerTimeoutMocked"
@@ -417,7 +417,7 @@ func TestExportAcceptedTestGap(t *testing.T) {
 				t.Fatal(err)
 			}
 			if kind != "unrecorded" {
-				if _, err := f.database.RecordAcceptedGaps(sr.ID, db.AcceptedGaps{FindingIDs: []string{"test-1"}, Reason: reason, CoveredBy: coveredBy}, true); err != nil {
+				if _, err := f.database.RecordAcceptedGaps(sr.ID, db.AcceptedGaps{FindingIDs: []string{"test-verdict"}, Reason: reason, CoveredBy: coveredBy}, true); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -450,7 +450,7 @@ func TestExportAcceptedTestGap(t *testing.T) {
 				t.Fatal(err)
 			}
 			step := payload.Steps[3]
-			if step.Status != "completed" || step.Execution != "performed" || step.AcceptedGaps == nil || step.AcceptedGaps.Reason != reason || step.AcceptedGaps.CoveredBy != coveredBy || len(step.AcceptedGaps.FindingIDs) != 1 || step.AcceptedGaps.FindingIDs[0] != "test-1" {
+			if step.Status != "completed" || step.Execution != "performed" || step.AcceptedGaps == nil || step.AcceptedGaps.Reason != reason || step.AcceptedGaps.CoveredBy != coveredBy || len(step.AcceptedGaps.FindingIDs) != 1 || step.AcceptedGaps.FindingIDs[0] != "test-verdict" {
 				t.Fatalf("receipt step = %+v", step)
 			}
 			for i, other := range payload.Steps {

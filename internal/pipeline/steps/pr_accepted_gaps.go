@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/safepath"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -34,7 +35,23 @@ func attestedAcceptedGaps(sr *db.StepResult) *pipelineAttestationAcceptedGaps {
 	if err != nil || gaps == nil {
 		return nil
 	}
-	return &pipelineAttestationAcceptedGaps{FindingIDs: gaps.FindingIDs, ReasonDigest: fmt.Sprintf("%x", sha256.Sum256([]byte(gaps.Reason))), CoveredByDigest: fmt.Sprintf("%x", sha256.Sum256([]byte(gaps.CoveredBy)))}
+	return &pipelineAttestationAcceptedGaps{FindingIDs: gaps.FindingIDs, ReasonDigest: acceptedGapTextDigest(gaps.Reason), CoveredByDigest: acceptedGapTextDigest(gaps.CoveredBy)}
+}
+
+// canonicalAcceptedGapText is the one representation of the reason and
+// covering tests that is both published and digested: the stored text after
+// the publication redaction boundary (home directories become a placeholder)
+// and before the PR-flavor HTML/markdown escaping, which only changes how the
+// same text is displayed. Redaction is idempotent, so the later whole-body
+// redaction cannot change it. Digesting the raw stored text instead would
+// leave a verifier unable to reproduce the digest from the published block
+// whenever redaction changed the text.
+func canonicalAcceptedGapText(text string) string {
+	return safepath.RedactText(text)
+}
+
+func acceptedGapTextDigest(text string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(canonicalAcceptedGapText(text))))
 }
 
 func acceptedGapAuditBlock(pipelineMD string) string {
@@ -103,8 +120,8 @@ func buildAcceptedGapsBlock(steps []*db.StepResult, flavor prBodyFlavor) string 
 			}
 			b.WriteString("\n")
 		}
-		fmt.Fprintf(&b, "- Approved: %s\n", escapePRText(gaps.Reason, flavor))
-		fmt.Fprintf(&b, "- Covered by: %s", escapePRText(gaps.CoveredBy, flavor))
+		fmt.Fprintf(&b, "- Approved: %s\n", escapePRText(canonicalAcceptedGapText(gaps.Reason), flavor))
+		fmt.Fprintf(&b, "- Covered by: %s", escapePRText(canonicalAcceptedGapText(gaps.CoveredBy), flavor))
 		return b.String()
 	}
 	return ""
