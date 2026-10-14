@@ -330,10 +330,21 @@ func verifyPRMutationComparison(sctx *pipeline.StepContext, host scm.Host, pr *s
 	if err != nil {
 		return err
 	}
-	if receipt == nil || receipt.PRURL == "" || !samePRIdentity(receipt.PRURL, pr) ||
+	if receipt == nil || (receipt.PRURL == "" && !allowProposed) ||
+		(receipt.PRURL != "" && !samePRIdentity(receipt.PRURL, pr)) ||
 		proposedHead == "" || sctx.Run.HeadSHA != receipt.LocalHeadSHA ||
 		(!allowProposed && proposedHead != receipt.LocalHeadSHA) {
 		return fmt.Errorf("PR update lacks the current run comparison")
+	}
+	forgeHead := receipt.ForgeHeadSHA
+	if receipt.PRURL == "" {
+		selected := sctx.PRTarget
+		if selected == nil || selected.PRURL != "" || selected.ForgeHeadSHA == "" ||
+			!scm.SameSourceRepository(resolvedProvider(sctx), selected.SourceRepo, receipt.SourceRepo) ||
+			selected.SourceBranch != receipt.SourceBranch || selected.TargetBranch != receipt.TargetBranch {
+			return fmt.Errorf("unbound PR attestation lacks the current source-matched observation")
+		}
+		forgeHead = selected.ForgeHeadSHA
 	}
 	durable, err := sctx.DB.GetRun(sctx.Run.ID)
 	if err != nil {
@@ -359,9 +370,9 @@ func verifyPRMutationComparison(sctx *pipeline.StepContext, host scm.Host, pr *s
 	if err != nil {
 		return fmt.Errorf("read pull request before update: %w", err)
 	}
-	if facts.State != scm.PRStateOpen || !samePRIdentity(receipt.PRURL, &facts.PR) ||
+	if facts.State != scm.PRStateOpen || !samePRIdentity(pr.URL, &facts.PR) ||
 		!scm.SameSourceRepository(resolvedProvider(sctx), facts.SourceRepository, receipt.SourceRepo) ||
-		facts.SourceBranch != receipt.SourceBranch || facts.HeadSHA != receipt.ForgeHeadSHA ||
+		facts.SourceBranch != receipt.SourceBranch || facts.HeadSHA != forgeHead ||
 		facts.BaseBranch != receipt.TargetBranch {
 		return fmt.Errorf("live pull request differs from its comparison receipt before update")
 	}

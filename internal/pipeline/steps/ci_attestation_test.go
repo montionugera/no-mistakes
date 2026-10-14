@@ -561,83 +561,110 @@ func TestCIStep_PublishRepairDoesNotMintAttestation(t *testing.T) {
 // pushed head becomes current. A post-push write, however fast, cannot beat
 // that: the payload is captured at push time, before any write could land.
 func TestPushStep_AttestsHeadBeforePush(t *testing.T) {
-	upstream := t.TempDir()
-	gitCmd(t, upstream, "init", "--bare")
+	for _, mode := range []string{"bound push", "unbound push", "unbound repair"} {
+		t.Run(mode, func(t *testing.T) {
+			upstream := t.TempDir()
+			gitCmd(t, upstream, "init", "--bare")
 
-	dir, baseSHA, priorHead := setupGitRepo(t)
-	gitCmd(t, dir, "remote", "add", "origin", upstream)
-	gitCmd(t, dir, "push", "origin", "main")
-	gitCmd(t, dir, "push", "origin", "feature")
+			dir, baseSHA, priorHead := setupGitRepo(t)
+			gitCmd(t, dir, "remote", "add", "origin", upstream)
+			gitCmd(t, dir, "push", "origin", "main")
+			gitCmd(t, dir, "push", "origin", "feature")
 
-	priorAttestedBody := compliantPipelineBody(t, priorHead)
+			priorAttestedBody := compliantPipelineBody(t, priorHead)
 
-	if err := os.WriteFile(filepath.Join(dir, "new-work.txt"), []byte("new work\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitCmd(t, dir, "add", "-A")
-	gitCmd(t, dir, "commit", "-m", "new work")
-	newHead := gitCmd(t, dir, "rev-parse", "HEAD")
+			if err := os.WriteFile(filepath.Join(dir, "new-work.txt"), []byte("new work\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitCmd(t, dir, "add", "-A")
+			gitCmd(t, dir, "commit", "-m", "new work")
+			newHead := gitCmd(t, dir, "rev-parse", "HEAD")
 
-	prURL := "https://github.com/test/repo/pull/42"
-	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, newHead, config.Commands{})
-	sctx.Repo.UpstreamURL = "https://github.com/test/repo"
-	sctx.Run.Branch = "refs/heads/feature"
-	sctx.Run.PRURL = &prURL
-	setupGateMirror(t, sctx)
-	recordReviewApproval(t, sctx, newHead)
-	if _, err := guardPRContextWithSelection(sctx, types.StepRebase, pipeline.PRTargetSelection{
-		PRURL: prURL, SourceRepo: "test/repo", SourceBranch: "feature",
-		ForgeHeadSHA: priorHead, TargetBranch: "main",
-	}, false); err != nil {
-		t.Fatal(err)
-	}
+			prURL := "https://github.com/test/repo/pull/42"
+			sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, newHead, config.Commands{})
+			sctx.Repo.UpstreamURL = "https://github.com/test/repo"
+			sctx.Run.Branch = "refs/heads/feature"
+			selectedURL := prURL
+			if mode == "bound push" {
+				sctx.Run.PRURL = &prURL
+			} else {
+				selectedURL = ""
+			}
+			setupGateMirror(t, sctx)
+			recordReviewApproval(t, sctx, newHead)
+			decision, err := guardPRContextWithSelection(sctx, types.StepRebase, pipeline.PRTargetSelection{
+				PRURL: selectedURL, SourceRepo: "test/repo", SourceBranch: "feature",
+				ForgeHeadSHA: priorHead, TargetBranch: "main",
+			}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sctx.PRTarget = &decision.Target
 
-	for _, name := range []types.StepName{types.StepReview, types.StepTest, types.StepDocument} {
-		sr, err := sctx.DB.InsertStepResult(sctx.Run.ID, name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := sctx.DB.UpdateStepStatus(sr.ID, types.StepStatusCompleted); err != nil {
-			t.Fatal(err)
-		}
-	}
+			for _, name := range []types.StepName{types.StepReview, types.StepTest, types.StepDocument} {
+				sr, err := sctx.DB.InsertStepResult(sctx.Run.ID, name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := sctx.DB.UpdateStepStatus(sr.ID, types.StepStatusCompleted); err != nil {
+					t.Fatal(err)
+				}
+			}
 
-	bodyFile := filepath.Join(t.TempDir(), "pr-body.md")
-	if err := os.WriteFile(bodyFile, []byte(priorAttestedBody), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	logFile := filepath.Join(t.TempDir(), "gh.log")
-	env := fakeCIGH(t, "OPEN", `[]`)
-	sctx.Env = append(env,
-		"FAKE_CLI_PR_HEAD_SHA="+priorHead,
-		"FAKE_CLI_PR_LIST_JSON=[{\"number\":42,\"url\":\"https://github.com/test/repo/pull/42\",\"baseRefName\":\"main\"}]",
-		"FAKE_CLI_PR_BODY_FILE="+bodyFile,
-		"FAKE_CLI_PR_TITLE=fix: existing pr",
-		"FAKE_CLI_LOG="+logFile,
-	)
+			bodyFile := filepath.Join(t.TempDir(), "pr-body.md")
+			if err := os.WriteFile(bodyFile, []byte(priorAttestedBody), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			capturedBody := filepath.Join(t.TempDir(), "body-at-push.md")
+			if err := os.WriteFile(filepath.Join(upstream, "hooks", "pre-receive"), []byte(fmt.Sprintf("#!/bin/sh\ncat %q > %q\n", bodyFile, capturedBody)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			logFile := filepath.Join(t.TempDir(), "gh.log")
+			env := fakeCIGH(t, "OPEN", `[]`)
+			sctx.Env = append(env,
+				"FAKE_CLI_PR_HEAD_SHA="+priorHead,
+				fmt.Sprintf(`FAKE_CLI_PR_FACTS_LIST_JSON=[[{"number":42,"html_url":"https://github.com/test/repo/pull/42","state":"open","merged":false,"head":{"ref":"feature","sha":%q,"repo":{"full_name":"test/repo"}},"base":{"ref":"main"}}]]`, priorHead),
+				"FAKE_CLI_PR_LIST_JSON=[{\"number\":42,\"url\":\"https://github.com/test/repo/pull/42\",\"baseRefName\":\"main\"}]",
+				"FAKE_CLI_PR_BODY_FILE="+bodyFile,
+				"FAKE_CLI_PR_TITLE=fix: existing pr",
+				"FAKE_CLI_LOG="+logFile,
+			)
 
-	if _, err := (&PushStep{}).Execute(sctx); err != nil {
-		t.Fatalf("push step failed: %v", err)
-	}
+			if mode == "unbound repair" {
+				if _, err := (&CIStep{}).publishRepair(sctx, newHead); err != nil {
+					t.Fatalf("repair publication failed: %v", err)
+				}
+			} else if _, err := (&PushStep{}).Execute(sctx); err != nil {
+				t.Fatalf("push step failed: %v", err)
+			}
 
-	remoteHead := gitCmd(t, upstream, "rev-parse", "refs/heads/feature")
-	if remoteHead != newHead {
-		t.Fatalf("remote head = %s, want %s", remoteHead, newHead)
-	}
+			remoteHead := gitCmd(t, upstream, "rev-parse", "refs/heads/feature")
+			if remoteHead != newHead {
+				t.Fatalf("remote head = %s, want %s", remoteHead, newHead)
+			}
 
-	updated := readFakeGHBodyArg(t, logFile)
-	attestation := parsePipelineAttestationForTest(t, updated)
-	if attestation.HeadSHA != newHead {
-		t.Fatalf("attested head = %q, want the pushed head %q", attestation.HeadSHA, newHead)
-	}
-	if got, out := runVerifyPy(t, updated, newHead); got != "success" {
-		t.Fatalf("attestation written before push must pass verify.py at the new head, got %s\n%s", got, out)
-	}
-	if got, out := runVerifyPy(t, priorAttestedBody, newHead); got != "failure" {
-		t.Fatalf("the original stale attestation unexpectedly passed at the new head, got %s\n%s", got, out)
-	}
-	if got, out := runVerifyPy(t, updated, priorHead); got != "failure" {
-		t.Fatalf("the new attestation unexpectedly passed at the OLD head - a check reading the body before the push lands must still see a mismatch, got %s\n%s", got, out)
+			bodyAtPush, err := os.ReadFile(capturedBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, out := runVerifyPy(t, string(bodyAtPush), newHead); got != "success" {
+				t.Fatalf("body observed during push must certify the new head, got %s\n%s", got, out)
+			}
+			updated := readFakeGHBodyArg(t, logFile)
+			attestation := parsePipelineAttestationForTest(t, updated)
+			if attestation.HeadSHA != newHead {
+				t.Fatalf("attested head = %q, want the pushed head %q", attestation.HeadSHA, newHead)
+			}
+			if got, out := runVerifyPy(t, updated, newHead); got != "success" {
+				t.Fatalf("attestation written before push must pass verify.py at the new head, got %s\n%s", got, out)
+			}
+			if got, out := runVerifyPy(t, priorAttestedBody, newHead); got != "failure" {
+				t.Fatalf("the original stale attestation unexpectedly passed at the new head, got %s\n%s", got, out)
+			}
+			if got, out := runVerifyPy(t, updated, priorHead); got != "failure" {
+				t.Fatalf("the new attestation unexpectedly passed at the OLD head - a check reading the body before the push lands must still see a mismatch, got %s\n%s", got, out)
+			}
+		})
 	}
 }
 
@@ -708,51 +735,69 @@ func TestPushStep_UnavailableSCMRefusesUnverifiedPRTarget(t *testing.T) {
 // let code ship with no matching attestation at all - exactly the race this
 // design exists to close.
 func TestPushStep_AttestationWriteFailureAbortsBeforePush(t *testing.T) {
-	upstream := t.TempDir()
-	gitCmd(t, upstream, "init", "--bare")
+	for _, bound := range []bool{true, false} {
+		t.Run(fmt.Sprintf("bound=%v", bound), func(t *testing.T) {
+			upstream := t.TempDir()
+			gitCmd(t, upstream, "init", "--bare")
 
-	dir, baseSHA, priorHead := setupGitRepo(t)
-	gitCmd(t, dir, "remote", "add", "origin", upstream)
-	gitCmd(t, dir, "push", "origin", "main")
-	gitCmd(t, dir, "push", "origin", "feature")
+			dir, baseSHA, priorHead := setupGitRepo(t)
+			gitCmd(t, dir, "remote", "add", "origin", upstream)
+			gitCmd(t, dir, "push", "origin", "main")
+			gitCmd(t, dir, "push", "origin", "feature")
 
-	priorAttestedBody := compliantPipelineBody(t, priorHead)
+			priorAttestedBody := compliantPipelineBody(t, priorHead)
 
-	if err := os.WriteFile(filepath.Join(dir, "new-work.txt"), []byte("new work\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitCmd(t, dir, "add", "-A")
-	gitCmd(t, dir, "commit", "-m", "new work")
-	newHead := gitCmd(t, dir, "rev-parse", "HEAD")
+			if err := os.WriteFile(filepath.Join(dir, "new-work.txt"), []byte("new work\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitCmd(t, dir, "add", "-A")
+			gitCmd(t, dir, "commit", "-m", "new work")
+			newHead := gitCmd(t, dir, "rev-parse", "HEAD")
 
-	prURL := "https://github.com/test/repo/pull/42"
-	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, newHead, config.Commands{})
-	sctx.Repo.UpstreamURL = "https://github.com/test/repo"
-	sctx.Run.Branch = "refs/heads/feature"
-	sctx.Run.PRURL = &prURL
-	setupGateMirror(t, sctx)
-	recordReviewApproval(t, sctx, newHead)
+			prURL := "https://github.com/test/repo/pull/42"
+			sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, newHead, config.Commands{})
+			sctx.Repo.UpstreamURL = "https://github.com/test/repo"
+			sctx.Run.Branch = "refs/heads/feature"
+			selectedURL := ""
+			if bound {
+				sctx.Run.PRURL = &prURL
+				selectedURL = prURL
+			}
+			setupGateMirror(t, sctx)
+			recordReviewApproval(t, sctx, newHead)
+			decision, err := guardPRContextWithSelection(sctx, types.StepRebase, pipeline.PRTargetSelection{
+				PRURL: selectedURL, SourceRepo: "test/repo", SourceBranch: "feature",
+				ForgeHeadSHA: priorHead, TargetBranch: "main",
+			}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sctx.PRTarget = &decision.Target
 
-	bodyFile := filepath.Join(t.TempDir(), "pr-body.md")
-	if err := os.WriteFile(bodyFile, []byte(priorAttestedBody), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	env := fakeCIGH(t, "OPEN", `[]`)
-	sctx.Env = append(env,
-		"FAKE_CLI_PR_LIST_JSON=[{\"number\":42,\"url\":\"https://github.com/test/repo/pull/42\",\"baseRefName\":\"main\"}]",
-		"FAKE_CLI_PR_BODY_FILE="+bodyFile,
-		"FAKE_CLI_PR_TITLE=fix: existing pr",
-		"FAKE_CLI_PR_EDIT_ERR=provider unavailable",
-	)
+			bodyFile := filepath.Join(t.TempDir(), "pr-body.md")
+			if err := os.WriteFile(bodyFile, []byte(priorAttestedBody), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			env := fakeCIGH(t, "OPEN", `[]`)
+			sctx.Env = append(env,
+				"FAKE_CLI_PR_HEAD_SHA="+priorHead,
+				fmt.Sprintf(`FAKE_CLI_PR_FACTS_LIST_JSON=[[{"number":42,"html_url":"https://github.com/test/repo/pull/42","state":"open","merged":false,"head":{"ref":"feature","sha":%q,"repo":{"full_name":"test/repo"}},"base":{"ref":"main"}}]]`, priorHead),
+				"FAKE_CLI_PR_LIST_JSON=[{\"number\":42,\"url\":\"https://github.com/test/repo/pull/42\",\"baseRefName\":\"main\"}]",
+				"FAKE_CLI_PR_BODY_FILE="+bodyFile,
+				"FAKE_CLI_PR_TITLE=fix: existing pr",
+				"FAKE_CLI_PR_EDIT_ERR=provider unavailable",
+			)
 
-	_, err := (&PushStep{}).Execute(sctx)
-	if err == nil || !strings.Contains(err.Error(), "pipeline attestation write failed") {
-		t.Fatalf("Execute() error = %v, want an attestation write failure", err)
-	}
+			_, err = (&PushStep{}).Execute(sctx)
+			if err == nil || !strings.Contains(err.Error(), "pipeline attestation write failed") {
+				t.Fatalf("Execute() error = %v, want an attestation write failure", err)
+			}
 
-	remoteHead := gitCmd(t, upstream, "rev-parse", "refs/heads/feature")
-	if remoteHead != priorHead {
-		t.Fatalf("remote head = %s, want the push to never have happened (still %s)", remoteHead, priorHead)
+			remoteHead := gitCmd(t, upstream, "rev-parse", "refs/heads/feature")
+			if remoteHead != priorHead {
+				t.Fatalf("remote head = %s, want the push to never have happened (still %s)", remoteHead, priorHead)
+			}
+		})
 	}
 }
 
@@ -949,12 +994,20 @@ func TestPushStep_NoPullRequestLogsTheSkippedAttestation(t *testing.T) {
 	sctx.Run.Branch = "refs/heads/feature"
 	setupGateMirror(t, sctx)
 	recordReviewApproval(t, sctx, newHead)
+	decision, err := guardPRContextWithSelection(sctx, types.StepRebase, pipeline.PRTargetSelection{
+		SourceRepo: "test/repo", SourceBranch: "feature", TargetBranch: "main",
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sctx.PRTarget = &decision.Target
 
 	var logs []string
 	sctx.Log = func(line string) { logs = append(logs, line) }
 	logFile := filepath.Join(t.TempDir(), "gh.log")
 	sctx.Env = append(fakeCIGH(t, "OPEN", `[]`),
 		"FAKE_CLI_PR_LIST_JSON=[]",
+		"FAKE_CLI_PR_FACTS_LIST_JSON=[[]]",
 		"FAKE_CLI_LOG="+logFile,
 	)
 

@@ -563,7 +563,7 @@ Selection happens per run, before built-in detection and forge profiles: the rem
 
 `provider_plugins` is global-only. A plugin runs with your credentials for every repository on its hosts, so a repository `.no-mistakes.yaml` can never add, change, or redirect one; a `provider_plugins` block there is ignored.
 
-The [provider plugin protocol](/no-mistakes/reference/provider-plugin-protocol/) owns invocation, availability failures, and timeout handling, including the current complete PR-facts limitation that prevents protocol-v1 plugins from running core steps on network hosts. `no-mistakes doctor` lists configured plugins and checks that each command resolves; it does not run the plugin, because the handshake is per repository.
+The [provider plugin protocol](/no-mistakes/reference/provider-plugin-protocol/) owns invocation, availability failures, and timeout handling, including the full source repository, branch, head, and target facts required for protocol-v1 plugins to run core steps on network hosts. Cross-repository fork PRs are unsupported. `no-mistakes doctor` lists configured plugins and checks that each command resolves; it does not run the plugin, because the handshake is per repository.
 
 ### ci_timeout
 

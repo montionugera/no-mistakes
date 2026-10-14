@@ -4,11 +4,11 @@ description: Release channel publication and source-build version ordering.
 ---
 
 The [update command](/no-mistakes/reference/cli/#no-mistakes-update) follows this
-fork's release channels. The fork must publish its own `channels` release with
-the `channels.json` asset. `.github/workflows/publish-channels.yml` builds that
-manifest from releases in the current GitHub repository. The release workflow
-calls it after publishing all binary archives and `checksums.txt`; maintainers
-can also run the publisher manually after publishing or promoting a release.
+fork's release channels. This fork currently has no channel manifest or release
+and channel-publishing workflows. Self-update requires maintainers to first
+provide a publisher and a `channels` release containing `channels.json`, backed
+by published binary archives and `checksums.txt`. Until those prerequisites
+exist, the updater fails closed rather than using another repository's releases.
 The stable channel requires a published stable release. `update --beta` also
 considers published prereleases.
 

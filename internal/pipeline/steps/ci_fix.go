@@ -883,6 +883,32 @@ func attestHeadBeforePush(sctx *pipeline.StepContext, headSHA string, steps []*d
 	if err != nil {
 		return fmt.Errorf("%w: resolve pull request: %w", errAttestationWriteFailed, err)
 	}
+	if pr == nil && sctx.Run.Shipping == nil {
+		receipt, err := sctx.DB.GetRunPRContext(sctx.Run.ID)
+		if err != nil || receipt == nil {
+			return fmt.Errorf("%w: missing PR comparison receipt: %v", errAttestationWriteFailed, err)
+		}
+		reader, ok := host.(scm.PRFactsReader)
+		if !ok {
+			return fmt.Errorf("%w: provider cannot read complete pull request facts", errAttestationWriteFailed)
+		}
+		candidates, err := reader.FindOpenPRFacts(sctx.Ctx, receipt.SourceRepo, receipt.SourceBranch)
+		if err != nil {
+			return fmt.Errorf("%w: discover pull request: %w", errAttestationWriteFailed, err)
+		}
+		if len(candidates) == 0 && sctx.PRTarget != nil && sctx.PRTarget.ForgeHeadSHA != "" {
+			return fmt.Errorf("%w: previously observed pull request is no longer open", errAttestationWriteFailed)
+		}
+		if len(candidates) > 1 {
+			return fmt.Errorf("%w: multiple source-matched pull requests", errAttestationWriteFailed)
+		}
+		if len(candidates) == 1 {
+			pr = &candidates[0].PR
+			if err := verifyPRMutationComparison(sctx, host, pr, headSHA, true); err != nil {
+				return fmt.Errorf("%w: %w", errAttestationWriteFailed, err)
+			}
+		}
+	}
 	if pr == nil {
 		if sctx.Log != nil {
 			sctx.Log("skipping attestation write: no pull request found for this branch")

@@ -329,3 +329,40 @@ func TestPRMutationComparisonRejectsTargetAdvanceDuringDraft(t *testing.T) {
 		t.Fatalf("target advance was published: err=%v writes=%d", err, host.writes)
 	}
 }
+
+func TestPRMutationComparisonUnboundAttestationRequiresObservedFacts(t *testing.T) {
+	for _, mode := range []string{"current", "source repository", "source branch", "head", "target", "closed"} {
+		t.Run(mode, func(t *testing.T) {
+			dir, base, head := setupGitRepo(t)
+			sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, base, head, config.Commands{})
+			pr := prFromOwnedURL("https://github.com/test/repo/pull/42")
+			host := &mutationComparisonHost{facts: scm.PRFacts{PR: *pr, State: scm.PRStateOpen, SourceRepository: "test/repo", SourceBranch: "feature", HeadSHA: head, BaseBranch: "main"}}
+			decision, err := guardPRContextWithSelection(sctx, types.StepRebase, pipeline.PRTargetSelection{
+				SourceRepo: "test/repo", SourceBranch: "feature", ForgeHeadSHA: host.facts.HeadSHA, TargetBranch: "main",
+			}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sctx.PRTarget = &decision.Target
+			switch mode {
+			case "source repository":
+				host.facts.SourceRepository = "other/repo"
+			case "source branch":
+				host.facts.SourceBranch = "other"
+			case "head":
+				host.facts.HeadSHA = strings.Repeat("a", 40)
+			case "target":
+				host.facts.BaseBranch = "develop"
+			case "closed":
+				host.facts.State = scm.PRStateClosed
+			}
+			err = verifyPRMutationComparison(sctx, host, pr, sctx.Run.HeadSHA, true)
+			if (err == nil) != (mode == "current") {
+				t.Fatalf("unbound attestation with %s facts: %v", mode, err)
+			}
+			if err := verifyPRMutationComparison(sctx, host, pr, sctx.Run.HeadSHA, false); err == nil {
+				t.Fatal("ordinary body update accepted an unbound PR")
+			}
+		})
+	}
+}

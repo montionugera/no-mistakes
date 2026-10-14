@@ -610,6 +610,12 @@ func extractTrailingNumber(rawURL string) int {
 }
 
 func fakeCIGHFactsAPI(args []string) {
+	if len(args) > 0 && args[0] == "api" && strings.Contains(strings.Join(args, " "), "repos/test/repo/pulls ") {
+		if facts := os.Getenv("FAKE_CLI_PR_FACTS_LIST_JSON"); facts != "" {
+			fmt.Print(facts)
+			os.Exit(0)
+		}
+	}
 	if len(args) == 0 || args[0] != "api" || !strings.HasPrefix(args[len(args)-1], "repos/test/repo/pulls/") {
 		return
 	}
