@@ -45,6 +45,7 @@ func pluginCIContext(t *testing.T, state fakeplugin.State) (*pipeline.StepContex
 	sctx.Repo.UpstreamURL = "https://git.example.com/team/repo.git"
 	prURL := pluginPRURL
 	sctx.Run.PRURL = &prURL
+	stepstest.BindCurrentPRComparison(t, sctx, prURL, "team/repo", "main")
 	sctx.Config.CITimeout = 5 * time.Second
 	sctx.Config.ProviderPlugins = config.ProviderPlugins{
 		"ssm": {Command: fakeplugin.ExecutableName, Hosts: []string{"git.example.com"}, Timeout: 30 * time.Second},
@@ -100,6 +101,7 @@ func TestCIStep_ProviderPluginMergesAfterChecksPass(t *testing.T) {
 	sctx, statePath := pluginCIContext(t, fakeplugin.State{
 		Checks:              []fakeplugin.Check{{Name: "build", Bucket: "pass"}},
 		MergeWhenChecksPass: true,
+		MergeSHA:            "0123456789012345678901234567890123456789",
 	})
 	polls := 0
 	step := (&steps.CIStep{}).SetWaitForNextPoll(func(ctx context.Context, _ time.Duration) error {
