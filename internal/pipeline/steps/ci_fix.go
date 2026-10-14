@@ -821,13 +821,9 @@ func (s *CIStep) publishRepair(sctx *pipeline.StepContext, headSHA string) (ciRe
 // attestHeadBeforePush writes this run's pipeline attestation for headSHA
 // into any existing PR body BEFORE that head is pushed, so no check racing
 // the push can ever observe a legitimate head without a matching
-// attestation. See publishRunHead for why this ordering - not a post-push
-// write - is the fix for the push-then-attest race: every known consumer of
-// the shared require-no-mistakes action pins an immutable revision whose
-// verifier reads the PR body from the frozen `synchronize` event payload, so
-// no post-push write, however fast, can ever land before that payload is
-// read. Attesting first means the payload already carries the correct
-// attestation for the head it describes.
+// attestation. A verifier reading live PR facts can run immediately after
+// the push; writing first closes that race. It also protects consumers pinned
+// to older verifier revisions that read the frozen `synchronize` payload.
 //
 // steps is nil for a CI repair published without revalidation (carry the
 // existing attestation's own step statuses forward, since review/test/

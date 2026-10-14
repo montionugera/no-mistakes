@@ -100,7 +100,7 @@ Commit and push the generated file to enable the checks.
 
 Agent eXperience Interface for non-interactive agents.
 Most agent workflows use the installed `/no-mistakes` skill, which drives this command surface underneath.
-It prints TOON to stdout (except [`review-receipt`](#strict-shipping-and-review-receipts), which emits JSON), prints progress to stderr, and uses structured stdout errors with exit code `1` for operational failures and `2` for bad usage.
+It prints TOON to stdout, except [`review-receipt`](#no-mistakes-axi-review-receipt) and [`ci-handoff`](#no-mistakes-axi-ci-handoff), which emit JSON on success. It prints progress to stderr and uses structured stdout errors with exit code `1` for operational failures and `2` for bad usage; `ci-handoff` uses JSON errors and exit code `1`.
 At the TOON output boundary, unsupported C0 control bytes are rendered as visible `\xNN` escapes while tabs, carriage returns, newlines, printable Unicode, and the underlying durable logs remain unchanged.
 If TOON encoding still fails, AXI prints a structured error instead of returning successful empty stdout.
 The calling agent drives AXI approval gates but does not replace the configured pipeline agent that performs validation.
