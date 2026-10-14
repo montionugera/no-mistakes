@@ -85,30 +85,47 @@ func TestFindOpenPRFactsReadsEveryBitbucketPage(t *testing.T) {
 }
 
 func TestReadPRFactsRejectsWrongIdentityAndMissingHead(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, strings.ReplaceAll(bitbucketFactsPull, "0123456789abcdef0123456789abcdef01234567", ""))
-	}))
-	defer server.Close()
-	host := NewHost(&Client{baseURL: server.URL, httpClient: server.Client()}, RepoRef{Workspace: "test", RepoSlug: "repo"}, false)
-	if _, err := host.ReadPRFacts(context.Background(), &scm.PR{Number: "42", URL: "https://bitbucket.org/test/repo/pull-requests/99"}); err == nil {
-		t.Fatal("accepted a different recorded PR URL")
-	}
-	if _, err := host.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err == nil {
-		t.Fatal("accepted PR facts without an exact head")
+	for _, condition := range []string{"recorded URL", "missing head"} {
+		t.Run(condition, func(t *testing.T) {
+			payload := bitbucketFactsPull
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, payload) }))
+			defer server.Close()
+			host := NewHost(&Client{baseURL: server.URL, httpClient: server.Client()}, RepoRef{Workspace: "test", RepoSlug: "repo"}, false)
+			pr := &scm.PR{Number: "42", URL: "https://bitbucket.org/test/repo/pull-requests/42"}
+			facts, err := host.ReadPRFacts(context.Background(), pr)
+			if err != nil || facts.PR.URL != pr.URL || facts.HeadSHA != "0123456789abcdef0123456789abcdef01234567" {
+				t.Fatalf("valid PR facts = %+v, %v", facts, err)
+			}
+			want := "recorded URL does not match configured repository"
+			if condition == "recorded URL" {
+				pr.URL = "https://bitbucket.org/test/repo/pull-requests/99"
+			} else {
+				payload = strings.Replace(payload, "0123456789abcdef0123456789abcdef01234567", "", 1)
+				want = "incomplete source, head, or target facts"
+			}
+			if _, err := host.ReadPRFacts(context.Background(), pr); err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("rejection = %v, want %q", err, want)
+			}
+		})
 	}
 }
 
 func TestFindOpenPRFactsRejectsMalformedLaterPage(t *testing.T) {
+	later := `{"values":[]}`
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("page") == "2" {
-			fmt.Fprint(w, `{"values":null}`)
+			fmt.Fprint(w, later)
 			return
 		}
 		fmt.Fprintf(w, `{"values":[%s],"next":%q}`, bitbucketFactsPull, server.URL+"/2.0/repositories/test/repo/pullrequests?page=2")
 	}))
 	defer server.Close()
 	host := NewHost(&Client{baseURL: server.URL, httpClient: server.Client()}, RepoRef{Workspace: "test", RepoSlug: "repo"}, false)
+	if facts, err := host.FindOpenPRFacts(context.Background(), "test/repo", "feature"); err != nil || len(facts) != 1 {
+		t.Fatalf("valid pages = %+v, %v", facts, err)
+	}
+	later = `{"values":null}`
 	if _, err := host.FindOpenPRFacts(context.Background(), "test/repo", "feature"); err == nil {
 		t.Fatal("accepted an incomplete later PR page")
 	}
@@ -129,6 +146,13 @@ func TestReadPRFactsMergedCommitFailsClosed(t *testing.T) {
 		{"whitespace", " " + mergeSHA, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			valid := strings.Replace(merged, `{`, `{"merge_commit":{"hash":"`+mergeSHA+`"},`, 1)
+			baselineServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, valid) }))
+			defer baselineServer.Close()
+			baseline := NewHost(&Client{baseURL: baselineServer.URL, httpClient: baselineServer.Client()}, RepoRef{Workspace: "test", RepoSlug: "repo"}, false)
+			if facts, err := baseline.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err != nil || facts.MergeCommitSHA != mergeSHA {
+				t.Fatalf("valid merged baseline = %+v, %v", facts, err)
+			}
 			payload := merged
 			if !tc.omit {
 				payload = strings.Replace(payload, `{`, `{`+fmt.Sprintf(`"merge_commit":{"hash":%q},`, tc.sha), 1)

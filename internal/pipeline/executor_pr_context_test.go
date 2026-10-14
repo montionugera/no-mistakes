@@ -168,41 +168,98 @@ func TestExecutorRechecksTerminalCIProof(t *testing.T) {
 	}
 }
 
-func TestExecutorReviewPendingTestClaimAdvancesToOwnerStep(t *testing.T) {
-	database, p, run, repo := setupTest(t)
-	testRan := false
-	const pending = `{"findings":[{"severity":"warning","description":"old test output needs current proof","action":"no-op","category":"review-support-pending","support":{"claim_type":"test","test":{"command":"go test ./..."}}}]}`
-	executor := NewExecutor(database, p, nil, nil, []Step{
-		&adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) {
-			return &StepOutcome{Findings: pending, ReviewApprovedHeadSHA: "1111111111111111111111111111111111111111"}, nil
-		}},
-		&adaptiveCallStep{name: types.StepTest, fn: func(*StepContext) (*StepOutcome, error) {
-			testRan = true
-			return &StepOutcome{}, nil
-		}},
-	}, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := executor.Execute(ctx, run, repo, t.TempDir()); err == nil {
-		t.Fatal("pending claim completed without current owner proof")
+func currentTestOwnerProof(t *testing.T, database *db.DB, run *db.Run, pending string) string {
+	t.Helper()
+	findings, err := types.ParseFindingsJSON(pending)
+	if err != nil || len(findings.Items) != 1 {
+		t.Fatalf("fixture claim = %+v, %v", findings, err)
 	}
-	if !testRan {
-		t.Fatal("pending Test claim never reached Test")
+	receipt, err := database.GetRunPRContext(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := findings.Items[0]
+	zero := 0
+	result := types.Finding{ID: types.ReviewSupportClaimID(claim), Severity: types.FindingSeverityInfo, Action: types.ActionNoOp, Category: types.FindingCategoryReviewSupportResolved,
+		Support: &types.FindingSupport{ClaimType: types.FindingClaimTest, Test: &types.FindingTestSupport{Command: claim.Support.Test.Command}, OwnerResult: &types.FindingOwnerResult{ReviewFindingID: claim.ID, HeadSHA: run.HeadSHA, TargetSHA: receipt.TargetSHA, DiffDigest: receipt.DiffDigest, Generation: receipt.Generation, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), Disposition: types.FindingSupportDispositionDisproven, ExitCode: &zero}}}
+	encoded, err := types.MarshalFindingsJSON(types.Findings{Items: []types.Finding{result}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func TestExecutorReviewPendingTestClaimAdvancesToOwnerStep(t *testing.T) {
+	for _, missingProof := range []bool{false, true} {
+		database, p, run, repo := setupTest(t)
+		testRan := false
+		workDir := completionFixture(t, database, run)
+
+		const pending = `{"findings":[{"id":"review-test-1","severity":"warning","description":"old test output needs current proof","action":"no-op","category":"review-support-pending","support":{"claim_type":"test","test":{"command":"go test ./..."}}}]}`
+		proof := currentTestOwnerProof(t, database, run, pending)
+		executor := NewExecutor(database, p, nil, nil, []Step{
+			&adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) {
+				return &StepOutcome{Findings: pending, ReviewApprovedHeadSHA: run.HeadSHA}, nil
+			}},
+			&adaptiveCallStep{name: types.StepTest, fn: func(*StepContext) (*StepOutcome, error) {
+				testRan = true
+				findings := proof
+				if missingProof {
+					findings = ""
+				}
+				return &StepOutcome{Findings: findings}, nil
+			}},
+		}, nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		err := executor.Execute(ctx, run, repo, workDir)
+		if !missingProof {
+			if err != nil {
+				t.Fatalf("valid completion baseline: %v", err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatal("missing current owner proof was accepted")
+		}
+		if !testRan {
+			t.Fatal("pending Test claim never reached Test")
+		}
 	}
 }
 
 func TestExecutorSkippedEvidenceOwnerCannotCompletePendingClaim(t *testing.T) {
-	database, p, run, repo := setupTest(t)
-	const pending = `{"findings":[{"severity":"warning","description":"old test output needs current proof","action":"no-op","category":"review-support-pending","support":{"claim_type":"test","test":{"command":"go test ./..."}}}]}`
-	executor := NewExecutor(database, p, nil, nil, []Step{
-		&adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) {
-			return &StepOutcome{Findings: pending, ReviewApprovedHeadSHA: "1111111111111111111111111111111111111111"}, nil
-		}},
-		newPassStep(types.StepTest),
-	}, nil)
-	executor.SetSkippedSteps([]types.StepName{types.StepTest})
-	if err := executor.Execute(context.Background(), run, repo, t.TempDir()); err == nil {
-		t.Fatal("skipped Test owner completed a run with a pending test claim")
+	for _, missingProof := range []bool{false, true} {
+		database, p, run, repo := setupTest(t)
+		workDir := completionFixture(t, database, run)
+
+		const pending = `{"findings":[{"id":"review-test-1","severity":"warning","description":"old test output needs current proof","action":"no-op","category":"review-support-pending","support":{"claim_type":"test","test":{"command":"go test ./..."}}}]}`
+		proof := currentTestOwnerProof(t, database, run, pending)
+		executor := NewExecutor(database, p, nil, nil, []Step{
+			&adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) {
+				return &StepOutcome{Findings: pending, ReviewApprovedHeadSHA: run.HeadSHA}, nil
+			}},
+			&adaptiveCallStep{name: types.StepTest, fn: func(*StepContext) (*StepOutcome, error) {
+				findings := proof
+				if missingProof {
+					findings = ""
+				}
+				return &StepOutcome{Findings: findings}, nil
+			}},
+		}, nil)
+		if missingProof {
+			executor.SetSkippedSteps([]types.StepName{types.StepTest})
+		}
+		err := executor.Execute(context.Background(), run, repo, workDir)
+		if !missingProof {
+			if err != nil {
+				t.Fatalf("valid completion baseline: %v", err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatal("missing current owner proof was accepted")
+		}
 	}
 }
 
@@ -267,6 +324,22 @@ func TestExecutorCurrentOwnerProofCompletesPendingTestClaim(t *testing.T) {
 	if err := executor.Execute(context.Background(), run, repo, workDir); err != nil {
 		t.Fatal(err)
 	}
+	steps, err := database.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range steps {
+		if step.StepName != types.StepTest {
+			continue
+		}
+		if err := database.UpdateStepStatus(step.ID, types.StepStatusSkipped); err != nil {
+			t.Fatal(err)
+		}
+		if err := executor.validateReviewSupportOwners(run.ID, types.StepTest); err == nil {
+			t.Fatal("skipped owner with otherwise-current proof was accepted")
+		}
+	}
+
 }
 
 func TestExecutorTestRestartPrecedesFinalSupportValidation(t *testing.T) {
@@ -299,24 +372,42 @@ func TestExecutorTestRestartPrecedesFinalSupportValidation(t *testing.T) {
 }
 
 func TestExecutorUnresolvedTestClaimStopsBeforePublication(t *testing.T) {
-	database, p, run, repo := setupTest(t)
-	const pending = `{"findings":[{"id":"review-claim-1","severity":"warning","description":"old test output needs current proof","action":"no-op","category":"review-support-pending","support":{"claim_type":"test","test":{"command":"go test ./..."}}}]}`
-	pushRan := false
-	executor := NewExecutor(database, p, nil, nil, []Step{
-		&adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) {
-			return &StepOutcome{Findings: pending, ReviewApprovedHeadSHA: "1111111111111111111111111111111111111111"}, nil
-		}},
-		newPassStep(types.StepTest),
-		&adaptiveCallStep{name: types.StepPush, fn: func(*StepContext) (*StepOutcome, error) {
-			pushRan = true
-			return &StepOutcome{}, nil
-		}},
-	}, nil)
-	if err := executor.Execute(context.Background(), run, repo, t.TempDir()); err == nil {
-		t.Fatal("unresolved Test claim completed a run")
-	}
-	if pushRan {
-		t.Fatal("unresolved Test claim reached Push")
+	for _, missingProof := range []bool{false, true} {
+		database, p, run, repo := setupTest(t)
+		workDir := completionFixture(t, database, run)
+
+		const pending = `{"findings":[{"id":"review-claim-1","severity":"warning","description":"old test output needs current proof","action":"no-op","category":"review-support-pending","support":{"claim_type":"test","test":{"command":"go test ./..."}}}]}`
+		pushRan := false
+		proof := currentTestOwnerProof(t, database, run, pending)
+		executor := NewExecutor(database, p, nil, nil, []Step{
+			&adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) {
+				return &StepOutcome{Findings: pending, ReviewApprovedHeadSHA: run.HeadSHA}, nil
+			}},
+			&adaptiveCallStep{name: types.StepTest, fn: func(*StepContext) (*StepOutcome, error) {
+				findings := proof
+				if missingProof {
+					findings = ""
+				}
+				return &StepOutcome{Findings: findings}, nil
+			}},
+			&adaptiveCallStep{name: types.StepPush, fn: func(*StepContext) (*StepOutcome, error) {
+				pushRan = true
+				return &StepOutcome{}, nil
+			}},
+		}, nil)
+		err := executor.Execute(context.Background(), run, repo, workDir)
+		if !missingProof {
+			if err != nil {
+				t.Fatalf("valid completion baseline: %v", err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatal("missing current owner proof was accepted")
+		}
+		if pushRan {
+			t.Fatal("unresolved Test claim reached Push")
+		}
 	}
 }
 
@@ -355,31 +446,47 @@ func TestExecutorExplicitExternalCIOwnerCarriesPendingClaim(t *testing.T) {
 }
 
 func TestExecutorExternalCIBypassRequiresHandoffSourceIdentity(t *testing.T) {
-	database, p, baseRun, repo := setupTest(t)
-	const head = "1111111111111111111111111111111111111111"
-	run, err := database.InsertRunWithExternalCIOwner(repo.ID, "feature-external-ci-no-source", head, baseRun.BaseSHA,
-		nil, "", "", "", "develop", false, false, types.ExternalCIOwnerControllerShipPR, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.BindRunPRContext(run.ID, db.PRContextCandidate{
-		LocalHeadSHA: run.HeadSHA, TargetBranch: "develop",
-		TargetSHA:    "2222222222222222222222222222222222222222",
-		MergeBaseSHA: "2222222222222222222222222222222222222222",
-		DiffDigest:   "3333333333333333333333333333333333333333333333333333333333333333",
-	}, types.StepRebase); err != nil {
-		t.Fatal(err)
-	}
-	const pending = `{"findings":[{"id":"review-ci-no-source","severity":"warning","description":"historical CI failure","action":"no-op","category":"review-support-pending","support":{"claim_type":"ci","ci":{"check_id":"old-check","head_sha":"1111111111111111111111111111111111111111"}}}]}`
-	executor := NewExecutor(database, p, nil, nil, []Step{
-		&adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) {
-			return &StepOutcome{Findings: pending, ReviewApprovedHeadSHA: run.HeadSHA}, nil
-		}},
-		newPassStep(types.StepPush), newPassStep(types.StepPR), newPassStep(types.StepCI),
-	}, nil)
-	executor.SetSkippedSteps([]types.StepName{types.StepPush, types.StepPR, types.StepCI})
-	if err := executor.Execute(context.Background(), run, repo, t.TempDir()); err == nil {
-		t.Fatal("external CI bypass completed without a handoff source identity")
+	for _, missingSource := range []bool{false, true} {
+		database, p, baseRun, repo := setupTest(t)
+		const head = "1111111111111111111111111111111111111111"
+		run, err := database.InsertRunWithExternalCIOwner(repo.ID, "feature-external-ci-no-source", head, baseRun.BaseSHA,
+			nil, "", "", "", "develop", false, false, types.ExternalCIOwnerControllerShipPR, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sourceRepo, sourceBranch := "acme/repo", run.Branch
+		if missingSource {
+			sourceRepo, sourceBranch = "", ""
+		}
+		workDir := completionFixture(t, database, run)
+		receipt, err := database.GetRunPRContext(run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidate := receipt.PRContextCandidate
+		candidate.SourceRepo, candidate.SourceBranch = sourceRepo, sourceBranch
+		if _, err := database.BindRunPRContext(run.ID, candidate, types.StepRebase); err != nil {
+			t.Fatal(err)
+		}
+
+		const pending = `{"findings":[{"id":"review-ci-no-source","severity":"warning","description":"historical CI failure","action":"no-op","category":"review-support-pending","support":{"claim_type":"ci","ci":{"check_id":"old-check","head_sha":"1111111111111111111111111111111111111111"}}}]}`
+		executor := NewExecutor(database, p, nil, nil, []Step{
+			&adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) {
+				return &StepOutcome{Findings: pending, ReviewApprovedHeadSHA: run.HeadSHA}, nil
+			}},
+			newPassStep(types.StepPush), newPassStep(types.StepPR), newPassStep(types.StepCI),
+		}, nil)
+		executor.SetSkippedSteps([]types.StepName{types.StepPush, types.StepPR, types.StepCI})
+		err = executor.Execute(context.Background(), run, repo, workDir)
+		if !missingSource {
+			if err != nil {
+				t.Fatalf("valid source handoff: %v", err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatal("external CI bypass completed without a handoff source identity")
+		}
 	}
 }
 
@@ -405,7 +512,7 @@ func TestExecutorExternalCIBypassRejectsPostReviewDocumentCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	receipt := db.PRContextCandidate{
-		LocalHeadSHA: reviewedHead, TargetBranch: "develop",
+		SourceRepo: "acme/repo", SourceBranch: "feature-external-ci-advanced", LocalHeadSHA: reviewedHead, TargetBranch: "develop",
 		TargetSHA:    "2222222222222222222222222222222222222222",
 		MergeBaseSHA: "2222222222222222222222222222222222222222",
 		DiffDigest:   "3333333333333333333333333333333333333333333333333333333333333333",
@@ -427,6 +534,10 @@ func TestExecutorExternalCIBypassRejectsPostReviewDocumentCommit(t *testing.T) {
 	if err := database.UpdateRunReviewApprovedHeadSHA(run.ID, reviewedHead); err != nil {
 		t.Fatal(err)
 	}
+	pendingRound := pending
+	if _, err := database.InsertReviewStepRound(review.ID, 1, "initial", &pendingRound, nil, reviewedHead, 1); err != nil {
+		t.Fatal(err)
+	}
 	for _, name := range []types.StepName{types.StepPush, types.StepPR, types.StepCI} {
 		step, err := database.InsertStepResult(run.ID, name)
 		if err != nil {
@@ -436,6 +547,11 @@ func TestExecutorExternalCIBypassRejectsPostReviewDocumentCommit(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	executor := NewExecutor(database, p, nil, nil, nil, nil)
+	executor.workDir = workDir
+	if err := executor.validateReviewSupportOwners(run.ID, types.StepCI); err != nil {
+		t.Fatalf("valid external handoff: %v", err)
+	}
 	if err := database.UpdateRunHeadSHA(run.ID, advancedHead); err != nil {
 		t.Fatal(err)
 	}
@@ -444,8 +560,6 @@ func TestExecutorExternalCIBypassRejectsPostReviewDocumentCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	executor := NewExecutor(database, p, nil, nil, nil, nil)
-	executor.workDir = workDir
 	if err := executor.validateReviewSupportOwners(run.ID, types.StepCI); err == nil {
 		t.Fatal("external CI bypass accepted a document commit after Review approval")
 	}

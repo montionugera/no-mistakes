@@ -52,6 +52,10 @@ func TestReadPRFactsPreservesForkSourceIdentity(t *testing.T) {
 }
 
 func TestFindOpenPRFactsRejectsForeignSource(t *testing.T) {
+	baseline := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: pullListJSON(42)}, {stdout: rawPullFactsJSON(testRepo, "open", testHeadSHA)}, {stdout: pullListJSON()}}})
+	if facts, err := baseline.FindOpenPRFacts(context.Background(), testRepo, "feature/forgejo"); err != nil || len(facts) != 1 {
+		t.Fatalf("valid source = %+v, %v", facts, err)
+	}
 	recorder := &fakeRecorder{responses: []fakeResponse{
 		{stdout: pullListJSON(42)},
 		{stdout: rawPullFactsJSON("other/widgets", "open", testHeadSHA)},
@@ -97,17 +101,30 @@ func TestFindOpenPRFactsFiltersSameBranchForkCandidates(t *testing.T) {
 }
 
 func TestReadPRFactsRejectsMissingSourceAndHead(t *testing.T) {
-	for _, raw := range []string{
-		`{"status":200,"data":{"number":42,"html_url":"` + testPRURL + `","state":"open","head":{"ref":"feature/forgejo","sha":"` + testHeadSHA + `"},"base":{"ref":"main"}}}`,
-		rawPullFactsJSON(testRepo, "open", "short"),
+	valid := rawPullFactsJSON(testRepo, "open", testHeadSHA)
+	for name, raw := range map[string]string{
+		"missing source": strings.Replace(valid, `,"repo":{"full_name":"`+testRepo+`"}`, "", 1),
+		"short head":     rawPullFactsJSON(testRepo, "open", "short"),
 	} {
-		if _, err := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: raw}}}).ReadPRFacts(context.Background(), &scm.PR{Number: "42", URL: testPRURL}); err == nil {
-			t.Fatalf("accepted incomplete PR facts: %s", raw)
-		}
+		t.Run(name, func(t *testing.T) {
+			recorder := &fakeRecorder{responses: []fakeResponse{{stdout: valid}, {stdout: raw}}}
+			host := newTestHost(recorder)
+			pr := &scm.PR{Number: "42", URL: testPRURL}
+			if facts, err := host.ReadPRFacts(context.Background(), pr); err != nil || facts.HeadSHA != testHeadSHA || facts.SourceRepository != testRepo {
+				t.Fatalf("valid facts = %+v, %v", facts, err)
+			}
+			if _, err := host.ReadPRFacts(context.Background(), pr); err == nil || !strings.Contains(err.Error(), "lack source, head, or target identity") {
+				t.Fatalf("rejection = %v, want incomplete identity", err)
+			}
+		})
 	}
 }
 
 func TestFindOpenPRFactsRejectsAmbiguousSearch(t *testing.T) {
+	baseline := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: pullListJSON(42, 43)}, {stdout: rawPullFactsJSONFor(42, testRepo, "open", testHeadSHA)}, {stdout: rawPullFactsJSONFor(43, "other/widgets", "open", testHeadSHA)}, {stdout: pullListJSON()}}})
+	if facts, err := baseline.FindOpenPRFacts(context.Background(), testRepo, "feature/forgejo"); err != nil || len(facts) != 1 {
+		t.Fatalf("unique source = %+v, %v", facts, err)
+	}
 	recorder := &fakeRecorder{responses: []fakeResponse{
 		{stdout: pullListJSON(42, 43)},
 		{stdout: rawPullFactsJSONFor(42, testRepo, "open", testHeadSHA)},
@@ -123,6 +140,10 @@ func TestFindOpenPRFactsRejectsAmbiguousSearch(t *testing.T) {
 
 func TestFindOpenPRFactsRejectsIncompletePage(t *testing.T) {
 	for _, raw := range []string{`null`, `{"status":500,"data":[]}`, `{"status":200,"data":null}`} {
+		baseline := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: pullListJSON()}}})
+		if facts, err := baseline.FindOpenPRFacts(context.Background(), testRepo, "feature/forgejo"); err != nil || len(facts) != 0 {
+			t.Fatalf("valid empty page = %+v, %v", facts, err)
+		}
 		if _, err := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: raw}}}).FindOpenPRFacts(context.Background(), testRepo, "feature/forgejo"); err == nil {
 			t.Fatalf("incomplete Forgejo PR page was accepted: %s", raw)
 		}
@@ -144,6 +165,10 @@ func TestReadPRFactsMergedCommitFailsClosed(t *testing.T) {
 		{"whitespace", " " + mergeSHA, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			baseline := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: strings.Replace(merged, `"data":{`, `"data":{"merge_commit_sha":"`+mergeSHA+`",`, 1)}}})
+			if facts, err := baseline.ReadPRFacts(context.Background(), &scm.PR{Number: "42", URL: testPRURL}); err != nil || facts.MergeCommitSHA != mergeSHA {
+				t.Fatalf("valid merged baseline = %+v, %v", facts, err)
+			}
 			payload := merged
 			if !tc.omit {
 				payload = strings.Replace(payload, `"data":{`, `"data":{`+fmt.Sprintf(`"merge_commit_sha":%q,`, tc.sha), 1)
@@ -165,6 +190,10 @@ func TestReadPRFactsMergedCommitFailsClosed(t *testing.T) {
 
 func TestReadPRFactsRejectsUnknownMergedState(t *testing.T) {
 	payload := strings.Replace(rawPullFactsJSON(testRepo, "invalid", testHeadSHA), `"merged":false`, `"merged":true,"merge_commit_sha":"abcdef0123456789abcdef0123456789abcdef01"`, 1)
+	baseline := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: strings.Replace(payload, `"state":"invalid"`, `"state":"closed"`, 1)}}})
+	if facts, err := baseline.ReadPRFacts(context.Background(), &scm.PR{Number: "42", URL: testPRURL}); err != nil || facts.State != scm.PRStateMerged {
+		t.Fatalf("valid merged state = %+v, %v", facts, err)
+	}
 	host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: payload}}})
 	if facts, err := host.ReadPRFacts(context.Background(), &scm.PR{Number: "42", URL: testPRURL}); err == nil {
 		t.Fatalf("accepted unknown raw state as merged: %+v", facts)

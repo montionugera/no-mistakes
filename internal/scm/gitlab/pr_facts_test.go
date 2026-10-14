@@ -13,6 +13,7 @@ const gitlabFacts42 = `{"iid":42,"web_url":"https://gitlab.example.com/group/pro
 const gitlabFacts43 = `{"iid":43,"web_url":"https://gitlab.example.com/group/project/-/merge_requests/43","state":"opened","source_project_id":9,"target_project_id":7,"source_branch":"feature","target_branch":"main","sha":"1123456789abcdef0123456789abcdef01234567"}`
 
 func gitlabFactsHost(responses map[string]gitlabTestResponse) *Host {
+	responses["glab api --hostname gitlab.example.com --method GET projects/0"] = gitlabTestResponse{stdout: `{"id":0,"path_with_namespace":"other/fork"}`}
 	responses["glab api --hostname gitlab.example.com --method GET projects/9"] = gitlabTestResponse{stdout: `{"id":9,"path_with_namespace":"other/fork"}`}
 	responses["glab api --hostname gitlab.example.com --method GET projects/7"] = gitlabTestResponse{stdout: `{"id":7,"path_with_namespace":"group/project"}`}
 	return New(gitlabTestCmdFactory(responses), nil, "gitlab.example.com", "group/project")
@@ -45,6 +46,7 @@ func TestFindOpenPRFactsReturnsEveryPaginatedCandidate(t *testing.T) {
 }
 
 func TestGitLabPRFactsFailClosed(t *testing.T) {
+	wantErrors := map[string]string{"missing source": "incomplete source, head, or target", "missing head": "incomplete source, head, or target", "bad URL": "inconsistent URL and IID", "unknown state": "unsupported state", "wrong project identity": "incomplete or inconsistent identity"}
 	for _, tc := range []struct{ name, body, sourceProject string }{
 		{"missing source", strings.Replace(gitlabFacts42, `"source_project_id":9,`, "", 1), ""},
 		{"missing head", strings.Replace(gitlabFacts42, `"sha":"0123456789abcdef0123456789abcdef01234567"`, `"sha":""`, 1), ""},
@@ -53,6 +55,10 @@ func TestGitLabPRFactsFailClosed(t *testing.T) {
 		{"wrong project identity", gitlabFacts42, `{"id":8,"path_with_namespace":"other/fork"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			valid := gitlabFactsHost(map[string]gitlabTestResponse{"glab api --hostname gitlab.example.com --method GET projects/group%2Fproject/merge_requests/42": {stdout: gitlabFacts42}})
+			if facts, err := valid.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err != nil || facts.PR.Number != "42" {
+				t.Fatalf("valid baseline = %+v, %v", facts, err)
+			}
 			h := gitlabFactsHost(map[string]gitlabTestResponse{
 				"glab api --hostname gitlab.example.com --method GET projects/group%2Fproject/merge_requests/42": {stdout: tc.body},
 			})
@@ -63,14 +69,20 @@ func TestGitLabPRFactsFailClosed(t *testing.T) {
 					"glab api --hostname gitlab.example.com --method GET projects/7":                                 {stdout: `{"id":7,"path_with_namespace":"group/project"}`},
 				}), nil, "gitlab.example.com", "group/project")
 			}
-			if _, err := h.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err == nil {
-				t.Fatal("ReadPRFacts accepted incomplete or inconsistent data")
+			if _, err := h.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err == nil || !strings.Contains(err.Error(), wantErrors[tc.name]) {
+				t.Fatalf("rejection = %v, want %q", err, wantErrors[tc.name])
 			}
 		})
 	}
 }
 
 func TestFindOpenPRFactsRejectsCorruptLaterPage(t *testing.T) {
+	valid := gitlabFactsHost(map[string]gitlabTestResponse{
+		"glab api --hostname gitlab.example.com --method GET projects/group%2Fproject/merge_requests -f state=opened -f source_branch=feature -f per_page=100 --paginate": {stdout: `[` + gitlabFacts42 + `]` + "\n[]"},
+	})
+	if facts, err := valid.FindOpenPRFacts(context.Background(), "other/fork", "feature"); err != nil || len(facts) != 1 {
+		t.Fatalf("valid pages = %+v, %v", facts, err)
+	}
 	h := gitlabFactsHost(map[string]gitlabTestResponse{
 		"glab api --hostname gitlab.example.com --method GET projects/group%2Fproject/merge_requests -f state=opened -f source_branch=feature -f per_page=100 --paginate": {stdout: `[` + gitlabFacts42 + `]` + "\n" + `[broken`},
 	})
@@ -88,11 +100,25 @@ func TestFindOpenPRFactsRejectsDuplicateAndIncompleteCandidates(t *testing.T) {
 		{"non-array page", `{}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			valid := gitlabFactsHost(map[string]gitlabTestResponse{"glab api --hostname gitlab.example.com --method GET projects/group%2Fproject/merge_requests -f state=opened -f source_branch=feature -f per_page=100 --paginate": {stdout: `[` + gitlabFacts42 + `]`}})
+			if facts, err := valid.FindOpenPRFacts(context.Background(), "other/fork", "feature"); err != nil || len(facts) != 1 {
+				t.Fatalf("valid baseline = %+v, %v", facts, err)
+			}
 			h := gitlabFactsHost(map[string]gitlabTestResponse{
 				"glab api --hostname gitlab.example.com --method GET projects/group%2Fproject/merge_requests -f state=opened -f source_branch=feature -f per_page=100 --paginate": {stdout: tc.body},
 			})
-			if _, err := h.FindOpenPRFacts(context.Background(), "other/fork", "feature"); err == nil {
-				t.Fatal("FindOpenPRFacts accepted ambiguous or incomplete candidate list")
+			want := ""
+			if tc.name == "missing source project" {
+				want = "incomplete source, head, or target"
+			}
+			if tc.name == "duplicate MR" {
+				want = "duplicate"
+			}
+			if tc.name == "non-open response" {
+				want = "non-open"
+			}
+			if _, err := h.FindOpenPRFacts(context.Background(), "other/fork", "feature"); err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("rejection = %v, want %q", err, want)
 			}
 		})
 	}
@@ -129,6 +155,10 @@ func TestReadPRFactsMergedResultMatchesGitLabMergeMethod(t *testing.T) {
 		{"malformed squash with valid merge", fmt.Sprintf(`"merge_commit_sha":%q,"squash_commit_sha":"bad",`, mergeSHA), "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			baseline := gitlabFactsHost(map[string]gitlabTestResponse{"glab api --hostname gitlab.example.com --method GET projects/group%2Fproject/merge_requests/42": {stdout: strings.Replace(merged, `{`, `{"merge_commit_sha":"`+mergeSHA+`",`, 1)}})
+			if facts, err := baseline.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err != nil || facts.MergeCommitSHA != mergeSHA {
+				t.Fatalf("valid merged baseline = %+v, %v", facts, err)
+			}
 			payload := strings.Replace(merged, `{`, `{`+tc.fields, 1)
 			host := gitlabFactsHost(map[string]gitlabTestResponse{
 				"glab api --hostname gitlab.example.com --method GET projects/group%2Fproject/merge_requests/42": {stdout: payload},

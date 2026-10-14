@@ -51,18 +51,23 @@ func TestReadPRFactsFailsClosedOnIncompleteOrMalformedData(t *testing.T) {
 		"missing sha":       strings.Replace(giteaFactsJSON, giteaFactsSHA, "", 1),
 		"wrong number":      strings.Replace(giteaFactsJSON, `"number":42`, `"number":43`, 1),
 		"wrong url":         strings.Replace(giteaFactsJSON, `/pulls/42`, `/pulls/43`, 1),
-		"incoherent merged": strings.Replace(giteaFactsJSON, `"merged":false`, `"merged":true`, 1),
+		"incoherent merged": strings.Replace(giteaFactsJSON, `"merged":false`, `"merged":true,"merge_commit_sha":"abcdef0123456789abcdef0123456789abcdef01"`, 1),
 		"null":              `null`,
 		"malformed":         `{`,
 		"trailing response": giteaFactsJSON + ` {}`,
 	}
+	wantErrors := map[string]string{"missing source": "incomplete or malformed", "missing sha": "incomplete or malformed", "wrong number": "inconsistent URL or number", "wrong url": "inconsistent URL or number", "incoherent merged": "reports merged", "null": "incomplete or malformed", "malformed": "decode Gitea PR facts", "trailing response": "decode Gitea PR facts"}
 	for name, payload := range cases {
 		t.Run(name, func(t *testing.T) {
+			valid := factsHost(map[string]giteaTestResponse{"tea api --login work /repos/owner/repo/pulls/42": {stdout: giteaFactsJSON}})
+			if facts, err := valid.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err != nil || facts.PR.Number != "42" {
+				t.Fatalf("valid baseline = %+v, %v", facts, err)
+			}
 			host := factsHost(map[string]giteaTestResponse{
 				"tea api --login work /repos/owner/repo/pulls/42": {stdout: payload},
 			})
-			if _, err := host.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err == nil {
-				t.Fatal("accepted incomplete or malformed PR facts")
+			if _, err := host.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err == nil || !strings.Contains(err.Error(), wantErrors[name]) {
+				t.Fatalf("rejection = %v, want %q", err, wantErrors[name])
 			}
 		})
 	}
@@ -98,12 +103,23 @@ func TestFindOpenPRFactsFailsClosedOnMalformedUnrelatedCandidateAndDuplicate(t *
 		"trailing response":    `[] {}`,
 	} {
 		t.Run(name, func(t *testing.T) {
+			valid := factsHost(map[string]giteaTestResponse{"tea api --login work /repos/owner/repo/pulls?state=open&sort=oldest&limit=50&page=1": {stdout: `[` + giteaFactsJSON + `]`}, "tea api --login work /repos/owner/repo/pulls?state=open&sort=oldest&limit=50&page=2": {stdout: `[]`}})
+			if facts, err := valid.FindOpenPRFacts(context.Background(), "fork/repo", "feature"); err != nil || len(facts) != 1 {
+				t.Fatalf("valid baseline = %+v, %v", facts, err)
+			}
 			host := factsHost(map[string]giteaTestResponse{
 				"tea api --login work /repos/owner/repo/pulls?state=open&sort=oldest&limit=50&page=1": {stdout: first},
 				"tea api --login work /repos/owner/repo/pulls?state=open&sort=oldest&limit=50&page=2": {stdout: `[]`},
 			})
-			if _, err := host.FindOpenPRFacts(context.Background(), "fork/repo", "feature"); err == nil {
-				t.Fatal("accepted incomplete or ambiguous list")
+			want := ""
+			if name == "incomplete unrelated" {
+				want = "incomplete or malformed"
+			}
+			if name == "duplicate" {
+				want = "duplicate"
+			}
+			if _, err := host.FindOpenPRFacts(context.Background(), "fork/repo", "feature"); err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("rejection = %v, want %q", err, want)
 			}
 		})
 	}
@@ -134,6 +150,10 @@ func TestReadPRFactsMergedCommitFailsClosed(t *testing.T) {
 		{"whitespace", " " + mergeSHA, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			baseline := factsHost(map[string]giteaTestResponse{"tea api --login work /repos/owner/repo/pulls/42": {stdout: strings.Replace(merged, `{`, `{"merge_commit_sha":"`+mergeSHA+`",`, 1)}})
+			if facts, err := baseline.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err != nil || facts.MergeCommitSHA != mergeSHA {
+				t.Fatalf("valid merged baseline = %+v, %v", facts, err)
+			}
 			payload := merged
 			if !tc.omit {
 				payload = strings.Replace(payload, `{`, `{`+fmt.Sprintf(`"merge_commit_sha":%q,`, tc.sha), 1)

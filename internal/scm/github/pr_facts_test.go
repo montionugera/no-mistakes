@@ -47,6 +47,9 @@ func TestReadPRFactsRejectsWrongIdentityAndMissingHead(t *testing.T) {
 	host := New(githubTestCmdFactory(map[string]githubTestResponse{
 		"gh api --method GET repos/test/repo/pulls/42": {stdout: testPRFactsJSON},
 	}), nil, "", "test/repo")
+	if facts, err := host.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err != nil || facts.PR.Number != "42" {
+		t.Fatalf("valid identity = %+v, %v", facts, err)
+	}
 	if _, err := host.ReadPRFacts(context.Background(), &scm.PR{Number: "42", URL: "https://github.com/test/repo/pull/99"}); err == nil {
 		t.Fatal("accepted a different recorded PR URL")
 	}
@@ -65,6 +68,12 @@ func TestFindOpenPRFactsRejectsMalformedLaterPage(t *testing.T) {
 			stdout: `[[` + testPRFactsJSON + `],null]`,
 		},
 	}), nil, "", "test/repo")
+	valid := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh api --method GET repos/test/repo/pulls -f state=open -f head=test:feature -f per_page=100 --paginate --slurp": {stdout: `[[` + testPRFactsJSON + `],[]]`},
+	}), nil, "", "test/repo")
+	if facts, err := valid.FindOpenPRFacts(context.Background(), "test/repo", "feature"); err != nil || len(facts) != 1 {
+		t.Fatalf("valid pages = %+v, %v", facts, err)
+	}
 	if _, err := host.FindOpenPRFacts(context.Background(), "test/repo", "feature"); err == nil {
 		t.Fatal("accepted an incomplete paginated PR list")
 	}
@@ -85,6 +94,10 @@ func TestReadPRFactsMergedCommitFailsClosed(t *testing.T) {
 		{"whitespace", " " + mergeSHA, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			baseline := New(githubTestCmdFactory(map[string]githubTestResponse{"gh api --method GET repos/test/repo/pulls/42": {stdout: strings.Replace(merged, `{`, `{"merge_commit_sha":"`+mergeSHA+`",`, 1)}}), nil, "", "test/repo")
+			if facts, err := baseline.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err != nil || facts.MergeCommitSHA != mergeSHA {
+				t.Fatalf("valid merged baseline = %+v, %v", facts, err)
+			}
 			payload := merged
 			if !tc.omit {
 				payload = strings.Replace(payload, `{`, `{`+fmt.Sprintf(`"merge_commit_sha":%q,`, tc.sha), 1)

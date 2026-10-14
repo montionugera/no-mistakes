@@ -100,6 +100,10 @@ func TestFindOpenPRFactsReturnsEveryPagedCandidateAndAcceptsPushURL(t *testing.T
 }
 
 func TestReadPRFactsRejectsStalePRMergeSnapshot(t *testing.T) {
+	valid := newTestHost(azFactsResponses())
+	if facts, err := valid.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err != nil || facts.HeadSHA != azFactsSHA {
+		t.Fatalf("valid live head = %+v, %v", facts, err)
+	}
 	h := newTestHost(map[string]azdoTestResponse{
 		"az repos pr show --id 42 --organization " + testOrg + " --output json":                                                                             {stdout: azFacts42},
 		"az repos ref list --filter heads/feature --organization " + testOrg + " --project " + testProject + " --repository " + testRepo + " --output json": {stdout: `[{"name":"refs/heads/feature","objectId":"1123456789abcdef0123456789abcdef01234567"}]`},
@@ -132,6 +136,10 @@ func TestReadPRFactsRejectsMissingOrAmbiguousLiveSourceRef(t *testing.T) {
 		{"null", `null`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			valid := newTestHost(azFactsResponses())
+			if facts, err := valid.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err != nil || facts.HeadSHA != azFactsSHA {
+				t.Fatalf("valid live ref = %+v, %v", facts, err)
+			}
 			h := newTestHost(map[string]azdoTestResponse{
 				"az repos pr show --id 42 --organization " + testOrg + " --output json":                                                                             {stdout: azFacts42},
 				"az repos ref list --filter heads/feature --organization " + testOrg + " --project " + testProject + " --repository " + testRepo + " --output json": {stdout: tc.body},
@@ -199,6 +207,10 @@ func TestReadPRFactsMergedCommitFailsClosed(t *testing.T) {
 		{"whitespace", " " + mergeSHA, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			baseline := newTestHost(map[string]azdoTestResponse{"az repos pr show --id 42 --organization " + testOrg + " --output json": {stdout: strings.Replace(merged, `{`, `{"lastMergeCommit":{"commitId":"`+mergeSHA+`"},`, 1)}})
+			if facts, err := baseline.ReadPRFacts(context.Background(), &scm.PR{Number: "42"}); err != nil || facts.MergeCommitSHA != mergeSHA {
+				t.Fatalf("valid merged baseline = %+v, %v", facts, err)
+			}
 			payload := merged
 			if !tc.omit {
 				payload = strings.Replace(payload, `{`, `{`+fmt.Sprintf(`"lastMergeCommit":{"commitId":%q},`, tc.sha), 1)

@@ -131,6 +131,9 @@ func TestRunPRContextRejectsMalformedAndConflictingIdentity(t *testing.T) {
 	d := openTestDB(t)
 	runID := testPRContextRun(t, d)
 	valid := testPRContextCandidate()
+	if _, err := d.BindRunPRContext(runID, valid, types.StepRebase); err != nil {
+		t.Fatalf("valid baseline: %v", err)
+	}
 	for _, mutate := range []func(*PRContextCandidate){
 		func(c *PRContextCandidate) { c.TargetBranch = " " },
 		func(c *PRContextCandidate) { c.LocalHeadSHA = "bad" },
@@ -160,7 +163,7 @@ func TestRunPRContextRejectsMalformedAndConflictingIdentity(t *testing.T) {
 	if _, err := d.BindRunPRContext(runID, conflict, types.StepRebase); err == nil {
 		t.Fatal("accepted source branch retarget")
 	}
-	if got, err := d.GetRunPRContext(runID); err != nil || got.Generation != 1 || got.PRURL != valid.PRURL {
+	if got, err := d.GetRunPRContext(runID); err != nil || got.Generation != 2 || got.PRURL != valid.PRURL {
 		t.Fatalf("identity changed: %+v, %v", got, err)
 	}
 }
@@ -168,6 +171,15 @@ func TestRunPRContextRejectsMalformedAndConflictingIdentity(t *testing.T) {
 func TestRunPRContextRejectsIdentityConflictingWithExistingRunPR(t *testing.T) {
 	d := openTestDB(t)
 	runID := testPRContextRun(t, d)
+	baselineID := testPRContextRun(t, d)
+	baseline := testPRContextCandidate()
+	baseline.PRURL, baseline.ForgeHeadSHA = "https://example.com/pr/1", baseline.LocalHeadSHA
+	if _, err := d.sql.Exec(`UPDATE runs SET pr_url=? WHERE id=?`, baseline.PRURL, baselineID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.BindRunPRContext(baselineID, baseline, types.StepRebase); err != nil {
+		t.Fatalf("valid recorded identity: %v", err)
+	}
 	if _, err := d.sql.Exec(`UPDATE runs SET pr_url=? WHERE id=?`, "https://example.com/pr/1", runID); err != nil {
 		t.Fatal(err)
 	}
