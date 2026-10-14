@@ -18,16 +18,10 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
-// canonicalStaleMonitorPhrases are the load-bearing claims of the corrected
-// "PR fell behind / conflicted after checks pass" guidance: the live CI monitor
-// auto-rebases and re-pushes such a PR, so the agent runs no command and never
-// hand-rebases, and `no-mistakes rerun` is only the dead-monitor recovery,
-// subject to its clean caller-head check.
 var canonicalStaleMonitorPhrases = []string{
+	"receipt guard stops the run when the live target commit changes",
+	"Restart from the current target and head",
 	"never hand-rebase",
-	"revalidates from Review",
-	"cannot prove continuity with the reviewed head",
-	"re-pushes",
 	"no-mistakes rerun",
 }
 
