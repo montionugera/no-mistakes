@@ -19,6 +19,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/forgecontext"
+	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
@@ -767,37 +768,41 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 			if err := appPaths.EnsureDirs(); err != nil {
 				t.Fatal(err)
 			}
-			exec := pipeline.NewExecutor(sctx.DB, appPaths, sctx.Config, sctx.Agent, steps, nil)
+			gateReady := make(chan struct{}, 1)
+			exec := pipeline.NewExecutor(sctx.DB, appPaths, sctx.Config, sctx.Agent, steps, func(event ipc.Event) {
+				if event.Type == ipc.EventStepCompleted && event.StepName != nil && *event.StepName == types.StepTest && event.Status != nil && *event.Status == string(types.StepStatusAwaitingApproval) {
+					gateReady <- struct{}{}
+				}
+			})
 			exec.SetForgeContext(&forgecontext.Context{Provider: provider, Host: "github.com"})
 			var err error
 			if strings.HasPrefix(scenario, "Test ") {
+				// Gate readiness is an event contract, not a timing assertion. The
+				// deadline only detects a hang, including slow git under the race suite.
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 				done := make(chan error, 1)
-				go func() { done <- exec.Execute(context.Background(), sctx.Run, sctx.Repo, dir) }()
-				deadline := time.Now().Add(10 * time.Second)
-				approved := false
-				for time.Now().Before(deadline) {
-					rows, readErr := sctx.DB.GetStepsByRun(sctx.Run.ID)
-					if readErr != nil {
-						t.Fatal(readErr)
+				go func() {
+					defer close(done)
+					done <- exec.Execute(ctx, sctx.Run, sctx.Repo, dir)
+				}()
+				defer func() {
+					cancel()
+					for range done {
 					}
-					for _, row := range rows {
-						if row.StepName == types.StepTest && row.Status == types.StepStatusAwaitingApproval {
-							if _, respondErr := exec.RespondWithOverrides(types.StepTest, types.ActionApprove, nil, nil, nil, nil, "accept live validation exception"); respondErr == nil {
-								approved = true
-							}
-						}
-					}
-					if approved {
-						break
-					}
-					time.Sleep(10 * time.Millisecond)
-				}
-				if !approved {
+				}()
+				select {
+				case <-gateReady:
+				case err := <-done:
+					t.Fatalf("executor exited before Test approval: %v", err)
+				case <-ctx.Done():
 					t.Fatal("Test did not park for approval")
+				}
+				if _, respondErr := exec.RespondWithOverrides(types.StepTest, types.ActionApprove, nil, nil, nil, nil, "accept live validation exception"); respondErr != nil {
+					t.Fatal(respondErr)
 				}
 				select {
 				case err = <-done:
-				case <-time.After(10 * time.Second):
+				case <-ctx.Done():
 					t.Fatal("approved run did not complete")
 				}
 			} else {
