@@ -75,8 +75,19 @@ func handleFakeCLI(mode string) {
 			return
 		}
 		os.Exit(1)
-	case "gh-git-push-reply-lost":
+	case "gh-git-push-reply-lost", "gh-git-status-confirmation-timeout":
 		if strings.TrimSuffix(filepath.Base(os.Args[0]), filepath.Ext(os.Args[0])) == "git" {
+			statePath := os.Getenv("FAKE_CLI_STATUS_CONFIRMATION_STATE")
+			if mode == "gh-git-status-confirmation-timeout" && fakeGitSubcommand(args) == "ls-remote" {
+				if state, err := os.ReadFile(statePath); err == nil && string(state) == "armed" {
+					if err := os.WriteFile(statePath, []byte("timed-out"), 0600); err != nil {
+						fmt.Fprintln(os.Stderr, err)
+						os.Exit(1)
+					}
+					time.Sleep(time.Hour)
+					return
+				}
+			}
 			cmd := exec.Command(os.Getenv("FAKE_CLI_REAL_GIT"), args...)
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
@@ -85,8 +96,16 @@ func handleFakeCLI(mode string) {
 				os.Exit(1)
 			}
 			if fakeGitSubcommand(args) == "push" {
-				fmt.Fprintln(os.Stderr, "lost push response after remote update")
-				os.Exit(1)
+				if mode == "gh-git-push-reply-lost" {
+					fmt.Fprintln(os.Stderr, "lost push response after remote update")
+					os.Exit(1)
+				}
+				if _, err := os.Stat(statePath); os.IsNotExist(err) {
+					if err := os.WriteFile(statePath, []byte("armed"), 0600); err != nil {
+						fmt.Fprintln(os.Stderr, err)
+						os.Exit(1)
+					}
+				}
 			}
 			return
 		}

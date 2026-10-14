@@ -180,11 +180,15 @@ func TestCommitStatusLateAttemptAfterRepairStaysRetired(t *testing.T) {
 func TestCommitStatusLockWaitHonorsContext(t *testing.T) {
 	dir, base, head := setupGitRepo(t)
 	sc := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, base, head, config.Commands{})
+	sc.ForgeContext = &forgecontext.Context{Provider: scm.ProviderGitHub, Host: "github.com"}
 	publication := db.CommitStatusPublication{SHA: head, Host: "github.com", Repo: "test/repo", Validated: true}
 	if err := sc.DB.PutCommitStatusPublication(sc.Run.ID, publication); err != nil {
 		t.Fatal(err)
 	}
-	for _, operation := range []string{"confirmation", "reporting"} {
+	if err := sc.DB.PutCommitStatusAttempt(sc.Run.ID, db.CommitStatusAttempt{CommitStatusPublication: publication, Target: "https://github.com/test/repo", Ref: "refs/heads/feature"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{"confirmation", "verified confirmation", "reporting"} {
 		for _, ending := range []string{"cancel", "deadline"} {
 			t.Run(operation+"/"+ending, func(t *testing.T) {
 				if err := acquireCommitStatusLock(context.Background()); err != nil {
@@ -199,8 +203,13 @@ func TestCommitStatusLockWaitHonorsContext(t *testing.T) {
 				go func() {
 					defer close(done)
 					close(started)
-					if operation == "confirmation" {
-						_, err := reconcileCommitStatusAttempt(&bounded)
+					if operation != "reporting" {
+						var err error
+						if operation == "confirmation" {
+							_, err = reconcileCommitStatusAttempt(&bounded)
+						} else {
+							_, err = confirmVerifiedCommitStatus(&bounded, head, "https://github.com/test/repo", "refs/heads/feature")
+						}
 						if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 							t.Errorf("confirmation error = %v", err)
 						}
@@ -501,7 +510,7 @@ func TestCommitStatusNewerPublicationOwnsStatus(t *testing.T) {
 }
 
 func TestPipeline_GitHubCommitStatuses(t *testing.T) {
-	for _, scenario := range []string{"pass", "push reply lost", "fail after push", "cancel after push", "no push", "forgejo", "bitbucket", "repair head", "posting fails", "already upstream", "attempt already upstream", "fork", "formatter head", "recovered failure", "CI repair readiness", "Test no-go exception", "Test inconclusive exception", "skipped Test", "late Document", "late Lint", "stale tested head"} {
+	for _, scenario := range []string{"pass", "push reply lost", "fail after push", "cancel after push", "no push", "forgejo", "bitbucket", "repair head", "confirmation timeout then repair", "posting fails", "already upstream", "attempt already upstream", "fork", "formatter head", "recovered failure", "CI repair readiness", "Test no-go exception", "Test inconclusive exception", "skipped Test", "late Document", "late Lint", "stale tested head"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir, base, head := setupGitRepo(t)
 			remote := t.TempDir()
@@ -552,7 +561,7 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 			for key, value := range environmentEntries(t, env) {
 				t.Setenv(key, value)
 			}
-			if scenario == "push reply lost" {
+			if scenario == "push reply lost" || scenario == "confirmation timeout then repair" {
 				gh, err := exec.LookPath("gh")
 				if err != nil {
 					t.Fatal(err)
@@ -560,7 +569,12 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 				if err := os.Link(gh, filepath.Join(filepath.Dir(gh), "git")); err != nil {
 					t.Fatal(err)
 				}
-				t.Setenv("FAKE_CLI_MODE", "gh-git-push-reply-lost")
+				if scenario == "push reply lost" {
+					t.Setenv("FAKE_CLI_MODE", "gh-git-push-reply-lost")
+				} else {
+					t.Setenv("FAKE_CLI_MODE", "gh-git-status-confirmation-timeout")
+					t.Setenv("FAKE_CLI_STATUS_CONFIRMATION_STATE", filepath.Join(t.TempDir(), "confirmation-state"))
+				}
 				realGit, err := testgit.RealGit()
 				if err != nil {
 					t.Fatal(err)
@@ -631,7 +645,7 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 			repaired := ""
 			steps = append(steps, &transitionStep{name: types.StepCI, execute: func(sc *pipeline.StepContext) (*pipeline.StepOutcome, error) {
 				ciCalls++
-				if ciCalls == 1 && scenario != "no push" && scenario != "forgejo" && scenario != "bitbucket" && scenario != "already upstream" {
+				if ciCalls == 1 && scenario != "no push" && scenario != "forgejo" && scenario != "bitbucket" && scenario != "already upstream" && scenario != "confirmation timeout then repair" {
 					mu.Lock()
 					n := len(requests)
 					mu.Unlock()
@@ -652,7 +666,7 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 				if scenario == "cancel after push" {
 					return nil, errors.New(types.RunCancelReasonAbortedByUser)
 				}
-				if (scenario == "repair head" || scenario == "CI repair readiness") && ciCalls == 1 {
+				if (scenario == "repair head" || scenario == "CI repair readiness" || scenario == "confirmation timeout then repair") && ciCalls == 1 {
 					if err := os.WriteFile(filepath.Join(dir, "repair.txt"), []byte("repair"), 0600); err != nil {
 						t.Fatal(err)
 					}
@@ -752,6 +766,18 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 					t.Fatal("recovered failure did not fail")
 				}
 			}
+			if scenario == "confirmation timeout then repair" {
+				state, err := os.ReadFile(os.Getenv("FAKE_CLI_STATUS_CONFIRMATION_STATE"))
+				if err != nil || string(state) != "timed-out" {
+					t.Fatalf("confirmation timeout state = %q, %v", state, err)
+				}
+				for _, sha := range []string{head, repaired} {
+					p, err := sctx.DB.GetCommitStatusPublication(context.Background(), sctx.Run.ID, db.CommitStatusPublication{SHA: sha, Host: "github.com", Repo: "test/repo"})
+					if err != nil || p == nil || p.LastState != "success" {
+						t.Fatalf("verified publication %s was lost after repair: %+v, %v", sha, p, err)
+					}
+				}
+			}
 			mu.Lock()
 			got := append([]statusRequest(nil), requests...)
 			mu.Unlock()
@@ -761,7 +787,7 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 				if wantError || scenario == "recovered failure" {
 					want = append(want, statusRequest{Path: want[0].Path, State: "failure"})
 				}
-				if scenario == "repair head" || scenario == "CI repair readiness" {
+				if scenario == "repair head" || scenario == "CI repair readiness" || scenario == "confirmation timeout then repair" {
 					want = append(want, statusRequest{Path: "/repos/test/repo/statuses/" + repaired, State: "pending"}, statusRequest{Path: "/repos/test/repo/statuses/" + repaired, State: "success"})
 				}
 			}

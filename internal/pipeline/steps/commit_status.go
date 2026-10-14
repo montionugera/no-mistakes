@@ -115,6 +115,30 @@ func beginPublishedCommitStatus(sctx *pipeline.StepContext) func(string) {
 	return update
 }
 
+func confirmVerifiedCommitStatus(sctx *pipeline.StepContext, sha, target, ref string) (*db.CommitStatusPublication, error) {
+	if suppressPluginCommitStatus(sctx) || resolvedProvider(sctx) != scm.ProviderGitHub {
+		return nil, nil
+	}
+	attempt, err := sctx.DB.GetCommitStatusAttempt(sctx.Run.ID)
+	if err != nil || attempt == nil {
+		return nil, err
+	}
+	if attempt.SHA != sha || attempt.Target != safeurl.Redact(target) || attempt.Ref != ref {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(sctx.Ctx, commitStatusOperationTimeout)
+	defer cancel()
+	if err := acquireCommitStatusLock(ctx); err != nil {
+		return nil, err
+	}
+	defer func() { <-commitStatusLock }()
+	confirmed, err := sctx.DB.ConfirmCommitStatusAttempt(sctx.Run.ID, attempt.CommitStatusPublication)
+	if err != nil || !confirmed {
+		return nil, err
+	}
+	return &attempt.CommitStatusPublication, nil
+}
+
 func statusWarning(log func(string), operation string, err error) {
 	message := safeurl.RedactText(fmt.Sprintf("warning: no-mistakes commit status %s: %v", operation, err))
 	slog.Warn(message)

@@ -244,17 +244,17 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 	// push whose response was lost. A head already upstream without an attempt
 	// never earns a status.
 	reportStatus := func(string) {}
+	defer func() {
+		if publicationErr != nil {
+			reportStatus("failure")
+		}
+	}()
 	attempt, err := sctx.DB.GetCommitStatusAttempt(sctx.Run.ID)
 	if err != nil {
 		statusWarning(sctx.Log, "read push attempt", err)
 	}
 	if err == nil && attempt != nil && attempt.SHA == headBeingPushed && attempt.Target == safeurl.Redact(pushURL) && attempt.Ref == ref {
 		reportStatus = beginPublishedCommitStatus(sctx)
-		defer func() {
-			if publicationErr != nil {
-				reportStatus("failure")
-			}
-		}()
 	}
 	verifiedRemote, err := lsRemoteSHA(gitRun, pushURL, ref)
 	if err != nil || verifiedRemote != headBeingPushed {
@@ -262,6 +262,15 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 			return fmt.Errorf("verify successful push to %s: %w", pushTarget, err)
 		}
 		return fmt.Errorf("verify successful push to %s: remote head %s does not equal pushed head %s", pushTarget, verifiedRemote, headBeingPushed)
+	}
+	publication, err := confirmVerifiedCommitStatus(sctx, verifiedRemote, pushURL, ref)
+	if err != nil {
+		return fmt.Errorf("record verified commit status publication: %w", err)
+	}
+	if publication != nil {
+		report := commitStatusReporter(sctx, publication)
+		reportStatus = func(state string) { report(sctx.Ctx, state, "", sctx.Log) }
+		reportStatus("pending")
 	}
 	// Settle the gate mirror BEFORE recording the publication. The remote
 	// already has the head, but a run is only "published" once the gate mirror
