@@ -158,7 +158,7 @@ func TestRecoverOnStartup_ReplacesPublishedSuccessWithFailure(t *testing.T) {
 				}
 				mgr := NewRunManager(d, p, nil)
 				recoveredRuns := recoverOnStartup(d, p, mgr, worktrees.New(p, nil))
-				reportRecoveredCommitStatuses(context.Background(), d, p, mgr, recoveredRuns, time.Second)
+				reportRecoveredCommitStatuses(context.Background(), d, p, mgr, recoveredRuns, recoveryCommitStatusTimeout)
 				recovered, err := d.GetRun(run.ID)
 				if err != nil || recovered.Status != wantStatus {
 					t.Fatalf("recovered run = %+v, %v", recovered, err)
