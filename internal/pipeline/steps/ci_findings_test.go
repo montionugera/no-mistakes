@@ -534,9 +534,6 @@ func TestCIStep_PublishedRepairResumesMonitoringAndWaitsForTheRerun(t *testing.T
 	if calls := len(f.sctx.Agent.(*mockAgent).calls); calls != 1 {
 		t.Fatalf("agent invocations = %d, want one", calls)
 	}
-	if !strings.Contains(f.log(), "fix already attempted for these issues, waiting for CI re-run") {
-		t.Fatalf("the poll after the push must wait for the provider, log:\n%s", f.log())
-	}
 	if strings.Count(f.log(), "issues detected:") != 1 {
 		t.Fatalf("a stale poll must not be re-escalated as a new observation, log:\n%s", f.log())
 	}

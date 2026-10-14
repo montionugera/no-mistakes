@@ -1860,13 +1860,9 @@ func TestCIStep_MovedPublishedHeadClearsCIReadiness(t *testing.T) {
 	t.Parallel()
 	dir, _, baseSHA, headSHA := setupCIRerunRepo(t)
 
-	os.WriteFile(filepath.Join(dir, "out-of-band.txt"), []byte("out of band"), 0o644)
-	stepstest.GitCmd(t, dir, "add", "-A")
-	stepstest.GitCmd(t, dir, "commit", "-m", "out of band commit")
-	stepstest.GitCmd(t, dir, "push", "origin", "feature")
-
 	// The first poll is green, so the run records CI readiness before the
-	// cancelled check on the second poll reaches the head check.
+	// published branch moves. The forge still reports the delivered head on
+	// the second poll, so its cancelled check reaches the rerun head guard.
 	env, _ := stepstest.FakeCIGHLoggedSequence(t, "OPEN", []string{
 		`[{"name":"test","state":"SUCCESS","bucket":"pass"}]`,
 		`[{"name":"test","state":"CANCELLED","bucket":"cancel","link":"https://github.com/test/repo/actions/runs/900/job/901"}]`,
@@ -1877,6 +1873,7 @@ func TestCIStep_MovedPublishedHeadClearsCIReadiness(t *testing.T) {
 	sctx := stepstest.NewTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = env
 	sctx.Run.PRURL = &prURL
+	stepstest.BindCurrentPRComparison(t, sctx, prURL, "test/repo", "main")
 	sctx.Repo.UpstreamURL = "https://github.com/test/repo"
 	sctx.Config.CITimeout = 30 * time.Minute
 	sctx.Config.AutoFix = config.AutoFix{CI: 3}
@@ -1889,6 +1886,18 @@ func TestCIStep_MovedPublishedHeadClearsCIReadiness(t *testing.T) {
 	polls := 0
 	step := (&steps.CIStep{}).SetWaitForNextPoll(func(ctx context.Context, interval time.Duration) error {
 		polls++
+		if polls == 1 {
+			run, err := sctx.DB.GetRun(sctx.Run.ID)
+			if err != nil || run.CIReadyAt == nil {
+				t.Fatalf("first green poll did not establish readiness: %+v, %v", run, err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "out-of-band.txt"), []byte("out of band"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			stepstest.GitCmd(t, dir, "add", "-A")
+			stepstest.GitCmd(t, dir, "commit", "-m", "out of band commit")
+			stepstest.GitCmd(t, dir, "push", "origin", "feature")
+		}
 		if polls >= 5 {
 			cancel()
 			return ctx.Err()
@@ -2355,7 +2364,9 @@ func TestCIStep_MovedPublishedHeadTerminatesInsteadOfRerunning(t *testing.T) {
 	prURL := "https://github.com/test/repo/pull/42"
 	ag := &stepstest.MockAgent{AgentName: "test"}
 	sctx := stepstest.NewTestContext(t, ag, dir, baseSHA, headSHA, config.Commands{})
-	sctx.Env = env
+	// Keep the forge observation on the delivered head; the independent Git
+	// publication read must catch the move before requesting a rerun.
+	sctx.Env = append(env, "FAKE_CLI_PR_HEAD_SHA="+headSHA)
 	sctx.Run.PRURL = &prURL
 	sctx.Repo.UpstreamURL = "https://github.com/test/repo"
 	sctx.Config.CITimeout = 30 * time.Minute
