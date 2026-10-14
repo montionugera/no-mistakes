@@ -591,9 +591,8 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 			var requests []statusRequest
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var payload struct {
-					State   string `json:"state"`
-					Context string `json:"context"
-	"database/sql"`
+					State       string `json:"state"`
+					Context     string `json:"context"`
 					Description string `json:"description"`
 					TargetURL   string `json:"target_url"`
 				}
