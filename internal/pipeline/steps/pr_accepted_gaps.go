@@ -17,6 +17,9 @@ import (
 // and an accepted gap is audit evidence that must survive every trimming path.
 const acceptedGapsHeading = "### Accepted gaps"
 
+const acceptedGapsStart = "<!-- no-mistakes:accepted-gaps:start -->"
+const acceptedGapsEnd = "<!-- no-mistakes:accepted-gaps:end -->"
+
 const maxAcceptedGapDescriptionRunes = 500
 
 // pipelineAttestationAcceptedGaps is the machine-readable form of an accepted
@@ -55,12 +58,15 @@ func acceptedGapTextDigest(text string) string {
 }
 
 func acceptedGapAuditBlock(pipelineMD string) string {
-	header, _ := splitPipelineSectionHeader(pipelineMD)
-	start := strings.Index(header, acceptedGapsHeading+"\n")
+	start := strings.Index(pipelineMD, acceptedGapsStart)
 	if start < 0 {
 		return ""
 	}
-	return strings.TrimSpace(header[start:])
+	end := strings.Index(pipelineMD[start:], acceptedGapsEnd)
+	if end < 0 {
+		return ""
+	}
+	return pipelineMD[start : start+end+len(acceptedGapsEnd)]
 }
 
 func validateAcceptedGapAuditBudget(pipelineMD string, limit int) error {
@@ -92,9 +98,9 @@ func preserveAcceptedGapAudit(body, prefix, pipelineMD string, limit int, units 
 
 // buildAcceptedGapsBlock renders each accepted finding with its description,
 // plus the approval reason and the covering tests verbatim. It returns "" when
-// no completed Test step carries a recorded gap. The block is one paragraph
-// (no blank lines) so the Pipeline header parser can keep it whole.
-func buildAcceptedGapsBlock(steps []*db.StepResult, flavor prBodyFlavor) string {
+// no completed Test step carries a recorded gap.
+func buildAcceptedGapsBlock(steps []*db.StepResult, provider scm.Provider) string {
+	flavor := prBodyFlavorFor(provider)
 	for _, sr := range steps {
 		if sr == nil || sr.StepName != types.StepTest || sr.Status != types.StepStatusCompleted {
 			continue
@@ -122,7 +128,7 @@ func buildAcceptedGapsBlock(steps []*db.StepResult, flavor prBodyFlavor) string 
 		}
 		fmt.Fprintf(&b, "- Approved: %s\n", escapePRText(canonicalAcceptedGapText(gaps.Reason), flavor))
 		fmt.Fprintf(&b, "- Covered by: %s", escapePRText(canonicalAcceptedGapText(gaps.CoveredBy), flavor))
-		return b.String()
+		return acceptedGapsStart + "\n" + neutralizeAttestationMarkers(provider, b.String()) + "\n" + acceptedGapsEnd
 	}
 	return ""
 }
@@ -136,24 +142,18 @@ func singleLineText(s string, maxRunes int) string {
 	return s
 }
 
-func rebindAcceptedGapAudit(body string, steps []*db.StepResult, provider scm.Provider) string {
-	lines := strings.Split(body, "\n")
-	for i := 0; i < len(lines); i++ {
-		if lines[i] != acceptedGapsHeading {
-			continue
+func rebindAcceptedGapAudit(body string, steps []*db.StepResult, provider scm.Provider) (string, error) {
+	block := buildAcceptedGapsBlock(steps, provider)
+	starts, ends := strings.Count(body, acceptedGapsStart), strings.Count(body, acceptedGapsEnd)
+	if starts == 0 && ends == 0 {
+		if block == "" {
+			return body, nil
 		}
-		end := i + 1
-		for end < len(lines) {
-			line := lines[end]
-			if strings.HasPrefix(line, "## ") || strings.HasPrefix(line, "### ") || strings.HasPrefix(line, "<details>") || strings.HasPrefix(line, "</details>") || strings.HasPrefix(line, pipelineAttestationCommentPrefix) {
-				break
-			}
-			end++
-		}
-		lines = append(lines[:i], lines[end:]...)
-		i--
+		return body + "\n\n" + block, nil
 	}
-	body = strings.Join(lines, "\n")
-	block := neutralizeAttestationMarkers(provider, buildAcceptedGapsBlock(steps, prBodyFlavorFor(provider)))
-	return joinBlocks(body, block)
+	start, end := strings.Index(body, acceptedGapsStart), strings.Index(body, acceptedGapsEnd)
+	if starts != 1 || ends != 1 || end < start {
+		return "", fmt.Errorf("ambiguous accepted-gap audit markers; refusing publication")
+	}
+	return body[:start] + block + body[end+len(acceptedGapsEnd):], nil
 }

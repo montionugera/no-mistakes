@@ -214,7 +214,11 @@ func rebindOwnedPRAttestation(body, head string, steps []*db.StepResult, policy 
 	if !hasPRAppendixMarkers(body) {
 		updated, rebound := rebindPipelineAttestationWithSteps(body, head, steps, policy)
 		if rebound && steps != nil {
-			updated = rebindAcceptedGapAudit(updated, steps, provider)
+			var err error
+			updated, err = rebindAcceptedGapAudit(updated, steps, provider)
+			if err != nil {
+				return "", false, err
+			}
 		}
 		return updated, rebound, nil
 	}
@@ -227,7 +231,10 @@ func rebindOwnedPRAttestation(body, head string, steps []*db.StepResult, policy 
 		return "", false, fmt.Errorf("cannot rebind the owned PR attestation")
 	}
 	if steps != nil {
-		appendix = rebindAcceptedGapAudit(appendix, steps, provider)
+		appendix, err = rebindAcceptedGapAudit(appendix, steps, provider)
+		if err != nil {
+			return "", false, err
+		}
 	}
 	updated := parts.before + wrapPRAppendix(appendix) + parts.after
 	if len(updated) > maxPullRequestBodyBytes {

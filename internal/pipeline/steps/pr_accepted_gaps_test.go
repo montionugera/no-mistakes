@@ -216,7 +216,7 @@ func TestRestampAcceptedGapAuditMatchesCurrentSteps(t *testing.T) {
 							previous[1].AcceptedGapsJSON = &raw
 						}
 						md, _ := buildPipelineSummaryFor(previous, nil, testPipelineHeadSHA, scm.ProviderGitHub, pipelineAttestationPolicy{})
-						body := appendixEvidence(mode, prBodyHTML, "low risk", "", md, provider)
+						body := "### Accepted gaps\n\nAuthor discussion of unrelated gaps.\n\n" + appendixEvidence(mode, prBodyHTML, "low risk", "", md, provider) + "\n\nReviewer paragraph after the audit.\n"
 						if owned {
 							body = "Author prefix\n\n" + wrapPRAppendix(body) + "\nAuthor suffix"
 						}
@@ -235,6 +235,11 @@ func TestRestampAcceptedGapAuditMatchesCurrentSteps(t *testing.T) {
 							t.Fatal(err)
 						}
 						got := host.body
+						for _, surrounding := range []string{"### Accepted gaps\n\nAuthor discussion of unrelated gaps.", "\n\nReviewer paragraph after the audit.\n"} {
+							if !strings.Contains(got, surrounding) {
+								t.Fatalf("restamp lost surrounding content %q: %s", surrounding, got)
+							}
+						}
 						attestation := parsePipelineAttestationForTest(t, got)
 						if attestation.HeadSHA != head {
 							t.Fatal("head not rebound")
@@ -246,7 +251,7 @@ func TestRestampAcceptedGapAuditMatchesCurrentSteps(t *testing.T) {
 							}
 						}
 						if wantReason == "" {
-							if gap != nil || strings.Contains(got, acceptedGapsHeading) || strings.Contains(got, "previous owner approval") {
+							if gap != nil || strings.Contains(got, acceptedGapsStart) || strings.Contains(got, "previous owner approval") {
 								t.Fatal("obsolete gap retained")
 							}
 						} else {
@@ -282,5 +287,47 @@ func TestRestampAcceptedGapAuditRefusesOrdinaryOverflow(t *testing.T) {
 	}
 	if host.updates != 0 || host.body != body {
 		t.Fatal("overflow reached publication")
+	}
+}
+
+func TestAcceptedGapMarkersInOperatorTextAreNeutralized(t *testing.T) {
+	for _, provider := range []scm.Provider{scm.ProviderGitHub, scm.ProviderBitbucket} {
+		steps := acceptedGapStepsForTest(t)
+		var gap db.AcceptedGaps
+		if err := json.Unmarshal([]byte(*steps[1].AcceptedGapsJSON), &gap); err != nil {
+			t.Fatal(err)
+		}
+		gap.Reason = "approved " + acceptedGapsStart
+		gap.CoveredBy = "tests " + acceptedGapsEnd
+		raw, err := json.Marshal(gap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded := string(raw)
+		steps[1].AcceptedGapsJSON = &encoded
+		block := buildAcceptedGapsBlock(steps, provider)
+		if strings.Count(block, acceptedGapsStart) != 1 || strings.Count(block, acceptedGapsEnd) != 1 {
+			t.Fatalf("operator text forged audit boundaries: %s", block)
+		}
+		text := neutralizeAttestationMarkers(provider, acceptedGapsStart+acceptedGapsEnd)
+		if strings.Contains(text, acceptedGapsStart) || strings.Contains(text, acceptedGapsEnd) {
+			t.Fatalf("narrative markers survived: %s", text)
+		}
+	}
+}
+
+func TestRestampAcceptedGapAuditRefusesAmbiguousMarkers(t *testing.T) {
+	for _, markers := range []string{acceptedGapsStart, acceptedGapsEnd, acceptedGapsEnd + acceptedGapsStart, acceptedGapsStart + acceptedGapsStart + acceptedGapsEnd} {
+		old := acceptedGapStepsForTest(t)
+		old[1].AcceptedGapsJSON = nil
+		md, _ := buildPipelineSummaryFor(old, nil, testPipelineHeadSHA, scm.ProviderGitHub, pipelineAttestationPolicy{})
+		body := md + "\n\n" + markers
+		host := &attestationTestHost{provider: scm.ProviderGitHub, body: body}
+		if err := restampPRAttestationWithSteps(context.Background(), host, &scm.PR{Number: "42"}, strings.Repeat("ab", 20), acceptedGapStepsForTest(t), nil, pipelineAttestationPolicy{}, nil); err == nil {
+			t.Fatal("ambiguous audit published")
+		}
+		if host.updates != 0 || host.body != body {
+			t.Fatal("ambiguous audit changed live content")
+		}
 	}
 }

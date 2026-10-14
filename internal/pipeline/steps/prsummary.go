@@ -166,10 +166,10 @@ func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 		b.WriteString(buildPipelineAttestationWithPolicy(steps, rounds, headSHA, policy))
 		b.WriteString("\n\n")
 	}
-	if gapBlock := buildAcceptedGapsBlock(steps, flavor); gapBlock != "" {
+	if gapBlock := buildAcceptedGapsBlock(steps, provider); gapBlock != "" {
 		// Neutralized like every detail block: the reason and covering tests
 		// are operator text and must not mint a second attestation marker.
-		b.WriteString(neutralizeAttestationMarkers(provider, gapBlock))
+		b.WriteString(gapBlock)
 		b.WriteString("\n\n")
 	}
 	for i, detail := range detailBlocks {
@@ -1670,6 +1670,7 @@ func escapePipelineFoldMarkers(s string) string {
 // through here - the grammar has to travel with the text, because GitLab
 // resolves a reference inside a code block where GitHub does not.
 func neutralizeAttestationMarkers(provider scm.Provider, s string) string {
+	s = strings.NewReplacer(acceptedGapsStart, "<!-- no-mistakes:accepted\\-gaps:start -->", acceptedGapsEnd, "<!-- no-mistakes:accepted\\-gaps:end -->").Replace(s)
 	escaped := escapePRAppendixMarkers(strings.ReplaceAll(s, pipelineAttestationCommentPrefix, escapedPipelineAttestationCommentPrefix))
 	return closingGrammarFor(provider).neutralize(escaped)
 }
