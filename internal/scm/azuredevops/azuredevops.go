@@ -384,6 +384,11 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 			CompletedAt: parseAzTime(e.CompletedDate),
 		})
 	}
+	if pr.HeadSHA != "" {
+		if err := scm.ValidateCheckHeads(checks, pr.HeadSHA); err != nil {
+			return nil, err
+		}
+	}
 	return checks, nil
 }
 

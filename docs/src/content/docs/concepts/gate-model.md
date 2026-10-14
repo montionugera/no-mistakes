@@ -104,19 +104,11 @@ copy whose patch ID changed only because the new base edited nearby context
 lines is not at risk, while changes discarded by a merge or revert are never
 counted as surviving content.
 
-A rebased branch whose later commits edit the lines the private commits wrote
-(for example a new run on a branch an earlier run already published) makes that
-merge conflict although nothing was dropped. Survival is then proven in two
-halves instead: merging with every conflicting hunk resolved toward the live
-head must still leave the live tree unchanged, so a private hunk that merges
-cleanly - content the live head reverted or never had - still refuses; and a
-commit on the live head's first-parent history touching the private paths must
-pass the clean-merge check, placing all of the private content in the live
-history. A side branch discarded by a merge never serves as that point. Both
-halves prove the whole private head, so a rebased copy whose patch ID drifted
-with context and whose lines a later live commit edited is not at risk either.
-At most 64 first-parent candidates are tried; past that bound the proof fails
-closed.
+A later live edit can make this merge conflict. Conflict resolution toward the
+live head cannot prove that the private content survived: the same resolution
+can hide a partial revert. A historical replay alone supplies no containment
+credit at the live head. Reconciliation therefore fails closed on a conflicting
+merge, even when an earlier live commit contained a clean replay.
 
 If survival cannot be proven, the whole private-only range is reported as at
 risk.

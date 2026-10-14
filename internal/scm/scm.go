@@ -804,3 +804,12 @@ func AuthConfigured(ctx context.Context, provider Provider, workDir string) bool
 	winproc.Harden(cmd)
 	return cmd.Run() == nil
 }
+
+func ValidateCheckHeads(checks []Check, head string) error {
+	for _, check := range checks {
+		if head == "" || check.HeadSHA == "" || check.HeadSHA != head {
+			return fmt.Errorf("%w: check %q is not bound to delivered head %s", ErrHeadChanged, check.Name, head)
+		}
+	}
+	return nil
+}

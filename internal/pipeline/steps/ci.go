@@ -233,6 +233,9 @@ func (s *CIStep) VerifyApprovalOverride(sctx *pipeline.StepContext) (string, err
 	// comes from that same head read, exactly as the polling loop names it.
 	pr.HeadSHA = sctx.Run.HeadSHA
 	checks, err := host.GetChecks(ctx, pr)
+	if err == nil {
+		err = scm.ValidateCheckHeads(checks, pr.HeadSHA)
+	}
 	if err != nil {
 		if errors.Is(err, scm.ErrHeadChanged) {
 			// The provider answered; nothing it offered is evidence for the
@@ -702,12 +705,17 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 		// Check CI status - wait for all checks to complete before escalating
 		pr.HeadSHA = sctx.Run.HeadSHA
 		checks, err := host.GetChecks(ctx, pr)
+		if err == nil {
+			err = scm.ValidateCheckHeads(checks, pr.HeadSHA)
+		}
 		if err != nil && pluginPollFailsStep(err) {
 			clearCIMonitorReady(sctx)
 			return nil, err
 		}
 		if err != nil {
 			if errors.Is(err, scm.ErrHeadChanged) {
+				timeoutFailingChecks = nil
+				timeoutMergeConflict = false
 				// The provider answered, but nothing it offered is evidence for
 				// the commit this run is delivering: no pipeline has registered
 				// for that commit yet, and the pipeline the merge request still
@@ -1030,10 +1038,8 @@ func verifyCIMonitorComparison(sctx *pipeline.StepContext, host scm.Host, checks
 	if durable == nil || durable.HeadSHA != receipt.LocalHeadSHA {
 		return fmt.Errorf("durable run head differs from CI readiness comparison")
 	}
-	for _, check := range checks {
-		if check.HeadSHA == "" || check.HeadSHA != receipt.LocalHeadSHA {
-			return fmt.Errorf("CI check %q is not bound to the current comparison head", check.Name)
-		}
+	if err := scm.ValidateCheckHeads(checks, receipt.LocalHeadSHA); err != nil {
+		return err
 	}
 	reader, ok := host.(scm.PRFactsReader)
 	if !ok {

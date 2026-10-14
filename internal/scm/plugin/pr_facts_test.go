@@ -74,15 +74,12 @@ func TestFindOpenPRFactsRejectsWrongSource(t *testing.T) {
 	}
 }
 
-func TestGetChecksPreservesReportedHeadSHA(t *testing.T) {
+func TestGetChecksRejectsReportedHeadDifferentFromRequest(t *testing.T) {
 	h, tr := newTestHost(t, Options{})
 	requested := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	tr.reply(`{"checks":[{"name":"build","bucket":"pass","head_sha":"` + factsHead + `"}]}`)
 	checks, err := h.GetChecks(context.Background(), &scm.PR{Number: "7", URL: testPR().URL, HeadSHA: requested})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if checks[0].HeadSHA != factsHead {
-		t.Fatalf("check head = %q, want reported %q", checks[0].HeadSHA, factsHead)
+	if !errors.Is(err, scm.ErrHeadChanged) || len(checks) != 0 {
+		t.Fatalf("stale reported head remained actionable: checks=%+v err=%v", checks, err)
 	}
 }

@@ -2,6 +2,7 @@ package azuredevops
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -36,7 +37,8 @@ func TestGetChecksNativeCommitAssociation(t *testing.T) {
 		{name: "latest native status", policy: statusPolicy, statuses: `{"count":2,"value":[{"id":4,"iterationId":2,"state":"succeeded","updatedDate":"2026-04-24T05:15:00Z","context":{"name":"lint","genre":"ci"},"createdBy":{"id":"account"}},{"id":3,"iterationId":1,"state":"succeeded","updatedDate":"2026-04-24T04:15:00Z","context":{"name":"lint","genre":"ci"},"createdBy":{"id":"account"}}]}`, iterations: iterations, want: head},
 		{name: "newer native failure", policy: statusPolicy, statuses: `{"count":2,"value":[{"id":3,"iterationId":1,"state":"succeeded","updatedDate":"2026-04-24T04:15:00Z","context":{"name":"lint","genre":"ci"},"createdBy":{"id":"account"}},{"id":4,"iterationId":2,"state":"failed","updatedDate":"2026-04-24T05:15:00Z","context":{"name":"lint","genre":"ci"},"createdBy":{"id":"account"}}]}`},
 		{name: "native status", policy: statusPolicy, statuses: statuses, iterations: iterations, want: head},
-		{name: "stale status", policy: statusPolicy, statuses: statuses, iterations: strings.Replace(iterations, head, strings.Repeat("c", 40), 1), want: strings.Repeat("c", 40)},
+		{name: "stale status", policy: statusPolicy, statuses: statuses, iterations: strings.Replace(iterations, head, strings.Repeat("c", 40), 1)},
+		{name: "stale failed status", policy: strings.Replace(statusPolicy, "approved", "rejected", 1), statuses: strings.Replace(statuses, "succeeded", "failed", 1), iterations: strings.Replace(iterations, head, strings.Repeat("c", 40), 1)},
 		{name: "code independent status", policy: `{"status":"approved","configuration":{"type":{"displayName":"Status"},"settings":{"statusName":"lint","statusGenre":"ci"}}}`, statuses: strings.Replace(statuses, `"iterationId":2`, `"iterationId":0`, 1)},
 		{name: "wrong status identity", policy: `{"status":"approved","configuration":{"type":{"displayName":"Status"},"settings":{"statusName":"lint","statusGenre":"ci","authorId":"other"}}}`, statuses: statuses},
 		{name: "missing build association", policy: `{"status":"approved","configuration":{"type":{"displayName":"Build"}}}`},
@@ -84,6 +86,14 @@ func TestGetChecksNativeCommitAssociation(t *testing.T) {
 			}
 			if len(checks) != 1 || checks[0].HeadSHA != tc.want {
 				t.Fatalf("checks=%+v, want head %q", checks, tc.want)
+			}
+			checks, err = newTestHost(responses).GetChecks(context.Background(), &scm.PR{Number: "42", HeadSHA: head})
+			if tc.want == "" {
+				if !errors.Is(err, scm.ErrHeadChanged) || len(checks) != 0 {
+					t.Fatalf("unbound checks remained actionable: checks=%+v err=%v", checks, err)
+				}
+			} else if err != nil || len(checks) != 1 || checks[0].HeadSHA != head {
+				t.Fatalf("current checks refused: checks=%+v err=%v", checks, err)
 			}
 		})
 	}

@@ -341,6 +341,9 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 		}
 		checks = append(checks, check)
 	}
+	if err := scm.ValidateCheckHeads(checks, strings.TrimSpace(pr.HeadSHA)); err != nil {
+		return nil, err
+	}
 	return checks, nil
 }
 

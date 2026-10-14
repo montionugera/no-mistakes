@@ -176,5 +176,15 @@ func (h *Host) statusSourceCommit(ctx context.Context, pr *scm.PR, e policyEval)
 			head = iteration.SourceRefCommit.CommitID
 		}
 	}
+	if head == "" {
+		return "", nil
+	}
+	facts, err := h.ReadPRFacts(ctx, pr)
+	if err != nil {
+		return "", err
+	}
+	if head != facts.HeadSHA {
+		return "", nil
+	}
 	return head, nil
 }

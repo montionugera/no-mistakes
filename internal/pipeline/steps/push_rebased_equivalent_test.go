@@ -9,17 +9,8 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 )
 
-// TestPushStep_PublishesRebasedEquivalentsOverAnEarlierRunsHead reproduces a
-// new run on a branch an earlier run already published. The new run's head
-// carries one more commit that edits the lines the published commits wrote,
-// and the rebase step moved it onto a newer main, so the private mirror still
-// holds the earlier run's pre-rebase copies of the same commits. That head is
-// not run-owned, so Decision 41-A does not apply and the preservation proof
-// must: the rebased copies survive in the live history, so the push goes
-// through, while a commit whose content the live head genuinely lacks still
-// refuses, naming the whole private-only range.
 func TestPushStep_PublishesRebasedEquivalentsOverAnEarlierRunsHead(t *testing.T) {
-	for _, variant := range []string{"rebased_equivalents", "dropped_commits", "mixed"} {
+	for _, variant := range []string{"rebased_equivalents", "edited_equivalents", "dropped_commits", "mixed"} {
 		t.Run(variant, func(t *testing.T) {
 			upstream := t.TempDir()
 			gitCmd(t, upstream, "init", "--bare")
@@ -55,7 +46,11 @@ func TestPushStep_PublishesRebasedEquivalentsOverAnEarlierRunsHead(t *testing.T)
 
 			// The author adds a commit that edits the widget's own lines and
 			// starts a new run from it.
-			write("src/widget.go", widgetV2)
+			if variant == "rebased_equivalents" {
+				write("followup.txt", "independent follow-up\n")
+			} else {
+				write("src/widget.go", widgetV2)
+			}
 			submitted := commit("fix: widget size")
 
 			sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, submitted, config.Commands{})
@@ -70,7 +65,7 @@ func TestPushStep_PublishesRebasedEquivalentsOverAnEarlierRunsHead(t *testing.T)
 			gitCmd(t, dir, "push", "-q", "origin", "main")
 			gitCmd(t, dir, "checkout", "-q", "-B", "feature", "main")
 			switch variant {
-			case "rebased_equivalents":
+			case "rebased_equivalents", "edited_equivalents":
 				gitCmd(t, dir, "cherry-pick", widget, published, submitted)
 			case "dropped_commits":
 				write("src/widget.go", widgetV2)
