@@ -1,10 +1,12 @@
 package steps
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -19,9 +21,9 @@ const maxAcceptedGapDescriptionRunes = 500
 // pipelineAttestationAcceptedGaps is the machine-readable form of an accepted
 // Test gap, carried on the Test step of the attestation.
 type pipelineAttestationAcceptedGaps struct {
-	FindingIDs []string `json:"finding_ids"`
-	Reason     string   `json:"reason"`
-	CoveredBy  string   `json:"covered_by"`
+	FindingIDs      []string `json:"finding_ids"`
+	ReasonDigest    string   `json:"reason_sha256"`
+	CoveredByDigest string   `json:"covered_by_sha256"`
 }
 
 func attestedAcceptedGaps(sr *db.StepResult) *pipelineAttestationAcceptedGaps {
@@ -32,7 +34,43 @@ func attestedAcceptedGaps(sr *db.StepResult) *pipelineAttestationAcceptedGaps {
 	if err != nil || gaps == nil {
 		return nil
 	}
-	return &pipelineAttestationAcceptedGaps{FindingIDs: gaps.FindingIDs, Reason: gaps.Reason, CoveredBy: gaps.CoveredBy}
+	return &pipelineAttestationAcceptedGaps{FindingIDs: gaps.FindingIDs, ReasonDigest: fmt.Sprintf("%x", sha256.Sum256([]byte(gaps.Reason))), CoveredByDigest: fmt.Sprintf("%x", sha256.Sum256([]byte(gaps.CoveredBy)))}
+}
+
+func acceptedGapAuditBlock(pipelineMD string) string {
+	header, _ := splitPipelineSectionHeader(pipelineMD)
+	start := strings.Index(header, acceptedGapsHeading+"\n")
+	if start < 0 {
+		return ""
+	}
+	return strings.TrimSpace(header[start:])
+}
+
+func validateAcceptedGapAuditBudget(pipelineMD string, limit int) error {
+	tail := joinBlocks(noMistakesPRSignature, carriedAttestation(pipelineMD), acceptedGapAuditBlock(pipelineMD))
+	if len(tail) > maxPullRequestBodyBytes || (limit > 0 && scm.PRBodyLen(tail) > limit) {
+		return fmt.Errorf("mandatory pipeline attestation and accepted-gap audit block exceed PR body limit; refusing publication")
+	}
+	return nil
+}
+
+func preserveAcceptedGapAudit(body, prefix, pipelineMD string, limit int, units func(string) int, clamp func(string, int) string) string {
+	block := acceptedGapAuditBlock(pipelineMD)
+	if block == "" {
+		return body
+	}
+	marker := carriedAttestation(pipelineMD)
+	if strings.Contains(body, block) && (marker == "" || strings.Contains(body, marker)) && (limit <= 0 || units(body) <= limit) {
+		return body
+	}
+	tail := joinBlocks(noMistakesPRSignature, marker, block)
+	if limit <= 0 {
+		return joinBlocks(body, block)
+	}
+	if units(tail) > limit {
+		return tail
+	}
+	return shrinkMeasuredKeepingTail(joinBlocks(prefix, tail), tail, limit, units, clamp)
 }
 
 // buildAcceptedGapsBlock renders each accepted finding with its description,

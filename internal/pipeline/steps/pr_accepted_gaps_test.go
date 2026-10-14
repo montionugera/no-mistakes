@@ -1,7 +1,11 @@
 package steps
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"strings"
 	"testing"
 
@@ -47,7 +51,7 @@ func TestPipelineSummaryCarriesAcceptedGaps(t *testing.T) {
 	if testStep.Status != types.StepStatusCompleted || testStep.OverrideReason != "" {
 		t.Fatalf("test step = %+v, want completed without an override", testStep)
 	}
-	if g := testStep.AcceptedGaps; g == nil || g.Reason != acceptedGapTestReason || g.CoveredBy != acceptedGapTestCoveredBy || len(g.FindingIDs) != 1 || g.FindingIDs[0] != "test-1" {
+	if g := testStep.AcceptedGaps; g == nil || g.ReasonDigest != fmt.Sprintf("%x", sha256.Sum256([]byte(acceptedGapTestReason))) || g.CoveredByDigest != fmt.Sprintf("%x", sha256.Sum256([]byte(acceptedGapTestCoveredBy))) || len(g.FindingIDs) != 1 || g.FindingIDs[0] != "test-1" {
 		t.Fatalf("attested gaps = %+v", g)
 	}
 	// The block belongs to the fixed Pipeline header, so truncation keeps it.
@@ -101,8 +105,57 @@ func TestAcceptedGapsSurviveBodyTrimmingAndRebind(t *testing.T) {
 			testStep = item
 		}
 	}
-	if testStep.AcceptedGaps == nil || testStep.AcceptedGaps.Reason != acceptedGapTestReason {
+	if testStep.AcceptedGaps == nil || testStep.AcceptedGaps.ReasonDigest != fmt.Sprintf("%x", sha256.Sum256([]byte(acceptedGapTestReason))) {
 		t.Fatalf("rebind dropped accepted gaps: %+v", testStep)
+	}
+}
+
+func TestAcceptedGapsEveryAppendixBudget(t *testing.T) {
+	for _, mode := range []string{config.PRAppendixFull, config.PRAppendixMinimal, config.PRAppendixCollapsed} {
+		t.Run(mode, func(t *testing.T) {
+			steps := acceptedGapStepsForTest(t)
+			var gaps db.AcceptedGaps
+			if err := json.Unmarshal([]byte(*steps[1].AcceptedGapsJSON), &gaps); err != nil {
+				t.Fatal(err)
+			}
+			gaps.Reason = strings.Repeat("R", 500)
+			gaps.CoveredBy = strings.Repeat("C", 500)
+			raw, err := json.Marshal(gaps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded := string(raw)
+			steps[1].AcceptedGapsJSON = &encoded
+			md, _ := buildPipelineSummaryFor(steps, nil, testPipelineHeadSHA, scm.ProviderAzureDevOps, pipelineAttestationPolicy{})
+			ctx := &pipeline.StepContext{Config: &config.Config{}}
+			ctx.Config.PR.Appendix = mode
+			narrative := "## What Changed\n\n" + strings.Repeat("change ", 10000)
+			for _, body := range []string{
+				assemblePRBody(ctx, narrative, "low risk", strings.Repeat("evidence ", 10000), md, 4000, scm.ProviderAzureDevOps),
+				buildPRBodyWithin(narrative, "low risk", strings.Repeat("evidence ", 10000), md, ctx, scm.ProviderAzureDevOps, 4000),
+				appendixEvidence(mode, prBodyHTML, "low risk", "", md, scm.ProviderAzureDevOps),
+			} {
+				if scm.PRBodyLen(body) > 4000 {
+					t.Fatalf("body exceeds Azure's 4000-character limit: %d", scm.PRBodyLen(body))
+				}
+				for _, text := range []string{gaps.Reason, gaps.CoveredBy, "`test-1`"} {
+					if strings.Count(body, text) != 1 {
+						t.Fatalf("audit text missing or duplicated: %q", text)
+					}
+				}
+				parsePipelineAttestationForTest(t, body)
+			}
+			if err := validateAcceptedGapAuditBudget(md, 4000); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateAcceptedGapAuditBudget(md, 100); err == nil {
+				t.Fatal("impossible mandatory audit budget accepted")
+			}
+			content, err := fallbackPRContent(ctx, "M file.go", "low risk", "", md, 100, scm.ProviderAzureDevOps)
+			if err == nil && validateOwnedPRBudget(content.Body, 100) == nil {
+				t.Fatal("oversized audit permitted publication")
+			}
+		})
 	}
 }
 

@@ -383,6 +383,9 @@ func (s *PRStep) buildPRContent(sctx *pipeline.StepContext, branch, baseBranch, 
 	if err != nil {
 		return prContent{}, err
 	}
+	if err := validateOwnedPRBudget(content.Body, bodyLimit); err != nil {
+		return prContent{}, err
+	}
 	return redactPRContent(content), nil
 }
 
@@ -404,9 +407,8 @@ func (s *PRStep) draftPRContent(sctx *pipeline.StepContext, branch, baseBranch, 
 		return prContent{}, fmt.Errorf("read final branch diff: %w", err)
 	}
 	pipelineMD, riskLine, testingMD := s.buildPipelineSection(sctx, provider)
-	if marker := extractPipelineAttestationMarker(pipelineMD); marker != "" &&
-		((bodyLimit > 0 && scm.PRBodyLen(marker) > bodyLimit) || len(marker) > maxPullRequestBodyBytes) {
-		return prContent{}, fmt.Errorf("pipeline attestation exceeds PR body limit")
+	if err := validateAcceptedGapAuditBudget(pipelineMD, bodyLimit); err != nil {
+		return prContent{}, err
 	}
 
 	titleRules := prTitlePromptRules(sctx)
@@ -1480,6 +1482,9 @@ func prependIntentSection(body string, sctx *pipeline.StepContext) string {
 }
 
 func fallbackPRContent(sctx *pipeline.StepContext, finalDiff, riskLine, testingMD, pipelineMD string, bodyLimit int, provider scm.Provider) (prContent, error) {
+	if err := validateAcceptedGapAuditBudget(pipelineMD, bodyLimit); err != nil {
+		return prContent{}, err
+	}
 	title, err := renderPRTitle(sctx, "update pull request")
 	if err != nil {
 		return prContent{}, err
@@ -1491,6 +1496,9 @@ func fallbackPRContent(sctx *pipeline.StepContext, finalDiff, riskLine, testingM
 	}
 	body = neutralizeAttestationMarkers(provider, body)
 	body = assembleDraftPRBody(sctx, body, riskLine, testingMD, pipelineMD, bodyLimit, provider)
+	if err := validateOwnedPRBudget(body, bodyLimit); err != nil {
+		return prContent{}, err
+	}
 	return prContent{
 		Title: title,
 		Body:  body,

@@ -315,6 +315,7 @@ func rebindPipelineAttestationWithSteps(body, newHeadSHA string, steps []*db.Ste
 	if err := json.Unmarshal([]byte(body[payloadStart:end]), &attestation); err != nil {
 		return body, false
 	}
+	keepAcceptedGaps := steps == nil
 	if steps == nil {
 		// A CI repair that did not re-run Test keeps the prior Test result,
 		// including an approved-over-failure override_reason. The caller's
@@ -327,17 +328,20 @@ func rebindPipelineAttestationWithSteps(body, newHeadSHA string, steps []*db.Ste
 				if reason := strings.TrimSpace(s.OverrideReason); reason != "" {
 					sr.OverrideReason = &reason
 				}
-				if s.AcceptedGaps != nil {
-					if raw, err := json.Marshal(db.AcceptedGaps{FindingIDs: s.AcceptedGaps.FindingIDs, Reason: s.AcceptedGaps.Reason, CoveredBy: s.AcceptedGaps.CoveredBy}); err == nil {
-						rawJSON := string(raw)
-						sr.AcceptedGapsJSON = &rawJSON
-					}
-				}
 			}
 			steps = append(steps, sr)
 		}
 	}
 	rebound := newPipelineAttestation(steps, nil, newHeadSHA, policy)
+	if keepAcceptedGaps {
+		for i := range rebound.Steps {
+			for _, previous := range attestation.Steps {
+				if previous.Step == rebound.Steps[i].Step {
+					rebound.Steps[i].AcceptedGaps = previous.AcceptedGaps
+				}
+			}
+		}
+	}
 	// Step statuses may be republished for a head the pipeline did not
 	// re-validate. Live validation is a factual claim about one commit's
 	// behavior, so it is derived only from current step findings and never

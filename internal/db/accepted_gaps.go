@@ -17,7 +17,7 @@ const MinAcceptedGapReasonLen = 10
 // MaxAcceptedGapTextLen bounds --reason and --covered-by. Both are stored and
 // rendered verbatim into a PR-body block that is never trimmed, so they stay
 // single-line and short.
-const MaxAcceptedGapTextLen = 1000
+const MaxAcceptedGapTextLen = 500
 
 // AcceptedGapTextRefusal reports why text cannot be recorded verbatim as the
 // named flag, or "" when it can.
