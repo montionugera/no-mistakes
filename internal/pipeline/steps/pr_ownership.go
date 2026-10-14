@@ -9,6 +9,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/safepath"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 )
 
@@ -236,6 +237,10 @@ func rebindOwnedPRAttestation(body, head string, steps []*db.StepResult, policy 
 			return "", false, err
 		}
 	}
+	// Restamps reach UpdatePR without the draft path's redaction. The generated
+	// appendix is ours, so route it through the same publication redaction before
+	// the integrity guard is recomputed; author text outside it is untouched.
+	appendix = safepath.RedactText(appendix)
 	updated := parts.before + wrapPRAppendix(appendix) + parts.after
 	if len(updated) > maxPullRequestBodyBytes {
 		return "", false, fmt.Errorf("restamped PR body exceeds the publication budget")

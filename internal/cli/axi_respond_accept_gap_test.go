@@ -126,3 +126,27 @@ func TestGateHelpKeepsPlainApproveWhereAGapIsNotEligible(t *testing.T) {
 		}
 	}
 }
+
+func TestGateHelpAfterACrashOffersTheRecoveryApproval(t *testing.T) {
+	gate := acceptGapGate(t)
+	info := &ipc.RunInfo{ID: "run-7", Status: types.RunRunning, Shipping: &types.ShippingOptions{Mode: types.ShippingFull}, Steps: []ipc.StepResultInfo{{
+		StepName: types.StepTest, Status: types.StepStatusAwaitingApproval, FindingsJSON: &gate.FindingsJSON, AcceptedGapRecorded: true,
+	}}}
+	rv := runViewFromIPC(info)
+	parked, ok := rv.awaitingStep()
+	if !ok || !parked.AcceptedGapRecorded {
+		t.Fatalf("recorded gap did not reach the step view: %+v", parked)
+	}
+	out := axiDoc(gateFieldsFor(parked, "run-7", true)...)
+	if !strings.Contains(out, "already recorded") || !strings.Contains(out, "--run run-7 --action approve` with no --reason") || !strings.Contains(out, "reused unchanged") {
+		t.Fatalf("recovery help missing:\n%s", out)
+	}
+	if strings.Contains(out, "--accept-gap test-verdict") || strings.Contains(out, "<who approved") {
+		t.Fatalf("recovery help still asks for a new reason and coverage:\n%s", out)
+	}
+	// Without the record the gate keeps asking for the full command.
+	parked.AcceptedGapRecorded = false
+	if out := axiDoc(gateFieldsFor(parked, "run-7", true)...); !strings.Contains(out, "--accept-gap test-verdict") {
+		t.Fatalf("unrecorded gate lost the accept-gap command:\n%s", out)
+	}
+}

@@ -444,7 +444,7 @@ func parseTestAnalyzerOutput(result *agent.Result) (Findings, error) {
 		// The verdict finding is the Test step's own: strict accepted gaps
 		// authenticate it by this reserved ID and category, so an analyzer
 		// can never supply either.
-		if item.Category == types.FindingCategoryTestVerdict || item.ID == types.FindingIDTestVerdict {
+		if types.IsReservedTestVerdictCategory(item.Category) || types.IsReservedTestVerdictID(item.ID) {
 			return Findings{}, fmt.Errorf("test analyzer finding %d cannot use the reserved test-verdict id or category", i)
 		}
 		if slices.Contains(testBudgetCutIDs, findings.Items[i].ID) {

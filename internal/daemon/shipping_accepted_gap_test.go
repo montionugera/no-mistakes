@@ -261,6 +261,10 @@ func TestAcceptedGapSurvivesACrashBetweenRecordAndCompletion(t *testing.T) {
 				t.Fatalf("recovery lost the durable acceptance: %+v, %v", parked, err)
 			}
 
+			if !stepToInfo(database, parked).AcceptedGapRecorded {
+				t.Fatal("run info does not expose the recovered accepted gap")
+			}
+
 			if response == "plain-with-reason" {
 				if _, err := manager.HandleRespondWithOverrides(run.ID, types.StepTest, types.ActionApprove, nil, nil, nil, nil, "another reason entirely"); err == nil {
 					t.Fatal("a plain approval carrying its own reason was admitted over a recorded gap")

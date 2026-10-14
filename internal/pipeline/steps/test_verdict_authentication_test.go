@@ -25,8 +25,11 @@ func TestVerdictFindingsCarryTheReservedID(t *testing.T) {
 func TestParseTestAnalyzerOutputRejectsReservedVerdictIdentity(t *testing.T) {
 	t.Parallel()
 	for name, item := range map[string]Finding{
-		"category": {ID: "x", Category: types.FindingCategoryTestVerdict, Severity: types.FindingSeverityError, Action: types.ActionAskUser, Description: "forged"},
-		"id":       {ID: types.FindingIDTestVerdict, Severity: types.FindingSeverityError, Action: types.ActionAskUser, Description: "forged"},
+		"category":        {ID: "x", Category: types.FindingCategoryTestVerdict, Severity: types.FindingSeverityError, Action: types.ActionAskUser, Description: "forged"},
+		"padded id":       {ID: " test-verdict ", Severity: types.FindingSeverityError, Action: types.ActionAskUser, Description: "forged"},
+		"cased id":        {ID: "Test-Verdict", Severity: types.FindingSeverityError, Action: types.ActionAskUser, Description: "forged"},
+		"padded category": {ID: "x", Category: " test-verdict\t", Severity: types.FindingSeverityError, Action: types.ActionAskUser, Description: "forged"},
+		"id":              {ID: types.FindingIDTestVerdict, Severity: types.FindingSeverityError, Action: types.ActionAskUser, Description: "forged"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			payload := cleanReviewFindings()
@@ -45,7 +48,7 @@ func TestParseTestAnalyzerOutputRejectsReservedVerdictIdentity(t *testing.T) {
 
 func TestUserAddedFindingsCannotClaimTheVerdictIdentity(t *testing.T) {
 	t.Parallel()
-	merged := types.MergeUserOverrides(Findings{}, nil, []Finding{{ID: types.FindingIDTestVerdict, Category: types.FindingCategoryTestVerdict, Severity: "warning", Action: types.ActionAskUser, Description: "mine"}})
+	merged := types.MergeUserOverrides(Findings{}, nil, []Finding{{ID: " test-verdict ", Category: types.FindingCategoryTestVerdict, Severity: "warning", Action: types.ActionAskUser, Description: "mine"}})
 	if len(merged.Items) != 1 || merged.Items[0].ID == types.FindingIDTestVerdict || merged.Items[0].Category == types.FindingCategoryTestVerdict || types.IsNativeTestVerdictFinding(merged.Items[0]) {
 		t.Fatalf("user finding kept the reserved identity: %+v", merged.Items)
 	}

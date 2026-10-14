@@ -581,6 +581,11 @@ type StepResultInfo struct {
 	// pipeline.ApprovalOverrideVerifier and db.StepResult.OverrideReason.
 	OverrideReason string `json:"override_reason,omitempty"`
 	SkipReason     string `json:"skip_reason,omitempty"`
+	// AcceptedGapRecorded is true when a valid owner-accepted Test gap is
+	// durably recorded on this step (db.StepResult.ValidAcceptedGaps). A parked
+	// Test step can hold one after a daemon stop between recording and
+	// completion; gate help then offers the recovery approval.
+	AcceptedGapRecorded bool `json:"accepted_gap_recorded,omitempty"`
 }
 
 // --- Events (for subscribe stream) ---

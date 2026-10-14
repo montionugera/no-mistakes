@@ -131,6 +131,19 @@ const FindingCategoryTestVerdict = "test-verdict"
 // author labeled as the verdict.
 const FindingIDTestVerdict = "test-verdict"
 
+// IsReservedTestVerdictID reports whether id names the Test step's own verdict
+// finding once NormalizeFindings has trimmed it. The comparison is also
+// case-insensitive so no spelling of the reserved ID is left to a producer.
+func IsReservedTestVerdictID(id string) bool {
+	return strings.EqualFold(strings.TrimSpace(id), FindingIDTestVerdict)
+}
+
+// IsReservedTestVerdictCategory is the category-side twin of
+// IsReservedTestVerdictID.
+func IsReservedTestVerdictCategory(category string) bool {
+	return strings.EqualFold(strings.TrimSpace(category), FindingCategoryTestVerdict)
+}
+
 // IsNativeTestVerdictFinding reports whether f is the finding the Test step
 // itself derived from an inconclusive verdict: the reserved ID and category,
 // the exact severity and action verdictFindings assigns, and not user-authored.
@@ -529,10 +542,10 @@ func MergeUserOverrides(findings Findings, instructions map[string]string, added
 		item.ID = strings.TrimSpace(item.ID)
 		// The verdict ID and category are reserved for the Test step's own
 		// finding; a user-authored finding never carries them.
-		if item.Category == FindingCategoryTestVerdict {
+		if IsReservedTestVerdictCategory(item.Category) {
 			item.Category = ""
 		}
-		if item.ID == "" || used[item.ID] || item.ID == FindingIDTestVerdict {
+		if item.ID == "" || used[item.ID] || IsReservedTestVerdictID(item.ID) {
 			item.ID, counter = nextUserFindingID(used, counter)
 		} else {
 			used[item.ID] = true

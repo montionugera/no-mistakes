@@ -331,3 +331,39 @@ func TestRestampAcceptedGapAuditRefusesAmbiguousMarkers(t *testing.T) {
 		}
 	}
 }
+
+func TestRestampedAcceptedGapDescriptionIsRedacted(t *testing.T) {
+	t.Parallel()
+	const description = "live validation verdict: inconclusive (1 of 2 scenarios were driven live against the product); untested: replay /Users/alice/projects/broker/scenario.json"
+	steps := acceptedGapStepsForTest(t)
+	gaps := `{"finding_ids":["test-verdict"],"findings":[{"id":"test-verdict","category":"test-verdict","description":"` + description + `"}],"reason":"` + acceptedGapTestReason + `","covered_by":"` + acceptedGapTestCoveredBy + `","verdict":"inconclusive"}`
+	steps[1].AcceptedGapsJSON = &gaps
+
+	// A body published before the gap was accepted, restamped through UpdatePR.
+	plain := acceptedGapStepsForTest(t)
+	plain[1].AcceptedGapsJSON = nil
+	original, _ := buildPipelineSummaryFor(plain, nil, testPipelineHeadSHA, scm.ProviderGitHub, pipelineAttestationPolicy{})
+	const newHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	restamped, ok, err := rebindOwnedPRAttestation(original, newHead, steps, pipelineAttestationPolicy{}, scm.ProviderGitHub)
+	if err != nil || !ok {
+		t.Fatalf("restamp = %v, %v", ok, err)
+	}
+	if !strings.Contains(restamped, acceptedGapsHeading) {
+		t.Fatalf("restamp omitted the accepted-gap block:\n%s", restamped)
+	}
+	if strings.Contains(restamped, "/Users/alice") {
+		t.Fatalf("restamped body leaks a home path:\n%s", restamped)
+	}
+	if !strings.Contains(restamped, "untested: replay ~") {
+		t.Fatalf("restamped description was not redacted to the placeholder:\n%s", restamped)
+	}
+
+	owned := "author text\n\n" + wrapPRAppendix(original) + "\n\nsuffix"
+	ownedRestamp, ok, err := rebindOwnedPRAttestation(owned, newHead, steps, pipelineAttestationPolicy{}, scm.ProviderGitHub)
+	if err != nil || !ok {
+		t.Fatalf("owned restamp = %v, %v", ok, err)
+	}
+	if strings.Contains(ownedRestamp, "/Users/alice") || !strings.Contains(ownedRestamp, "untested: replay ~") || !strings.HasPrefix(ownedRestamp, "author text") || !strings.HasSuffix(ownedRestamp, "suffix") {
+		t.Fatalf("owned restamp not redacted or touched author text:\n%s", ownedRestamp)
+	}
+}

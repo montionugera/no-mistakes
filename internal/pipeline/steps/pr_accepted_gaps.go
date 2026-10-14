@@ -111,7 +111,11 @@ func buildAcceptedGapsBlock(steps []*db.StepResult, provider scm.Provider) strin
 		}
 		descriptions := make(map[string]string, len(gaps.Findings))
 		for _, f := range gaps.Findings {
-			descriptions[f.ID] = f.Description
+			// The description embeds analyzer-provided scenario names, so it
+			// crosses the same publication redaction boundary as the reason.
+			// A restamp writes this block through UpdatePR without the draft
+			// path's whole-body redaction, so it must already be redacted.
+			descriptions[f.ID] = canonicalAcceptedGapText(f.Description)
 		}
 		var b strings.Builder
 		b.WriteString(acceptedGapsHeading)
