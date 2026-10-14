@@ -19,8 +19,12 @@ import (
 )
 
 var canonicalStaleMonitorPhrases = []string{
-	"receipt guard stops the run when the live target commit changes",
-	"Restart from the current target and head",
+	"with green checks and no merge conflict",
+	"CI clears readiness and keeps monitoring, withholding checks-passed",
+	"It may wait until ci_timeout, or indefinitely when unlimited",
+	"When CI returns, including with findings, the boundary guard rejects the changed comparison and terminates the run",
+	"does not automatically repair or revalidate that changed comparison",
+	"After termination, restart from the current target and head",
 	"never hand-rebase",
 	"no-mistakes rerun",
 }

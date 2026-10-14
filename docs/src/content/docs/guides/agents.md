@@ -152,9 +152,11 @@ That is a successful agent stopping point: report that the PR is ready and ask t
 Successful outcomes also instruct the agent to summarize the run for the user.
 When the pipeline applied fixes, successful outcomes include a `fixes` table listing each fix so the agent can acknowledge what it missed and the user can review them.
 
-The CI monitor stays live in the background after checks pass, but for ordinary runs the receipt guard stops the run when the live target commit changes.
-This applies whether the PR has a merge conflict or is still clean: the monitor does not automatically repair or revalidate a changed target comparison.
-Restart from the current target and head; never hand-rebase.
+For ordinary runs, when the live target commit advances with green checks and no merge conflict, CI clears readiness and keeps monitoring, withholding checks-passed.
+It may wait until ci_timeout, or indefinitely when unlimited.
+When CI returns, including with findings, the boundary guard rejects the changed comparison and terminates the run.
+The monitor does not automatically repair or revalidate that changed comparison.
+After termination, restart from the current target and head; never hand-rebase.
 See [`no-mistakes rerun`](/no-mistakes/reference/cli/#no-mistakes-rerun) for restart and custody conditions.
 The agent must not use `no-mistakes axi run` to refresh a still-active PR: after `checks-passed` it reattaches to the running monitor with HEAD unchanged and returns the monitor output without rebasing.
 

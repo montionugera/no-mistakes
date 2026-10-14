@@ -320,10 +320,11 @@ The CI step deliberately keeps watching the PR after checks pass, so
 blocking on the human merge. Never poll or re-run waiting for the merge yourself.
 Never treat "no CI checks reported" alone as green.
 
-For ordinary runs, the receipt guard stops the run when the live target commit changes,
-whether the PR has a merge conflict or is still clean. The monitor does not
-automatically repair or revalidate that changed comparison.
-Restart from the current target and head; never hand-rebase.
+For ordinary runs, when the live target commit advances with green checks and no merge conflict, CI clears readiness and keeps monitoring, withholding checks-passed.
+It may wait until ci_timeout, or indefinitely when unlimited.
+When CI returns, including with findings, the boundary guard rejects the changed comparison and terminates the run.
+The monitor does not automatically repair or revalidate that changed comparison.
+After termination, restart from the current target and head; never hand-rebase.
 After the run stops, recover with `no-mistakes rerun`, subject to the
 clean-head and custody checks above. An accepted rerun validates the selected
 gate or preserved head through the full pipeline, including Rebase.

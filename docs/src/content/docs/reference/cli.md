@@ -235,8 +235,11 @@ Long-running `axi run` calls are working, not stalled; if one returns a `gate:`,
 Backgrounding a call is fine for an agent harness, but the run never advances past a gate on its own.
 When the CI step is still monitoring an open PR and checks are green - or the trusted default-branch config declares [`no_ci: true`](/no-mistakes/reference/repo-config/#no_ci) with no registered checks - `axi run` exits successfully with `outcome: checks-passed` instead of waiting for a human merge. A generic empty check list without that declaration is not ready.
 Treat that as the agent stopping point: ask the user to review and merge the PR from the `help` line.
-For ordinary runs, the receipt guard stops the run when the live target commit changes, whether or not the PR has a merge conflict.
-The monitor does not automatically repair or revalidate that changed comparison. Restart from the current target and head; never hand-rebase.
+For ordinary runs, when the live target commit advances with green checks and no merge conflict, CI clears readiness and keeps monitoring, withholding checks-passed.
+It may wait until ci_timeout, or indefinitely when unlimited.
+When CI returns, including with findings, the boundary guard rejects the changed comparison and terminates the run.
+The monitor does not automatically repair or revalidate that changed comparison.
+After termination, restart from the current target and head; never hand-rebase.
 After the run stops, see [`no-mistakes rerun`](#no-mistakes-rerun) for restart and custody conditions.
 Reattaching with `axi run` while the monitor is still active leaves HEAD unchanged and does not refresh the target comparison.
 Successful outcomes (`checks-passed`, `passed`, `passed-with-override`, and `passed-with-skips`) also carry `help` instructions telling the agent to summarize the run.
