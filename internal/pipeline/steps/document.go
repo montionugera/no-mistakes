@@ -138,12 +138,14 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 		purpose = "housekeeping"
 	}
 
-	result, err := sctx.RunAgentContext(ctx, agent.RunOpts{
-		Prompt:     prompt,
-		CWD:        sctx.WorkDir,
-		JSONSchema: schema,
-		OnChunk:    sctx.LogChunk,
-		Purpose:    purpose,
+	result, err := runPipelineCorrectionAgent(sctx, func() (*agent.Result, error) {
+		return sctx.RunAgentContext(ctx, agent.RunOpts{
+			Prompt:     prompt,
+			CWD:        sctx.WorkDir,
+			JSONSchema: schema,
+			OnChunk:    sctx.LogChunk,
+			Purpose:    purpose,
+		})
 	})
 	if err != nil {
 		return nil, fmt.Errorf("agent document: %w", err)
