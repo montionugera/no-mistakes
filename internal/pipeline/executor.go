@@ -44,6 +44,9 @@ type approvalResponse struct {
 	instructions   map[string]string
 	addedFindings  []types.Finding
 	approvalReason string
+	// acceptedGaps is the validated strict-shipping Test gap this approval
+	// records; nil for every other approval.
+	acceptedGaps *db.AcceptedGaps
 	// ignoreFindingIDs is the validated decline list of a fix response. It is
 	// not dispatch input (the decline set is derived from the selection on
 	// read), but an accepted response that selects nothing still has to be
@@ -250,6 +253,18 @@ func (e *Executor) Respond(step types.StepName, action types.ApprovalAction, fin
 // It returns the dispositions the response recorded, which the daemon echoes
 // to the caller.
 func (e *Executor) RespondWithOverrides(step types.StepName, action types.ApprovalAction, findingIDs, ignoreFindingIDs []string, instructions map[string]string, addedFindings []types.Finding, approvalReason string) (RespondDispositions, error) {
+	return e.RespondWithAcceptedGaps(step, action, findingIDs, ignoreFindingIDs, instructions, addedFindings, approvalReason, nil)
+}
+
+// RespondWithAcceptedGaps is RespondWithOverrides for an approval that may
+// carry an owner-accepted Test gap (strict shipping only). The gap is admitted
+// by db.StepResult.AcceptedGapRefusal and recorded durably before the step
+// completes; approvalReason then doubles as the gap's reason and is not
+// stored as a Test exception reason.
+func (e *Executor) RespondWithAcceptedGaps(step types.StepName, action types.ApprovalAction, findingIDs, ignoreFindingIDs []string, instructions map[string]string, addedFindings []types.Finding, approvalReason string, gaps *db.AcceptedGaps) (RespondDispositions, error) {
+	if gaps != nil && (step != types.StepTest || action != types.ActionApprove) {
+		return RespondDispositions{}, fmt.Errorf("an accepted gap applies only to Test approval")
+	}
 	if approvalReason != "" && (step != types.StepTest || action != types.ActionApprove) {
 		return RespondDispositions{}, fmt.Errorf("an approval reason applies only to Test approval")
 	}
@@ -301,10 +316,13 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 			e.mu.Unlock()
 			return RespondDispositions{}, fmt.Errorf("strict shipping cannot read the parked step")
 		}
-		if refusal := row.StrictApprovalRefusal(approvalReason); refusal != "" {
+		if refusal := row.StrictApprovalRefusalWithGaps(approvalReason, gaps); refusal != "" {
 			e.mu.Unlock()
 			return RespondDispositions{}, errors.New(refusal)
 		}
+	} else if gaps != nil {
+		e.mu.Unlock()
+		return RespondDispositions{}, errors.New((&db.StepResult{StepName: step}).AcceptedGapRefusal(false, *gaps))
 	}
 	if action == types.ActionApprove && e.waitingApprovalRefusal != "" {
 		refusal := e.waitingApprovalRefusal
@@ -317,6 +335,7 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 		instructions:   instructions,
 		addedFindings:  addedFindings,
 		approvalReason: approvalReason,
+		acceptedGaps:   gaps,
 	}
 	dispositions := RespondDispositions{}
 	if action == types.ActionFix {
@@ -850,7 +869,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	switch response.action {
 	case types.ActionApprove:
 		e.recordDeclinedRound(gate.lastRoundID, gate.findings, gate.step.Name(), gate.round)
-		if err := e.applyApprovalOverride(gate.step, reconcileCtx, gate.stepResult.ID, response.approvalReason); err != nil {
+		if err := e.applyApprovalOverride(gate.step, reconcileCtx, gate.stepResult.ID, response.approvalReason, response.acceptedGaps); err != nil {
 			return e.failRun(run, repo, err, ctx)
 		}
 		if err := completeRecoveredGate(); err != nil {
@@ -1886,7 +1905,7 @@ rounds:
 				// Approved - execution already frozen in executionMS, reset phaseStart
 				// so the done label computes no additional elapsed.
 				e.recordDeclinedRound(currentRoundID, effectiveFindings, stepName, roundNum)
-				if err := e.applyApprovalOverride(step, sctx, sr.ID, response.approvalReason); err != nil {
+				if err := e.applyApprovalOverride(step, sctx, sr.ID, response.approvalReason, response.acceptedGaps); err != nil {
 					return false, "", err
 				}
 				phaseStart = time.Now()
@@ -2062,11 +2081,18 @@ done:
 // pass - the exact false-green this feature exists to prevent. When the marker
 // cannot be written this returns the error so the caller fails the run closed
 // instead of recording that plain pass.
-func (e *Executor) applyApprovalOverride(step Step, sctx *StepContext, stepResultID, approvalReason string) error {
-	// Every Test approval keeps its reason; db.StepResult.TestOverrideReason
-	// decides from the parked evidence whether it qualifies completion. Keep
-	// it separate from the command-waiver enforcement marker.
-	if step.Name() == types.StepTest {
+func (e *Executor) applyApprovalOverride(step Step, sctx *StepContext, stepResultID, approvalReason string, gaps *db.AcceptedGaps) error {
+	// An accepted strict-shipping gap is recorded as its own audit row and
+	// deliberately NOT as an approval reason: the step completes as an
+	// ordinary Test pass that carries the gap, and the receipt re-validates it.
+	if gaps != nil {
+		if _, err := e.db.RecordAcceptedGaps(stepResultID, *gaps, sctx.Run.Shipping != nil); err != nil {
+			return err
+		}
+	} else if step.Name() == types.StepTest {
+		// Every Test approval keeps its reason; db.StepResult.TestOverrideReason
+		// decides from the parked evidence whether it qualifies completion. Keep
+		// it separate from the command-waiver enforcement marker.
 		if err := e.db.SetTestApprovalReason(stepResultID, approvalReason); err != nil {
 			return err
 		}

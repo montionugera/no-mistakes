@@ -962,6 +962,15 @@ func splitPipelineSectionHeader(pipelineMD string) (string, string) {
 			}
 		}
 	}
+	// An accepted Test gap is audit evidence, not update history: keep its
+	// block in the fixed header so no truncation path drops it.
+	if rest := pipelineMD[headerEnd:]; strings.HasPrefix(rest, acceptedGapsHeading+"\n") {
+		blockEnd := len(rest)
+		if end := strings.Index(rest, "\n\n"); end >= 0 {
+			blockEnd = end + len("\n\n")
+		}
+		headerEnd += blockEnd
+	}
 	return pipelineMD[:headerEnd], pipelineMD[headerEnd:]
 }
 

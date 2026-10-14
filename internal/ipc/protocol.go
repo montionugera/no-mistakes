@@ -285,6 +285,11 @@ type RespondParams struct {
 	Instructions     map[string]string    `json:"instructions,omitempty"`
 	AddedFindings    []types.Finding      `json:"added_findings,omitempty"`
 	ApprovalReason   string               `json:"approval_reason,omitempty"` // Test approval only
+	// AcceptGaps names the Test findings an owner accepts as a strict-shipping
+	// gap. It rides on ActionApprove with ApprovalReason (who approved, where)
+	// and CoveredBy (the tests that cover the gap), both stored verbatim.
+	AcceptGaps []string `json:"accept_gaps,omitempty"`
+	CoveredBy  string   `json:"covered_by,omitempty"`
 }
 
 // CancelRunParams cancels an active pipeline run.

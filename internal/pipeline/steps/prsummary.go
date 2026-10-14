@@ -70,6 +70,10 @@ type pipelineAttestationStep struct {
 	// a failing configured commands.test. Omitted for every other step, ordinary
 	// Test completions, and attestations that predate the field.
 	OverrideReason string `json:"override_reason,omitempty"`
+	// AcceptedGaps records the owner-accepted Test gap this strict step
+	// completed with: the accepted finding ids, who approved it and where, and
+	// the covering tests. Omitted when no gap was accepted.
+	AcceptedGaps *pipelineAttestationAcceptedGaps `json:"accepted_gaps,omitempty"`
 }
 
 // pipelineAttestationLiveValidation reports the run's verdict and how much of
@@ -162,6 +166,12 @@ func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 		b.WriteString(buildPipelineAttestationWithPolicy(steps, rounds, headSHA, policy))
 		b.WriteString("\n\n")
 	}
+	if gapBlock := buildAcceptedGapsBlock(steps, flavor); gapBlock != "" {
+		// Neutralized like every detail block: the reason and covering tests
+		// are operator text and must not mint a second attestation marker.
+		b.WriteString(neutralizeAttestationMarkers(provider, gapBlock))
+		b.WriteString("\n\n")
+	}
 	for i, detail := range detailBlocks {
 		if i > 0 {
 			b.WriteString("\n")
@@ -208,6 +218,7 @@ func newPipelineAttestation(steps []*db.StepResult, rounds map[string][]*db.Step
 				attestation.AllowTestCommandOverride = strings.TrimSpace(policy.AllowTestCommandOverride)
 			}
 		}
+		item.AcceptedGaps = attestedAcceptedGaps(sr)
 		attestation.Steps = append(attestation.Steps, item)
 	}
 	// A custom gate shares its anchor's order, so the tie-break decides where
@@ -315,6 +326,12 @@ func rebindPipelineAttestationWithSteps(body, newHeadSHA string, steps []*db.Ste
 			if s.Step == types.StepTest {
 				if reason := strings.TrimSpace(s.OverrideReason); reason != "" {
 					sr.OverrideReason = &reason
+				}
+				if s.AcceptedGaps != nil {
+					if raw, err := json.Marshal(db.AcceptedGaps{FindingIDs: s.AcceptedGaps.FindingIDs, Reason: s.AcceptedGaps.Reason, CoveredBy: s.AcceptedGaps.CoveredBy}); err == nil {
+						rawJSON := string(raw)
+						sr.AcceptedGapsJSON = &rawJSON
+					}
 				}
 			}
 			steps = append(steps, sr)

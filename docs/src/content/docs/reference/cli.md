@@ -331,6 +331,8 @@ no-mistakes axi respond --run <id> --action approve
 | `--ignore`       | `string` | (none)        | Comma-separated finding IDs to decline with `--action fix`; see the accounting rules below |
 | `--instructions` | `string` | (none)        | Guidance applied to selected findings with `--action fix`            |
 | `--reason`       | `string` | (none)        | Operator's explanation for Test acknowledgment or exception approval |
+| `--accept-gap`   | `string` | (none)        | Comma-separated Test finding IDs to accept as a strict-shipping gap, with `--action approve`, `--reason`, and `--covered-by` |
+| `--covered-by`   | `string` | (none)        | Test names or paths covering the accepted gap (comma- or semicolon-separated or free text), recorded verbatim; requires `--accept-gap` |
 | `--add-finding`  | `string` | (none)        | JSON finding object to add and fix                                   |
 | `-y`, `--yes`    | `bool`   | `false`       | Auto-resolve subsequent eligible gates until a decision point or outcome |
 | `--wait`         | `duration` | `8m`        | Maximum time for pre-drive reads and post-response driving before the caller must reattach |
@@ -347,6 +349,17 @@ The step retains its findings and exit code, and the reason is durable local evi
 Revalidation, a new fix round, or skipping the step clears that current-step approval so a later result cannot inherit it.
 This is separate from the configured-command waiver and trusted repository opt-in used by [PR enforcement](/no-mistakes/reference/pipeline-steps/#pipeline-step-attestation); neither that policy nor approval authority changes.
 `--instructions` remains fix guidance, not an approval-reason input.
+
+A strict-shipping Test parked on an `inconclusive` verdict, where the unreachable scenarios are covered only by mocked tests, cannot be approved or skipped. The owner can accept that specific gap instead:
+
+```bash
+no-mistakes axi respond --step test --action approve \
+  --accept-gap test-1 \
+  --reason "owner approved via first mate, 2026-10-14" \
+  --covered-by "TestBrokerTimeoutMocked; internal/broker/timeout_test.go"
+```
+
+`--accept-gap` requires `--action approve`, a single-line `--reason` of at least 10 characters (up to 1000) that names who approved the gap and where, and a non-empty single-line `--covered-by`. Both strings are stored verbatim. Every actionable finding on the Test step must be named, and each named finding must be the native `inconclusive` verdict finding; a missing, unknown, or other ID is refused with the missing IDs listed. A `no-go` verdict, a failing `commands.test`, a Test-agent timeout or unvalidated-work finding, a recorded override or skip, and a non-zero exit code are never accepted. Outside strict shipping the flag is refused; use `--reason` there. The step completes normally (not skipped, not an override) and records the gap in `step_results.accepted_gaps_json`; see [strict shipping](/no-mistakes/reference/pipeline-steps/#explicit-strict-shipping-policy) for how it reaches receipts and the PR.
 
 The same approval command acknowledges a genuine strict `no-surface` Test; [strict shipping](#strict-shipping-and-review-receipts) owns its admission requirements.
 
@@ -846,7 +859,7 @@ Shows the PID if the daemon is running.
 
 ## Strict shipping and review receipts
 
-The explicit `axi run --shipping-mode full` mode owns the complete Intent → Rebase → Review → Test → Document → Lint → Push → PR → CI pipeline. It persists its policy on the selected run and refuses launch if the running daemon does not advertise strict-shipping support. It refuses skips, passing command exceptions, and approval of unresolved actionable findings. `--yes` stops at those gates. A genuine `no-surface` Test may complete after an explicit operator acknowledgment, with or without `--reason`, once documentation correctness is confirmed. Every scenario must be named, untested, not live, and carry a reason; an empty scenario list is refused. Only the native no-surface decision finding may remain actionable. The durable record retains the original verdict, scenarios, and acknowledgment through recovery. This is normal completion, not a Test override. Live or pass/fail scenarios, malformed evidence, operator-authored lookalikes, command failures, recorded overrides, invocation-budget cuts, and unrelated actionable findings remain refused. Independent Review, hosted CI, App approval, and merge safeguards still apply. Repairs and changes after Review must pass a fresh independent Review before publication. A changed target comparison invalidates readiness. Periodic CI reads wait at least five minutes; initial reads, explicit receipt exports, and event-driven reads remain immediate.
+The explicit `axi run --shipping-mode full` mode owns the complete Intent → Rebase → Review → Test → Document → Lint → Push → PR → CI pipeline. It persists its policy on the selected run and refuses launch if the running daemon does not advertise strict-shipping support. It refuses skips, passing command exceptions, and approval of unresolved actionable findings. `--yes` stops at those gates. A genuine `no-surface` Test may complete after an explicit operator acknowledgment, with or without `--reason`, once documentation correctness is confirmed. Every scenario must be named, untested, not live, and carry a reason; an empty scenario list is refused. Only the native no-surface decision finding may remain actionable. The durable record retains the original verdict, scenarios, and acknowledgment through recovery. This is normal completion, not a Test override. Live or pass/fail scenarios, malformed evidence, operator-authored lookalikes, command failures, recorded overrides, invocation-budget cuts, and unrelated actionable findings remain refused. An owner can accept a specific `inconclusive` Test gap with `axi respond --accept-gap`; see [Accepted Test gaps](/no-mistakes/reference/pipeline-steps/#accepted-test-gaps). Independent Review, hosted CI, App approval, and merge safeguards still apply. Repairs and changes after Review must pass a fresh independent Review before publication. A changed target comparison invalidates readiness. Periodic CI reads wait at least five minutes; initial reads, explicit receipt exports, and event-driven reads remain immediate.
 
 Existing-PR target checks and readiness invalidation are owned by the [PR and CI step contracts](/no-mistakes/reference/pipeline-steps/#pr).
 

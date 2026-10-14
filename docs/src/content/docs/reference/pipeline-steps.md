@@ -453,3 +453,13 @@ Step logs also record native subprocess start, exit, and retry lifecycle lines p
 ## Explicit strict shipping policy
 
 The [strict shipping CLI contract](/no-mistakes/reference/cli/#strict-shipping-and-review-receipts) owns admission flags, periodic polling, immutable-source custody, and receipt phases. [Review](#review), [Push](#push), [PR](#pr), and [CI](#ci) above own their exact-comparison checks and restart behavior. Immutable-source execution boundaries verify the submitted head and clean worktree before and after each step. CI remains active after `checks-passed` until native terminal custody settles.
+
+### Accepted Test gaps
+
+A strict Test parked on an `inconclusive` verdict because live-unreachable scenarios are covered only by mocked tests refuses plain approval, skip, and fix loops. The owner can accept that specific gap with `axi respond --step test --action approve --accept-gap <finding-id,...> --reason "<who approved, where, when>" --covered-by "<covering tests>"` (see [`axi respond`](/no-mistakes/reference/cli/#no-mistakes-axi-respond)).
+
+- Eligibility is one rule shared by the daemon pre-check, the executor's live gate, durable recording, and receipt export. It applies to strict runs only and to the Test step only. Every actionable finding must be named, and each must be the native `inconclusive` verdict finding. A `no-go` verdict, a failing `commands.test` finding or non-zero exit, a Test-agent timeout or unvalidated-work finding, and recorded overrides or skips are always refused. A partial list is refused with the missing IDs. Outside strict shipping the flag is refused.
+- The step completes as `completed`, not skipped and not an override, so the attestation still shows `test=completed`. The audit record is `{finding_ids, findings, reason, covered_by, verdict, accepted_at}` in `step_results.accepted_gaps_json`; revalidation, a new fix round, or skipping the step clears it. `--reason` and `--covered-by` are stored verbatim.
+- Strict receipt export re-validates the record against the step's stored findings with the same rule and carries it as `accepted_gaps` on the Test step. A record that no longer matches is ignored and the receipt is refused.
+- The PR body lists each accepted finding with its description, the reason, and the covering tests under `### Accepted gaps` in the fixed Pipeline header, which body trimming never drops, and the attestation's Test step carries `accepted_gaps` (`finding_ids`, `reason`, `covered_by`). The minimal appendix mode keeps only the attestation.
+- Status and run output report the gap with `test_override_reason`, and the commit status stays pending because an accepted gap is not a clean Test pass.
