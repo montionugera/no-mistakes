@@ -123,9 +123,10 @@ no-mistakes treats two kinds of failure differently:
 - **The plugin cannot serve the repository.** `status` exits non-zero (not
   authenticated, wrong account, repository unknown), or the configured command
   does not resolve. At PR-context resolution this stops the run before Rebase.
-  If availability is lost later at a PR or CI step, that step's adapter records
-  a skip reason under `run.automatic_skips`; skipped delivery cannot satisfy
-  pending Review support. Make the message actionable (for example
+  Ordinary guarded network runs also fail if availability is lost at a later
+  comparison boundary. The PR and CI adapters can record an availability
+  skip under `run.automatic_skips` if reached, but that does not bypass a later
+  boundary check or satisfy pending Review support. Make the message actionable (for example
   "run `gcloud auth login`"). This does not bypass the comparison-facts
   requirements above.
 - **The plugin broke this contract.** Unreadable output, a `protocol_version`
