@@ -2273,7 +2273,7 @@ func (e *Executor) failRun(run *db.Run, repo *db.Repo, err error, ctxs ...contex
 	}
 	run.Status = runStatus
 	run.Error = &errMsg
-	e.reportPublishedHeadStatus(context.Background(), run, repo, "failure")
+	e.ReportPublishedHeadFailure(run, repo)
 	e.emitRunEvent(ipc.EventRunCompleted, run, repo)
 	return err
 }

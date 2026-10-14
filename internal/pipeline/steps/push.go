@@ -234,7 +234,7 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 	// Record only an actual successful push, never a SHA found already upstream.
 	reportStatus := func(string) {}
 	if !decision.upToDate {
-		reportStatus = beginPublishedCommitStatus(sctx, headBeingPushed, pushURL, attestationSteps != nil && localValidationPassed(sctx))
+		reportStatus = beginPublishedCommitStatus(sctx, headBeingPushed, pushURL, attestationSteps != nil && localValidationPassed(sctx), attestationSteps == nil && localValidationPassed(sctx))
 		defer func() {
 			if publicationErr != nil {
 				reportStatus("failure")

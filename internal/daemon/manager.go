@@ -440,6 +440,9 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 					slog.Error("failed to update recovered run after panic", "run_id", plan.run.ID, "error", err)
 				}
 			}
+			if plan.run.Status == types.RunFailed || plan.run.Status == types.RunCancelled {
+				executor.ReportPublishedHeadFailure(plan.run, plan.repo)
+			}
 			cancel(nil)
 			_ = plan.agent.Close()
 			m.closeSubscribers(plan.run.ID)
@@ -1820,6 +1823,9 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 				if dbErr != nil {
 					slog.Error("failed to update run after panic", "run_id", run.ID, "error", dbErr)
 				}
+			}
+			if run.Status == types.RunFailed || run.Status == types.RunCancelled {
+				executor.ReportPublishedHeadFailure(run, repo)
 			}
 			cancel(nil)
 			ag.Close()

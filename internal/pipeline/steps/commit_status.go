@@ -18,12 +18,12 @@ import (
 
 // beginPublishedCommitStatus binds status updates to the immutable SHA sent to
 // git push, and to its target repository (the fork, when configured).
-func beginPublishedCommitStatus(sctx *pipeline.StepContext, sha, target string, validated bool) func(string) {
+func beginPublishedCommitStatus(sctx *pipeline.StepContext, sha, target string, validated, ciEligible bool) func(string) {
 	if resolvedProvider(sctx) != scm.ProviderGitHub || scm.ExtractHost(target) == "" {
 		return func(string) {}
 	}
 	hostName := resolvedHost(sctx, target)
-	publication := &db.CommitStatusPublication{SHA: sha, Host: hostName, Repo: github.RepoSlug(target), Validated: validated}
+	publication := &db.CommitStatusPublication{SHA: sha, Host: hostName, Repo: github.RepoSlug(target), Validated: validated, CIEligible: ciEligible}
 	if publication.Repo == "" {
 		return func(string) {}
 	}
@@ -56,11 +56,14 @@ func commitStatusReporter(sctx *pipeline.StepContext, publication *db.CommitStat
 	report := func(ctx context.Context, state, validatedSHA string, log func(string)) {
 		mu.Lock()
 		defer mu.Unlock()
-		if state == "success" && validatedSHA == publication.SHA {
+		if state == "success" && publication.CIEligible && validatedSHA == publication.SHA {
 			publication.Validated = true
 		}
 		if state == "success" && !publication.Validated {
-			return
+			if sctx.Run.Status != types.RunCompleted {
+				return
+			}
+			state = "failure"
 		}
 		if state == lastState {
 			return
@@ -115,7 +118,7 @@ func localValidationPassed(sctx *pipeline.StepContext) bool {
 	for _, name := range []types.StepName{types.StepReview, types.StepTest, types.StepDocument, types.StepLint} {
 		passed := false
 		for _, step := range steps {
-			if step.StepName == name && step.Status == types.StepStatusCompleted && step.OverrideReason == nil {
+			if step.StepName == name && step.Status == types.StepStatusCompleted && step.OverrideReason == nil && step.TestOverrideReason() == "" {
 				passed = true
 				break
 			}

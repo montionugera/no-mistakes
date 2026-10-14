@@ -68,3 +68,7 @@ func (e *Executor) reportPublishedHeadStatus(runCtx context.Context, run *db.Run
 		}
 	}
 }
+
+func (e *Executor) ReportPublishedHeadFailure(run *db.Run, repo *db.Repo) {
+	e.reportPublishedHeadStatus(context.Background(), run, repo, "failure")
+}

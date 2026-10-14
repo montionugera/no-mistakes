@@ -26,6 +26,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/logstore"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps"
 	"github.com/kunchenguid/no-mistakes/internal/procreap"
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 	"github.com/kunchenguid/no-mistakes/internal/shipping"
@@ -439,6 +440,10 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 	activeWorktrees := activeRecordedRunWorktrees(d, p)
 	preserveStaleRunHeads(d, p, preserved)
 
+	staleRuns, readErr := d.GetActiveRuns()
+	if readErr != nil {
+		slog.Warn("failed to read stale runs for commit status recovery", "error", readErr)
+	}
 	staleStarted := time.Now()
 	count, err := d.RecoverStaleRunsExcept("daemon crashed during execution", preserved)
 	if err != nil {
@@ -448,6 +453,18 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 			_ = plan.agent.Close()
 		}
 		return
+	}
+	for _, stale := range staleRuns {
+		run, err := d.GetRun(stale.ID)
+		if err != nil || run == nil || run.Status != types.RunFailed {
+			continue
+		}
+		repo, err := d.GetRepo(run.RepoID)
+		if err != nil || repo == nil {
+			slog.Warn("failed to read repository for commit status recovery", "run", run.ID, "error", err)
+			continue
+		}
+		pipeline.NewExecutor(d, p, nil, nil, []pipeline.Step{&steps.PushStep{}}, mgr.broadcast).ReportPublishedHeadFailure(run, repo)
 	}
 	if count > 0 {
 		slog.Info("recovered stale runs from previous crash", "count", count)

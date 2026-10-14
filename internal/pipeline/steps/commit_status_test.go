@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/forgecontext"
@@ -24,7 +25,7 @@ import (
 type statusRequest struct{ Path, State, Context, Description, TargetURL string }
 
 func TestPipeline_GitHubCommitStatuses(t *testing.T) {
-	for _, scenario := range []string{"pass", "fail after push", "cancel after push", "no push", "forgejo", "bitbucket", "repair head", "posting fails", "already upstream", "fork", "formatter head", "recovered failure", "CI repair readiness"} {
+	for _, scenario := range []string{"pass", "fail after push", "cancel after push", "no push", "forgejo", "bitbucket", "repair head", "posting fails", "already upstream", "fork", "formatter head", "recovered failure", "CI repair readiness", "Test no-go exception", "Test inconclusive exception", "skipped Test"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir, base, head := setupGitRepo(t)
 			remote := t.TempDir()
@@ -87,6 +88,16 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 				name := name
 				steps = append(steps, &transitionStep{name: name, execute: func(sc *pipeline.StepContext) (*pipeline.StepOutcome, error) {
 					o := &pipeline.StepOutcome{}
+					if name == types.StepTest {
+						if scenario == "skipped Test" {
+							o.Skipped = true
+						}
+						if strings.HasPrefix(scenario, "Test ") {
+							verdict := strings.TrimSuffix(strings.TrimPrefix(scenario, "Test "), " exception")
+							o.Findings = fmt.Sprintf(`{"findings":[],"verdict":%q}`, verdict)
+							o.NeedsApproval = true
+						}
+					}
 					if name == types.StepReview {
 						o.ReviewApprovedHeadSHA = sc.Run.HeadSHA
 					}
@@ -96,6 +107,7 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 			if scenario != "no push" {
 				steps = append(steps, &PushStep{})
 			}
+			uncertified := scenario == "skipped Test" || strings.HasPrefix(scenario, "Test ")
 			ciCalls := 0
 			repaired := ""
 			steps = append(steps, &transitionStep{name: types.StepCI, execute: func(sc *pipeline.StepContext) (*pipeline.StepOutcome, error) {
@@ -104,9 +116,16 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 					mu.Lock()
 					n := len(requests)
 					mu.Unlock()
-					if n != 2 {
+					wantAtCI := 2
+					if uncertified {
+						wantAtCI = 1
+					}
+					if n != wantAtCI {
 						t.Fatalf("requests at CI entry = %d, want pending then success before CI", n)
 					}
+				}
+				if uncertified {
+					sc.PublishedHeadValidated(head)
 				}
 				if scenario == "fail after push" {
 					return nil, errors.New("CI failed")
@@ -155,7 +174,40 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 			}
 			exec := pipeline.NewExecutor(sctx.DB, appPaths, sctx.Config, sctx.Agent, steps, nil)
 			exec.SetForgeContext(&forgecontext.Context{Provider: provider, Host: "github.com"})
-			err := exec.Execute(context.Background(), sctx.Run, sctx.Repo, dir)
+			var err error
+			if strings.HasPrefix(scenario, "Test ") {
+				done := make(chan error, 1)
+				go func() { done <- exec.Execute(context.Background(), sctx.Run, sctx.Repo, dir) }()
+				deadline := time.Now().Add(10 * time.Second)
+				approved := false
+				for time.Now().Before(deadline) {
+					rows, readErr := sctx.DB.GetStepsByRun(sctx.Run.ID)
+					if readErr != nil {
+						t.Fatal(readErr)
+					}
+					for _, row := range rows {
+						if row.StepName == types.StepTest && row.Status == types.StepStatusAwaitingApproval {
+							if _, respondErr := exec.RespondWithOverrides(types.StepTest, types.ActionApprove, nil, nil, nil, nil, "accept live validation exception"); respondErr == nil {
+								approved = true
+							}
+						}
+					}
+					if approved {
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				if !approved {
+					t.Fatal("Test did not park for approval")
+				}
+				select {
+				case err = <-done:
+				case <-time.After(10 * time.Second):
+					t.Fatal("approved run did not complete")
+				}
+			} else {
+				err = exec.Execute(context.Background(), sctx.Run, sctx.Repo, dir)
+			}
 			wantError := scenario == "fail after push" || scenario == "cancel after push"
 			if (err != nil) != wantError {
 				t.Fatalf("Execute = %v, wantError %v", err, wantError)
@@ -188,6 +240,9 @@ func TestPipeline_GitHubCommitStatuses(t *testing.T) {
 				if scenario == "repair head" || scenario == "CI repair readiness" {
 					want = append(want, statusRequest{Path: "/repos/test/repo/statuses/" + repaired, State: "pending"}, statusRequest{Path: "/repos/test/repo/statuses/" + repaired, State: "success"})
 				}
+			}
+			if uncertified {
+				want = []statusRequest{{Path: "/repos/test/repo/statuses/" + head, State: "pending"}, {Path: "/repos/test/repo/statuses/" + head, State: "failure"}}
 			}
 			if scenario == "formatter head" {
 				want = []statusRequest{{Path: "/repos/test/repo/statuses/" + repaired, State: "pending"}, {Path: "/repos/test/repo/statuses/" + repaired, State: "success"}}

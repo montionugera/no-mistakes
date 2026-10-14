@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE TABLE IF NOT EXISTS commit_status_publications (
  run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
  sha TEXT NOT NULL, host TEXT NOT NULL, repo TEXT NOT NULL,
- last_state TEXT NOT NULL DEFAULT '', validated INTEGER NOT NULL DEFAULT 0
+ last_state TEXT NOT NULL DEFAULT '', validated INTEGER NOT NULL DEFAULT 0, ci_eligible INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS step_results (
@@ -251,6 +251,7 @@ CREATE TABLE IF NOT EXISTS uncertified_pipeline_ranges (
 // were created before the referenced columns existed. Each statement must be
 // idempotent via its error being tolerated when the column already exists.
 var migrationStatements = []string{
+	`ALTER TABLE commit_status_publications ADD COLUMN ci_eligible INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE runs ADD COLUMN verification_plan TEXT`,
 	`CREATE TRIGGER IF NOT EXISTS runs_verification_plan_immutable BEFORE UPDATE OF verification_plan ON runs WHEN NEW.verification_plan IS NOT OLD.verification_plan BEGIN SELECT RAISE(ABORT, 'run verification plan is immutable'); END`,
 	`ALTER TABLE runs ADD COLUMN shipping_options TEXT`,
