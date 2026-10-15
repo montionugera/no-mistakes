@@ -359,7 +359,7 @@ no-mistakes axi respond --step test --action approve \
   --covered-by "TestBrokerTimeoutMocked; internal/broker/timeout_test.go"
 ```
 
-`--accept-gap` requires `--action approve`, a single-line `--reason` of at least 10 characters (up to 500) that names who approved the gap and where, and a non-empty single-line `--covered-by` of at most 500 characters. Neither field may contain control characters; limits count Unicode characters, not bytes. Both strings are stored verbatim. [Accepted Test gaps](/no-mistakes/reference/pipeline-steps/#accepted-test-gaps) owns eligibility, durable recording, and publication in receipts and the PR.
+`--accept-gap` requires `--action approve`, a single-line `--reason` of at least 10 characters (up to 500) that names who approved the gap and where, and a non-empty single-line `--covered-by` of at most 500 characters. Neither field may contain a Unicode control character (including C1 such as U+0085) or a line or paragraph separator (U+2028, U+2029); limits count Unicode characters, not bytes. Both strings are stored verbatim. The CLI probes the daemon first and refuses with `the daemon predates accepted gaps; restart it with `no-mistakes daemon restart`` when it cannot honor `--accept-gap`, because an older daemon would silently drop the fields. [Accepted Test gaps](/no-mistakes/reference/pipeline-steps/#accepted-test-gaps) owns eligibility, durable recording, and publication in receipts and the PR.
 
 Plain `--step test --action approve` acknowledges a genuine strict `no-surface` Test; [strict shipping](#strict-shipping-and-review-receipts) owns its admission requirements.
 

@@ -158,3 +158,11 @@ func rebindAcceptedGapAudit(body string, steps []*db.StepResult, provider scm.Pr
 	}
 	return body[:start] + block + body[end+len(acceptedGapsEnd):], nil
 }
+
+// acceptedGapAuditApplicable reports whether body is one of ours without an
+// HTML attestation: it already carries the audit markers or the pipeline
+// signature (Bitbucket bodies carry no attestation comment). Restamping adds,
+// replaces or removes the audit block only in such bodies.
+func acceptedGapAuditApplicable(body string) bool {
+	return strings.Contains(body, acceptedGapsStart) || strings.Contains(body, acceptedGapsEnd) || strings.Contains(body, noMistakesPRSignature)
+}

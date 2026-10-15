@@ -18,6 +18,7 @@ const (
 	MethodResolvePiProfile          = "resolve_pi_profile"
 	MethodProbeOmitIntent           = "probe_omit_intent"
 	MethodProbeExternalCIOwner      = "probe_external_ci_owner"
+	MethodProbeAcceptedGaps         = "probe_accepted_gaps"
 	MethodReleaseVerificationPlan   = "release_verification_plan"
 	MethodCaptureVerificationPlan   = "capture_verification_plan"
 	MethodStartFreshRun             = "start_fresh_run"
@@ -165,6 +166,15 @@ type ProbeOmitIntentResult struct {
 // request field while still starting a run.
 type ProbeExternalCIOwnerParams struct{}
 type ProbeExternalCIOwnerResult struct {
+	OK bool `json:"ok"`
+}
+
+// ProbeAcceptedGaps is the capability check for RespondParams.AcceptGaps and
+// CoveredBy. An older daemon decodes respond requests permissively and would
+// drop both fields, turning an accepted-gap approval into a plain approval
+// whose refusal hides the cause; a distinct method is refused as not found.
+type ProbeAcceptedGapsParams struct{}
+type ProbeAcceptedGapsResult struct {
 	OK bool `json:"ok"`
 }
 

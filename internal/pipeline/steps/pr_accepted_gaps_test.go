@@ -367,3 +367,42 @@ func TestRestampedAcceptedGapDescriptionIsRedacted(t *testing.T) {
 		t.Fatalf("owned restamp not redacted or touched author text:\n%s", ownedRestamp)
 	}
 }
+
+func TestBitbucketStyleRestampAddsReplacesAndRemovesTheAcceptedGapAudit(t *testing.T) {
+	t.Parallel()
+	withGap := acceptedGapStepsForTest(t)
+	plain := acceptedGapStepsForTest(t)
+	plain[1].AcceptedGapsJSON = nil
+	original, _ := buildPipelineSummaryFor(plain, nil, testPipelineHeadSHA, scm.ProviderBitbucket, pipelineAttestationPolicy{})
+	if strings.Contains(original, pipelineAttestationCommentPrefix) || strings.Contains(original, acceptedGapsStart) {
+		t.Fatalf("fixture is not a Bitbucket-style body without attestation or audit:\n%s", original)
+	}
+	const newHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	added, rebound, err := rebindOwnedPRAttestation(original, newHead, withGap, pipelineAttestationPolicy{}, scm.ProviderBitbucket)
+	if err != nil || !rebound {
+		t.Fatalf("add = %v, %v", rebound, err)
+	}
+	if !strings.Contains(added, acceptedGapsStart) || !strings.Contains(added, "Approved: "+acceptedGapTestReason) || strings.Contains(added, pipelineAttestationCommentPrefix) {
+		t.Fatalf("audit not added to the attestation-free body:\n%s", added)
+	}
+
+	changed := acceptedGapStepsForTest(t)
+	gaps := `{"finding_ids":["test-verdict"],"findings":[{"id":"test-verdict","category":"test-verdict","description":"inconclusive"}],"reason":"owner re-approved via first mate","covered_by":"TestOther","verdict":"inconclusive"}`
+	changed[1].AcceptedGapsJSON = &gaps
+	replaced, rebound, err := rebindOwnedPRAttestation(added, newHead, changed, pipelineAttestationPolicy{}, scm.ProviderBitbucket)
+	if err != nil || !rebound || strings.Count(replaced, acceptedGapsStart) != 1 || !strings.Contains(replaced, "owner re-approved via first mate") || strings.Contains(replaced, acceptedGapTestReason) {
+		t.Fatalf("audit not replaced: %v %v\n%s", rebound, err, replaced)
+	}
+
+	removed, rebound, err := rebindOwnedPRAttestation(replaced, newHead, plain, pipelineAttestationPolicy{}, scm.ProviderBitbucket)
+	if err != nil || !rebound || strings.Contains(removed, acceptedGapsStart) || strings.Contains(removed, "owner re-approved") {
+		t.Fatalf("audit not removed: %v %v\n%s", rebound, err, removed)
+	}
+
+	// A body that is not ours is never given an audit block.
+	foreign, rebound, err := rebindOwnedPRAttestation("someone else's description", newHead, withGap, pipelineAttestationPolicy{}, scm.ProviderBitbucket)
+	if err != nil || rebound || foreign != "someone else's description" {
+		t.Fatalf("foreign body touched: %q %v %v", foreign, rebound, err)
+	}
+}

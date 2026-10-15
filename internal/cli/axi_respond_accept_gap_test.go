@@ -30,6 +30,9 @@ func TestAxiRespond_AcceptGapFlagValidation(t *testing.T) {
 		{"short reason", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-verdict", "--reason", "ok", "--covered-by", "TestX"}, "--reason of at least 10 characters"},
 		{"missing covered-by", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-verdict", "--reason", acceptGapReason}, "non-empty --covered-by"},
 		{"blank covered-by", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-verdict", "--reason", acceptGapReason, "--covered-by", "  "}, "non-empty --covered-by"},
+		{"NEL in reason", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-verdict", "--reason", "owner approved\u0085via first mate", "--covered-by", "TestX"}, "single line"},
+		{"line separator in reason", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-verdict", "--reason", "owner approved\u2028via first mate", "--covered-by", "TestX"}, "single line"},
+		{"paragraph separator in covered-by", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-verdict", "--reason", "owner approved via first mate", "--covered-by", "TestX\u2029TestY"}, "single line"},
 		{"multiline reason", []string{"--action", "approve", "--step", "test", "--accept-gap", "test-verdict", "--reason", "owner approved\nvia first mate", "--covered-by", "TestX"}, "single line"},
 		{"no ids", []string{"--action", "approve", "--step", "test", "--accept-gap", " , ", "--reason", acceptGapReason, "--covered-by", "TestX"}, "at least one finding id"},
 		{"not the Test step", []string{"--action", "approve", "--step", "review", "--accept-gap", "test-verdict", "--reason", acceptGapReason, "--covered-by", "TestX"}, "applies only to the Test step"},
@@ -148,5 +151,32 @@ func TestGateHelpAfterACrashOffersTheRecoveryApproval(t *testing.T) {
 	parked.AcceptedGapRecorded = false
 	if out := axiDoc(gateFieldsFor(parked, "run-7", true)...); !strings.Contains(out, "--accept-gap test-verdict") {
 		t.Fatalf("unrecorded gate lost the accept-gap command:\n%s", out)
+	}
+}
+
+func TestAxiRespond_RefusesAnAcceptedGapOnADaemonThatPredatesThem(t *testing.T) {
+	var responded atomic.Bool
+	fx := newAxiTimeoutFixture(t, axiTimeoutOpts{
+		withoutAcceptedGaps: true,
+		respond: func(context.Context, json.RawMessage) (interface{}, error) {
+			responded.Store(true)
+			return &ipc.RespondResult{OK: true}, nil
+		},
+	})
+	fx.setGetRun(func(context.Context, int) (*ipc.RunInfo, error) {
+		run := fx.awaiting()
+		run.Steps[0].StepName = types.StepTest
+		return run, nil
+	})
+	out, err := executeCmd("axi", "respond", "--action", "approve", "--accept-gap", "test-verdict", "--reason", acceptGapReason, "--covered-by", acceptGapCoveredBy, "--wait", "3s")
+	var ee *exitError
+	if !errors.As(err, &ee) || ee.code != 2 {
+		t.Fatalf("error = %v, want usage exit 2\n%s", err, out)
+	}
+	if !strings.Contains(out, "the daemon predates accepted gaps; restart it with `no-mistakes daemon restart`") {
+		t.Fatalf("output missing the capability refusal:\n%s", out)
+	}
+	if responded.Load() {
+		t.Fatal("the response reached a daemon that would have dropped the accepted gap")
 	}
 }

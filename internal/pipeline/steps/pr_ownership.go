@@ -214,12 +214,17 @@ func updateOwnedPR(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR, initia
 func rebindOwnedPRAttestation(body, head string, steps []*db.StepResult, policy pipelineAttestationPolicy, provider scm.Provider) (string, bool, error) {
 	if !hasPRAppendixMarkers(body) {
 		updated, rebound := rebindPipelineAttestationWithSteps(body, head, steps, policy)
-		if rebound && steps != nil {
+		// The accepted-gap audit is independent of the attestation: a provider
+		// whose ordinary bodies carry no HTML attestation (Bitbucket) still has
+		// to gain, change or lose the block when the gap state changes. It is
+		// applied to any body that is recognizably ours, never to a foreign PR.
+		if steps != nil && (rebound || acceptedGapAuditApplicable(updated)) {
 			var err error
 			updated, err = rebindAcceptedGapAudit(updated, steps, provider)
 			if err != nil {
 				return "", false, err
 			}
+			rebound = true
 		}
 		return updated, rebound, nil
 	}
@@ -228,7 +233,7 @@ func rebindOwnedPRAttestation(body, head string, steps []*db.StepResult, policy 
 		return "", false, err
 	}
 	appendix, rebound := rebindPipelineAttestationWithSteps(parts.appendix, head, steps, policy)
-	if !rebound {
+	if !rebound && !(steps != nil && acceptedGapAuditApplicable(appendix)) {
 		return "", false, fmt.Errorf("cannot rebind the owned PR attestation")
 	}
 	if steps != nil {

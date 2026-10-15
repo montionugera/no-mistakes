@@ -1947,6 +1947,14 @@ func runAxiRespond(cmd *cobra.Command, ra respondArgs) error {
 		return emitError(cmd, 2, "--findings and --ignore apply only to --action fix")
 	}
 
+	if len(acceptGapIDs) > 0 {
+		// An older daemon would drop accept_gaps and covered_by silently.
+		var capability ipc.ProbeAcceptedGapsResult
+		if err := env.client.Call(ipc.MethodProbeAcceptedGaps, &ipc.ProbeAcceptedGapsParams{}, &capability); err != nil || !capability.OK {
+			return emitError(cmd, 2, "the daemon predates accepted gaps; restart it with `no-mistakes daemon restart`")
+		}
+	}
+
 	result, err := sendRespond(env.client, runID, stepName, act, findingIDs, ignoreIDs, instructions, added, ra.reason, acceptGapIDs, ra.coveredBy)
 	if err != nil {
 		var refusal *respondRefusalError

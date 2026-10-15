@@ -1424,6 +1424,9 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 	srv.Handle(ipc.MethodProbeExternalCIOwner, func(context.Context, json.RawMessage) (interface{}, error) {
 		return &ipc.ProbeExternalCIOwnerResult{OK: true}, nil
 	})
+	srv.Handle(ipc.MethodProbeAcceptedGaps, func(context.Context, json.RawMessage) (interface{}, error) {
+		return &ipc.ProbeAcceptedGapsResult{OK: true}, nil
+	})
 
 	srv.Handle(ipc.MethodCaptureVerificationPlan, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
 		if err := refuseNested(ctx, false); err != nil {

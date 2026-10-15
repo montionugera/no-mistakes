@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -25,8 +26,13 @@ func AcceptedGapTextRefusal(flag, text string) string {
 	if len([]rune(text)) > MaxAcceptedGapTextLen {
 		return fmt.Sprintf("%s must be at most %d characters", flag, MaxAcceptedGapTextLen)
 	}
-	if strings.ContainsFunc(text, func(r rune) bool { return r < ' ' || r == 0x7f }) {
-		return flag + " must be a single line without control characters"
+	// Every Unicode control rune (C0, DEL and C1 such as U+0085) and every
+	// line or paragraph separator (U+2028, U+2029: categories Zl and Zp) can
+	// break the single-line audit block, so none is stored.
+	if strings.ContainsFunc(text, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r)
+	}) {
+		return flag + " must be a single line without control or line-separator characters"
 	}
 	return ""
 }

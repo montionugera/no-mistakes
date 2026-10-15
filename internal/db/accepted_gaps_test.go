@@ -67,6 +67,10 @@ func TestAcceptedGapRefusal(t *testing.T) {
 		{"missing reason", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-verdict"}, CoveredBy: "TestX"}, "--reason"},
 		{"short reason", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-verdict"}, Reason: "ok", CoveredBy: "TestX"}, "at least 10 characters"},
 		{"missing covered-by", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-verdict"}, Reason: "owner approved via first mate"}, "--covered-by"},
+		{"NEL in reason", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-verdict"}, Reason: "owner approved\u0085via first mate", CoveredBy: "TestX"}, "single line"},
+		{"line separator in reason", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-verdict"}, Reason: "owner approved\u2028via first mate", CoveredBy: "TestX"}, "single line"},
+		{"paragraph separator in covered-by", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-verdict"}, Reason: "owner approved via first mate", CoveredBy: "TestX\u2029TestY"}, "single line"},
+		{"NEL in covered-by", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-verdict"}, Reason: "owner approved via first mate", CoveredBy: "TestX\u0085TestY"}, "single line"},
 		{"multiline reason", gapRow(gapFindings("inconclusive")), true, AcceptedGaps{FindingIDs: []string{"test-verdict"}, Reason: "owner approved\nvia first mate", CoveredBy: "TestX"}, "single line"},
 		// The audit contract allows 500 characters per field, including
 		// multibyte text, but must reject 501 before recording the gap.
