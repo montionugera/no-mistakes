@@ -41,14 +41,11 @@ func attestedAcceptedGaps(sr *db.StepResult) *pipelineAttestationAcceptedGaps {
 	return &pipelineAttestationAcceptedGaps{FindingIDs: gaps.FindingIDs, ReasonDigest: acceptedGapTextDigest(gaps.Reason), CoveredByDigest: acceptedGapTextDigest(gaps.CoveredBy)}
 }
 
-// canonicalAcceptedGapText is the one representation of the reason and
-// covering tests that is both published and digested: the stored text after
-// the publication redaction boundary (home directories become a placeholder)
-// and before the PR-flavor HTML/markdown escaping, which only changes how the
-// same text is displayed. Redaction is idempotent, so the later whole-body
-// redaction cannot change it. Digesting the raw stored text instead would
-// leave a verifier unable to reproduce the digest from the published block
-// whenever redaction changed the text.
+// canonicalAcceptedGapText redacts the reason and covering tests before both
+// digesting and rendering them, so the digest never binds text publication
+// would redact. Redaction is idempotent, so later whole-body redaction cannot
+// change it. Rendering also escapes text and neutralizes reserved markers and
+// closing references; those presentation rewrites are not part of the digest.
 func canonicalAcceptedGapText(text string) string {
 	return safepath.RedactText(text)
 }
