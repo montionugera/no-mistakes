@@ -10,6 +10,10 @@ import (
 	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/bitbucket"
+	"github.com/kunchenguid/no-mistakes/internal/branchsync"
+	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/forgecontext"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
@@ -21,6 +25,43 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/scm/origin"
 	"github.com/kunchenguid/no-mistakes/internal/scm/plugin"
 )
+
+func NewPRStateLookup(globalCfg *config.GlobalConfig, workDir string) branchsync.PRStateLookup {
+	return func(ctx context.Context, repo *db.Repo, run *db.Run) (scm.PRState, error) {
+		forge, err := forgecontext.Resolve(ctx, globalCfg.ForgeProfiles, repo.UpstreamURL, repo.ForkURL)
+		if err == nil {
+			err = forgecontext.RefuseProviderPluginOverlap(ctx, forge, globalCfg.ProviderPlugins, repo.UpstreamURL)
+		}
+		if err != nil {
+			return "", err
+		}
+		return ReadPRState(&pipeline.StepContext{
+			Ctx: ctx, Run: run, Repo: repo, WorkDir: workDir,
+			Config: config.Merge(globalCfg, &config.RepoConfig{}), ForgeContext: forge,
+		})
+	}
+}
+
+// ReadPRState observes the recorded PR using the same provider, profile, and
+// subprocess credentials as the PR and CI steps. It does not mutate the run.
+func ReadPRState(sctx *pipeline.StepContext) (scm.PRState, error) {
+	prURL := runPRURL(sctx)
+	if prURL == "" {
+		return "", fmt.Errorf("%w: run has no PR URL", scm.ErrPRIdentity)
+	}
+	number, err := scm.ExtractPRNumber(prURL)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", scm.ErrPRIdentity, err)
+	}
+	host, reason := buildHost(sctx, resolvedProvider(sctx))
+	if host == nil {
+		return "", fmt.Errorf("cannot check PR state: %s", reason)
+	}
+	if err := host.Available(sctx.Ctx); err != nil {
+		return "", err
+	}
+	return host.GetPRState(sctx.Ctx, &scm.PR{Number: number, URL: prURL})
+}
 
 func ShippingProofHost(sctx *pipeline.StepContext) (scm.Host, error) {
 	if resolvedProvider(sctx) != scm.ProviderGitHub {

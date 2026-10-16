@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -1596,7 +1598,7 @@ func TestSyncServicesRejectInvalidGlobalRemoteTimeout(t *testing.T) {
 		t.Fatalf("openSyncService error = %v", err)
 	}
 
-	service, closeFn, err = branchsync.OpenCurrent()
+	service, closeFn, err = branchsync.OpenCurrent(steps.NewPRStateLookup)
 	if err == nil {
 		closeFn()
 		t.Fatal("branchsync.OpenCurrent accepted an invalid branch sync timeout")
@@ -1771,4 +1773,184 @@ func asExitError(err error, target **exitError) bool {
 		err = u.Unwrap()
 	}
 	return false
+}
+
+func TestSyncServiceConstructorsConfirmMergedPRWithProfile(t *testing.T) {
+	for _, constructor := range []struct {
+		name string
+		open func() (*branchsync.Service, func(), error)
+	}{
+		{name: "CLI", open: openSyncService},
+		{name: "TUI OpenCurrent", open: func() (*branchsync.Service, func(), error) {
+			return branchsync.OpenCurrent(steps.NewPRStateLookup)
+		}},
+	} {
+		t.Run(constructor.name, func(t *testing.T) {
+			f := newCLISyncFixture(t)
+			p, err := paths.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			database, err := db.Open(p.DB())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			run, err := database.GetRun(f.runID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const upstream = "https://github.com/test/repo.git"
+			if _, err := database.UpdateRepoMetadata(run.RepoID, upstream, "main"); err != nil {
+				t.Fatal(err)
+			}
+			for _, err := range []error{
+				database.UpdateRunPushBinding(run.ID, db.PushBinding{HeadSHA: f.pushed, TargetKind: "upstream", TargetFingerprint: branchsync.TargetFingerprint(upstream), Ref: "refs/heads/feature/sync"}),
+				database.UpdateRunPRURL(run.ID, "https://github.com/test/repo/pull/42"),
+				database.UpdateRunPRState(run.ID, "open"),
+				database.UpdateRunErrorStatus(run.ID, types.RunCIMonitorInterruptedReason, types.RunCIMonitorInterrupted),
+			} {
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			cliGit(t, f.local, "push", f.remote, ":refs/heads/feature/sync")
+			cliGit(t, f.local, "config", "url."+f.remote+".insteadOf", upstream)
+			profileDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(profileDir, "hosts.yml"), []byte("github.com:\n    user: personal\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p.ConfigFile(), []byte(fmt.Sprintf("branch_sync_remote_timeout: 2s\nforge_profiles:\n  github.com:\n    gh_config_dir: %s\n", profileDir)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			binDir := t.TempDir()
+			script := `#!/bin/sh
+[ "$GH_CONFIG_DIR" = "$SYNC_TEST_PROFILE" ] || exit 10
+[ -z "$GH_TOKEN" ] || exit 11
+case "$*" in
+  "auth status --hostname github.com") exit 0 ;;
+  "pr view https://github.com/test/repo/pull/42 --repo test/repo --json state --jq .state") echo MERGED ;;
+  *) exit 12 ;;
+esac
+`
+			if err := os.WriteFile(filepath.Join(binDir, "gh"), []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("SYNC_TEST_PROFILE", profileDir)
+			t.Setenv("GH_TOKEN", "ambient-test-token")
+			refsBefore := cliGit(t, f.local, "show-ref")
+			service, closeFn, err := constructor.open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeFn()
+			if service.RemoteTimeout != 2*time.Second {
+				t.Fatalf("remote timeout = %s", service.RemoteTimeout)
+			}
+			for _, check := range []bool{true, false} {
+				state := service.Refresh(context.Background())
+				if !check {
+					state = service.Apply(context.Background())
+				}
+				if state.State != branchsync.StateMergedRemoteRemoved || state.Safety != "already_retired" || state.Changed {
+					t.Fatalf("merged PR with removed remote must retire without Git changes (check=%v): %+v", check, state)
+				}
+				stored, err := database.GetRun(run.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := "merged"
+				if check {
+					want = "open"
+				}
+				if stored.PRState == nil || *stored.PRState != want || stored.Status != types.RunCIMonitorInterrupted {
+					t.Fatalf("check=%v stored run = %+v", check, stored)
+				}
+				if cliGit(t, f.local, "show-ref") != refsBefore || cliGit(t, f.local, "rev-parse", "HEAD") != f.old {
+					t.Fatal("PR confirmation changed refs or HEAD")
+				}
+			}
+		})
+	}
+}
+
+// The fork push binding remains valid when only the upstream changes. A PR
+// number in that replacement repository must never retire the recorded PR.
+func TestAxiSyncRefusesRecordedPRIdentityMismatch(t *testing.T) {
+	for _, tt := range []struct{ name, upstream, prURL, hint string }{
+		{"changed owner", "https://github.com/replacement/repo.git", "https://github.com/original/repo/pull/42", "different repository than the current target"},
+		{"changed repository", "https://github.com/original/replacement.git", "https://github.com/original/repo/pull/42", "different repository than the current target"},
+		{"changed host", "https://github.com/original/repo.git", "https://other.example/original/repo/pull/42", "different repository than the current target"},
+		{"unparseable URL", "https://github.com/original/repo.git", "not-a-url/42", "recorded PR URL"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newCLISyncFixture(t)
+			p, err := paths.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			database, err := db.Open(p.DB())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			run, err := database.GetRun(f.runID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Keep the same fork and its push binding; replace only upstream.
+			if _, err := database.UpdateRepoMetadataWithFork(run.RepoID, tt.upstream, f.remote, "main"); err != nil {
+				t.Fatal(err)
+			}
+			for _, err := range []error{
+				database.UpdateRunPushBinding(run.ID, db.PushBinding{HeadSHA: f.pushed, TargetKind: "fork", TargetFingerprint: branchsync.TargetFingerprint(f.remote), Ref: "refs/heads/feature/sync"}),
+				database.UpdateRunPRURL(run.ID, tt.prURL),
+				database.UpdateRunPRState(run.ID, "open"),
+				database.UpdateRunErrorStatus(run.ID, types.RunCIMonitorInterruptedReason, types.RunCIMonitorInterrupted),
+			} {
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			cliGit(t, f.local, "push", f.remote, ":refs/heads/feature/sync")
+			binDir := t.TempDir()
+			// original/repo#42 is open, while every other #42 is merged.
+			script := `#!/bin/sh
+case "$*" in
+  "auth status --hostname github.com") exit 0 ;;
+  "pr view 42 --repo original/repo --json state --jq .state") echo OPEN ;;
+  "pr view "*) echo MERGED ;;
+  *) exit 12 ;;
+esac
+`
+			if err := os.WriteFile(filepath.Join(binDir, "gh"), []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			before, err := database.GetRun(run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			refsBefore := cliGit(t, f.local, "show-ref")
+			for _, check := range []bool{true, false} {
+				args := []string{"axi", "sync"}
+				if check {
+					args = append(args, "--check")
+				}
+				out, err := executeCmd(args...)
+				var ee *exitError
+				if err == nil || !asExitError(err, &ee) || ee.code != 1 || !strings.Contains(out, "safety: blocked_remote_missing") || !strings.Contains(out, tt.hint) {
+					t.Errorf("check=%v must refuse recorded PR identity: %v\n%s", check, err, out)
+				}
+				after, err := database.GetRun(run.ID)
+				if err != nil || !reflect.DeepEqual(before, after) {
+					t.Errorf("check=%v changed run metadata: %+v, %v", check, after, err)
+				}
+				if cliGit(t, f.local, "show-ref") != refsBefore || cliGit(t, f.local, "rev-parse", "HEAD") != f.old {
+					t.Fatal("refused lookup changed Git refs or HEAD")
+				}
+			}
+		})
+	}
 }

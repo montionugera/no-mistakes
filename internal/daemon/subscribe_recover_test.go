@@ -2,9 +2,11 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +18,6 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/lifecycle"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
-	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps"
 	"github.com/kunchenguid/no-mistakes/internal/testgit"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -591,116 +592,192 @@ func TestRecoverOnStartup_ResumesParkedRun(t *testing.T) {
 
 func TestRecoverOnStartup_ReconcilesHistoricalCIGateFromCurrentPRState(t *testing.T) {
 	for _, state := range []string{"MERGED", "CLOSED"} {
-		t.Run(state, func(t *testing.T) {
-			tmpDir, err := os.MkdirTemp("", "dtest")
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
-			p := paths.WithRoot(tmpDir)
-			if err := p.EnsureDirs(); err != nil {
-				t.Fatal(err)
-			}
-			mockClaude := writeMockClaude(t, t.TempDir())
-			profileDir := t.TempDir()
-			if err := os.WriteFile(filepath.Join(profileDir, "hosts.yml"), []byte("github.com:\n    user: recovery-user\n"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			globalConfig := "agent: claude\nagent_path_override:\n  claude: " + mockClaude +
-				"\nforge_profiles:\n  github.com:\n    gh_config_dir: " + profileDir + "\n"
-			if err := os.WriteFile(p.ConfigFile(), []byte(globalConfig), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			d, err := db.Open(p.DB())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer d.Close()
-			repo, headSHA := setupTestGitRepo(t, p, d, "reconcile-parked-ci-"+strings.ToLower(state))
-			run, err := d.InsertRun(repo.ID, "feature", headSHA, headSHA)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := d.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
-				t.Fatal(err)
-			}
-			if err := d.UpdateRunPRURL(run.ID, "https://github.com/test/repo/pull/42"); err != nil {
-				t.Fatal(err)
-			}
-			prURL := "https://github.com/test/repo/pull/42"
-			run.PRURL = &prURL
-			worktree := p.WorktreeDir(repo.ID, run.ID)
-			if err := gitpkg.WorktreeAdd(context.Background(), p.RepoDir(repo.ID), worktree, headSHA); err != nil {
-				t.Fatal(err)
-			}
-			testgit.BindRunComparison(t, d, run, worktree, "main", prURL, "test/repo", "feature")
-			step, err := d.InsertStepResult(run.ID, types.StepCI)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := d.StartStep(step.ID); err != nil {
-				t.Fatal(err)
-			}
-			findings := `{"findings":[{"id":"ci-1","severity":"warning","description":"PR was still open when CI monitoring timed out","action":"ask-user"}],"summary":"CI monitoring timed out before PR was merged or closed"}`
-			if err := d.SetStepFindings(step.ID, findings); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := d.InsertStepRound(step.ID, 1, "initial", &findings, nil, 1); err != nil {
-				t.Fatal(err)
-			}
-			if err := d.UpdateStepStatusWithDuration(step.ID, types.StepStatusAwaitingApproval, 1); err != nil {
-				t.Fatal(err)
-			}
-			if err := d.SetRunAwaitingAgent(run.ID); err != nil {
-				t.Fatal(err)
-			}
-
-			ghDir, ghLog := writeMockGHState(t, t.TempDir(), state)
-			t.Setenv("PATH", ghDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-			t.Setenv("GH_TOKEN", "ambient-must-not-leak")
-			errCh := make(chan error, 1)
-			go func() {
-				errCh <- RunWithOptions(p, d, func() []pipeline.Step { return []pipeline.Step{&steps.CIStep{}} })
-			}()
-			defer func() {
-				client, dialErr := ipc.Dial(p.Socket())
-				if dialErr == nil {
-					_ = client.Call(ipc.MethodShutdown, &ipc.ShutdownParams{}, nil)
-					_ = client.Close()
+		for _, tc := range []struct {
+			name, fork, prURL, sourceRepo, missingRunURL, wantError string
+		}{
+			{name: "matching"},
+			{name: "fork", fork: "https://github.com/contributor/repo.git", sourceRepo: "contributor/repo"},
+			{name: "missing_url_with_receipt", missingRunURL: "empty", wantError: "PR comparison changed after rebase"},
+			{name: "nil_url_with_receipt", missingRunURL: "nil", wantError: "PR comparison changed after rebase"},
+			{name: "wrong_repo", prURL: "https://github.com/other/repo/pull/42", wantError: "do not match recorded PR identity"},
+			{name: "wrong_host", prURL: "https://other.example/test/repo/pull/42", wantError: "do not match recorded PR identity"},
+		} {
+			t.Run(state+"/"+tc.name, func(t *testing.T) {
+				tmpDir, err := os.MkdirTemp("", "dtest")
+				if err != nil {
+					t.Fatal(err)
 				}
-				select {
-				case <-errCh:
-				// Match RunManager.Shutdown's 30-second in-flight drain budget;
-				// recovered worktree cleanup is especially process-spawn-bound on
-				// Windows.
-				case <-time.After(35 * time.Second):
-					t.Error("daemon did not stop")
+				t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+				p := paths.WithRoot(tmpDir)
+				if err := p.EnsureDirs(); err != nil {
+					t.Fatal(err)
 				}
-			}()
+				mockClaude := writeMockClaude(t, t.TempDir())
+				profileDir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(profileDir, "hosts.yml"), []byte("github.com:\n    user: recovery-user\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				globalConfig := "agent: claude\nagent_path_override:\n  claude: " + mockClaude +
+					"\nforge_profiles:\n  github.com:\n    gh_config_dir: " + profileDir + "\n"
+				if err := os.WriteFile(p.ConfigFile(), []byte(globalConfig), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				d, err := db.Open(p.DB())
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = d.Close() })
+				repo, headSHA := setupTestGitRepo(t, p, d, "reconcile-parked-ci-"+strings.ToLower(state))
+				if tc.fork != "" {
+					repo, err = d.UpdateRepoMetadataWithFork(repo.ID, repo.UpstreamURL, tc.fork, "main")
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				run, err := d.InsertRun(repo.ID, "feature", headSHA, headSHA)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := d.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+					t.Fatal(err)
+				}
+				prURL := tc.prURL
+				if prURL == "" {
+					prURL = "https://github.com/test/repo/pull/42"
+				}
+				if err := d.UpdateRunPRURL(run.ID, prURL); err != nil {
+					t.Fatal(err)
+				}
+				run.PRURL = &prURL
+				worktree := p.WorktreeDir(repo.ID, run.ID)
+				if err := gitpkg.WorktreeAdd(context.Background(), p.RepoDir(repo.ID), worktree, headSHA); err != nil {
+					t.Fatal(err)
+				}
+				sourceRepo := tc.sourceRepo
+				if sourceRepo == "" {
+					sourceRepo = "test/repo"
+				}
+				testgit.BindRunComparison(t, d, run, worktree, "main", prURL, sourceRepo, "feature")
+				if tc.missingRunURL == "empty" || tc.missingRunURL == "nil" {
+					if err := d.UpdateRunPRURL(run.ID, ""); err != nil {
+						t.Fatal(err)
+					}
+					empty := ""
+					run.PRURL = &empty
+					if tc.missingRunURL == "nil" {
+						// Model the nullable historical run row without
+						// changing the comparison receipt's recorded URL.
+						conn, err := sql.Open("sqlite", p.DB())
+						if err != nil {
+							t.Fatal(err)
+						}
+						_, err = conn.Exec("UPDATE runs SET pr_url = NULL WHERE id = ?", run.ID)
+						_ = conn.Close()
+						if err != nil {
+							t.Fatal(err)
+						}
+						run.PRURL = nil
+					}
+				}
+				rebase, err := d.InsertStepResult(run.ID, types.StepRebase)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := d.CompleteStepWithStatus(rebase.ID, types.StepStatusCompleted, 0, 1, ""); err != nil {
+					t.Fatal(err)
+				}
+				step, err := d.InsertStepResult(run.ID, types.StepCI)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := d.StartStep(step.ID); err != nil {
+					t.Fatal(err)
+				}
+				findings := `{"findings":[{"id":"ci-1","severity":"warning","description":"PR was still open when CI monitoring timed out","action":"ask-user"}],"summary":"CI monitoring timed out before PR was merged or closed"}`
+				if err := d.SetStepFindings(step.ID, findings); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := d.InsertStepRound(step.ID, 1, "initial", &findings, nil, 1); err != nil {
+					t.Fatal(err)
+				}
+				if err := d.UpdateStepStatusWithDuration(step.ID, types.StepStatusAwaitingApproval, 1); err != nil {
+					t.Fatal(err)
+				}
+				if err := d.SetRunAwaitingAgent(run.ID); err != nil {
+					t.Fatal(err)
+				}
 
-			waitForDaemonReady(t, p)
-			completed := waitForRunTerminalState(t, d, run.ID)
-			if completed.Status != types.RunCompleted || completed.AwaitingAgentSince != nil {
-				t.Fatalf("historical CI gate after %s reconciliation = status %s awaiting %v", state, completed.Status, completed.AwaitingAgentSince)
-			}
-			active, err := lifecycle.ActiveRuns(p)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(active) != 0 {
-				t.Fatalf("update guard still sees %d active runs after reconciliation", len(active))
-			}
-			logData, err := os.ReadFile(ghLog)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !strings.Contains(string(logData), "pr view 42") {
-				t.Fatalf("startup reconciliation did not read current PR state: %s", logData)
-			}
-			if !strings.Contains(string(logData), "env:"+profileDir+" token:") {
-				t.Fatalf("startup reconciliation did not use the recovered forge environment: %s", logData)
-			}
-		})
+				if err := d.UpdateRunPRState(run.ID, "open"); err != nil {
+					t.Fatal(err)
+				}
+				before, err := d.GetRun(run.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ghDir, ghLog := writeMockGHState(t, t.TempDir(), state, prURL, sourceRepo, headSHA)
+				t.Setenv("PATH", ghDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+				t.Setenv("GH_TOKEN", "ambient-must-not-leak")
+				runRecoveryTestDaemon(t, p, d)
+				recovered := waitForRunTerminalState(t, d, run.ID)
+				if tc.wantError != "" {
+					persisted, err := d.GetRun(run.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					recoveredSteps, err := d.GetStepsByRun(run.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					errorText := ""
+					if persisted.Error != nil {
+						errorText = *persisted.Error
+					}
+					if persisted.Status != types.RunFailed || persisted.Error == nil ||
+						!strings.Contains(errorText, "check PR context before ci:") ||
+						!strings.Contains(errorText, tc.wantError) ||
+						!reflect.DeepEqual(persisted.PRStateObservedAt, before.PRStateObservedAt) ||
+						!reflect.DeepEqual(persisted.PRState, before.PRState) ||
+						!reflect.DeepEqual(persisted.PRURL, before.PRURL) ||
+						len(recoveredSteps) != 2 || recoveredSteps[0].Status != types.StepStatusCompleted ||
+						recoveredSteps[1].Status != types.StepStatusFailed ||
+						!reflect.DeepEqual(recoveredSteps[1].Error, persisted.Error) {
+						t.Fatalf("guard refusal changed PR observation or did not fail recovery: run=%+v steps=%+v error=%v", persisted, recoveredSteps, errorText)
+					}
+					logData, err := os.ReadFile(ghLog)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if strings.Contains(string(logData), "pr view") {
+						t.Fatalf("guard refusal reached the live PR state lookup: %s", logData)
+					}
+					return
+				}
+				completed := recovered
+				if completed.Status != types.RunCompleted || completed.AwaitingAgentSince != nil || completed.PRState == nil || *completed.PRState != strings.ToLower(state) {
+					if completed.Error != nil {
+						t.Logf("recovery error: %s", *completed.Error)
+					}
+					t.Fatalf("historical CI gate after %s reconciliation = status %s awaiting %v error %v", state, completed.Status, completed.AwaitingAgentSince, completed.Error)
+				}
+				active, err := lifecycle.ActiveRuns(p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(active) != 0 {
+					t.Fatalf("update guard still sees %d active runs after reconciliation", len(active))
+				}
+				logData, err := os.ReadFile(ghLog)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(string(logData), "pr view "+prURL+" --repo test/repo --json state --jq .state") {
+					t.Fatalf("startup reconciliation did not read current PR state: %s", logData)
+				}
+				if !strings.Contains(string(logData), "env:"+profileDir+" token:") {
+					t.Fatalf("startup reconciliation did not use the recovered forge environment: %s", logData)
+				}
+			})
+		}
 	}
 }
 

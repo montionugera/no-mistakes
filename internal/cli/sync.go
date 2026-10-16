@@ -9,7 +9,7 @@ import (
 	toON "github.com/toon-format/toon-go"
 
 	"github.com/kunchenguid/no-mistakes/internal/branchsync"
-	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/spf13/cobra"
 )
@@ -130,21 +130,7 @@ func newAxiSyncCmd() *cobra.Command {
 }
 
 func openSyncService() (*branchsync.Service, func(), error) {
-	p, d, err := openResources()
-	if err != nil {
-		return nil, nil, err
-	}
-	repo, err := findRepo(d)
-	if err != nil {
-		d.Close()
-		return nil, nil, err
-	}
-	globalCfg, cfgErr := config.LoadGlobal(p.ConfigFile())
-	if cfgErr != nil {
-		d.Close()
-		return nil, nil, cfgErr
-	}
-	return &branchsync.Service{DB: d, Repo: repo, WorkDir: ".", GateDir: p.RepoDir(repo.ID), Paths: p, RemoteTimeout: globalCfg.BranchSyncRemoteTimeout}, func() { _ = d.Close() }, nil
+	return branchsync.OpenCurrent(steps.NewPRStateLookup)
 }
 
 func runHumanSync(cmd *cobra.Command, check, yes bool) error {
@@ -163,7 +149,12 @@ func runHumanSync(cmd *cobra.Command, check, yes bool) error {
 	}
 	defer closeFn()
 
-	state := service.Refresh(cmd.Context())
+	var state branchsync.State
+	if check {
+		state = service.Refresh(cmd.Context())
+	} else {
+		state = service.RefreshForApply(cmd.Context())
+	}
 	observed = state
 	printHumanSyncState(cmd, state)
 	if check {

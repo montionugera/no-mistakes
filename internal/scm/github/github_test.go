@@ -811,21 +811,64 @@ func TestGetPRContentFailsClosedWithoutIdentity(t *testing.T) {
 	}
 }
 
+// A number-only legacy identity is scoped by the repository already held by
+// the host. It must never fall back to gh's current directory or active repo.
 func TestGetPRStatePassesRepoFlag(t *testing.T) {
 	t.Parallel()
-
-	host := New(githubTestCmdFactory(map[string]githubTestResponse{
-		"gh pr view 123 --repo test/repo --json state --jq .state": {
-			stdout: "MERGED\n",
-		},
-	}), nil, "", "test/repo")
-
-	state, err := host.GetPRState(context.Background(), &scm.PR{Number: "123"})
-	if err != nil {
-		t.Fatalf("GetPRState() error = %v", err)
+	for _, tc := range []struct{ name, host, repo string }{
+		{"public", "github.com", "test/repo"},
+		{"enterprise", "ghe.example", "ghe.example/Original/Repo"},
+		{"missing repository", "github.com", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls [][]string
+			host := New(recordingCmdFactory("MERGED\n", &calls), nil, tc.host, tc.repo)
+			state, err := host.GetPRState(context.Background(), &scm.PR{Number: "123"})
+			if tc.repo == "" {
+				if !errors.Is(err, scm.ErrPRIdentity) || state != "" || len(calls) != 0 {
+					t.Fatalf("unscoped number queried forge: state=%q err=%v calls=%v", state, err, calls)
+				}
+				return
+			}
+			if err != nil || state != scm.PRStateMerged || len(calls) != 1 ||
+				strings.Join(calls[0], " ") != "gh pr view 123 --repo "+tc.repo+" --json state --jq .state" {
+				t.Fatalf("number-only lookup lost recorded repository: state=%q err=%v calls=%v", state, err, calls)
+			}
+		})
 	}
-	if state != scm.PRStateMerged {
-		t.Fatalf("GetPRState() = %q, want %q", state, scm.PRStateMerged)
+}
+
+func TestGetPRStateValidatesRecordedIdentity(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name, host, repo, url string
+		valid                 bool
+	}{
+		{"matching", "github.com", "original/repo", "https://github.com/original/repo/pull/42", true},
+		{"case insensitive", "GITHUB.COM", "ORIGINAL/REPO", "https://GitHub.com/Original/Repo/pull/42", true},
+		{"enterprise", "ghe.example", "ghe.example/original/repo", "https://ghe.example/original/repo/pull/42", true},
+		{"owner mismatch", "github.com", "replacement/repo", "https://github.com/original/repo/pull/42", false},
+		{"repository mismatch", "github.com", "original/replacement", "https://github.com/original/repo/pull/42", false},
+		{"host mismatch", "github.com", "original/repo", "https://other.example/original/repo/pull/42", false},
+		{"relative URL", "github.com", "original/repo", "original/repo/pull/42", false},
+		{"malformed URL", "github.com", "original/repo", "https://%/original/repo/pull/42", false},
+		{"invalid PR path", "github.com", "original/repo", "https://github.com/original/repo/issues/42", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls [][]string
+			host := New(recordingCmdFactory("MERGED\n", &calls), nil, tt.host, tt.repo)
+			// A stale number must not override the identity held in the URL.
+			state, err := host.GetPRState(context.Background(), &scm.PR{Number: "99", URL: tt.url})
+			if !tt.valid {
+				if err == nil || state != "" || len(calls) != 0 {
+					t.Fatalf("invalid identity queried forge: state=%q, err=%v, calls=%v", state, err, calls)
+				}
+				return
+			}
+			if err != nil || state != scm.PRStateMerged || len(calls) != 1 || calls[0][3] != tt.url {
+				t.Fatalf("recorded URL not queried: state=%q, err=%v, calls=%v", state, err, calls)
+			}
+		})
 	}
 }
 
@@ -1133,8 +1176,8 @@ func TestPRTargetingReadsFailClosedWithoutIdentity(t *testing.T) {
 	}
 }
 
-// GetPRState and GetMergeableState share the same selector boundary as
-// GetChecks, so a URL-only PR must target the URL there too.
+// URL-only PR reads must target that URL explicitly, after any method-specific
+// identity checks, rather than letting gh infer a branch.
 func TestPRStateAndMergeableTargetKnownPRByURL(t *testing.T) {
 	t.Parallel()
 

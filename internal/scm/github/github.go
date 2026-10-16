@@ -429,6 +429,18 @@ func (h *Host) GetPRState(ctx context.Context, pr *scm.PR) (scm.PRState, error) 
 	if err != nil {
 		return "", err
 	}
+	if pr.URL != "" {
+		if _, err := parsePullRequestURL(pr.URL, h.host, h.repoSlug()); err != nil {
+			return "", fmt.Errorf("%w: %v", scm.ErrPRIdentity, err)
+		}
+		// A number is only unique within one repository. Validate against the
+		// actual host target, then query the recorded URL even if Number is set.
+		selector = strings.TrimSpace(pr.URL)
+	} else if h.repo == "" {
+		// A legacy number-only receipt is safe only within the repository
+		// already recorded on this host, never gh's ambient repository.
+		return "", fmt.Errorf("%w: number-only PR has no recorded repository", scm.ErrPRIdentity)
+	}
 	args := append([]string{"pr", "view", selector}, h.repoArgs()...)
 	args = append(args, "--json", "state", "--jq", ".state")
 	cmd := h.cmd(ctx, "gh", args...)
