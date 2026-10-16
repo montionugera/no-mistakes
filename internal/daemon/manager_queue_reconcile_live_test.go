@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -112,7 +111,8 @@ esac
 	}
 	// This serialized record is the durable acceptance contract, not a mock
 	// of recovery: the pending reconciliation froze ten seconds at acceptance.
-	if err := database.SetStepPendingResponse(row.ID, `{"kind":"reconcile","parked_ms":10000}`, "already answered; waiting for a run slot"); err != nil {
+	pendingMarker := boundPendingFixture(t, database, row.ID, `{"kind":"reconcile","parked_ms":10000}`)
+	if err := database.SetStepPendingResponse(row.ID, pendingMarker, "already answered; waiting for a run slot", databaseGateSnapshot(t, database, row.ID)); err != nil {
 		t.Fatal(err)
 	}
 	// Restore a crash snapshot taken 120 seconds after parking, despite the
@@ -154,7 +154,7 @@ esac
 		t.Fatalf("transient read lost recoverability: %v", err)
 	}
 	persisted, err := database.GetStepResult(row.ID)
-	if err != nil || !persisted.AnsweredWaitingForSlot() || persisted.PendingResponse == nil || *persisted.PendingResponse != `{"kind":"reconcile","parked_ms":10000}` {
+	if err != nil || !persisted.AnsweredWaitingForSlot() || persisted.PendingResponse == nil || *persisted.PendingResponse != pendingMarker {
 		t.Fatalf("transient read consumed the acceptance marker: %+v, %v", persisted, err)
 	}
 	var snapshot ipc.GetRunResult
@@ -166,8 +166,9 @@ esac
 	}
 	wire, _ := json.MarshalIndent(snapshot, "", "  ")
 	t.Logf("get_run during transient forge failure:\n%s\npersisted pending_response: %s", wire, *persisted.PendingResponse)
-	err = client.Call(ipc.MethodRespond, &ipc.RespondParams{RunID: run.ID, Step: types.StepCI, Action: types.ActionApprove}, nil)
-	if err == nil || !strings.Contains(err.Error(), "already answered; waiting for a run slot") {
+	var refusal ipc.RespondResult
+	err = client.Call(ipc.MethodRespond, &ipc.RespondParams{RunID: run.ID, Step: types.StepCI, Action: types.ActionApprove, ExpectedGate: ipcGateSnapshot(t, client, run.ID, types.StepCI)}, &refusal)
+	if err != nil || refusal.OK || refusal.Code != "gate_superseded" {
 		t.Fatalf("second response: %v", err)
 	}
 	t.Logf("second respond refused: %v", err)
@@ -181,7 +182,7 @@ esac
 		t.Fatalf("shutdown lost the retrying parked run: %+v, %v", current, err)
 	}
 	persisted, err = database.GetStepResult(row.ID)
-	if err != nil || persisted.PendingResponse == nil || *persisted.PendingResponse != `{"kind":"reconcile","parked_ms":10000}` {
+	if err != nil || persisted.PendingResponse == nil || *persisted.PendingResponse != pendingMarker {
 		t.Fatalf("shutdown lost the retrying acceptance: %+v, %v", persisted, err)
 	}
 	if _, err := os.Stat(workDir); err != nil {

@@ -154,11 +154,17 @@ func (m Model) respondCmd(action types.ApprovalAction) tea.Cmd {
 			return nil
 		}
 	}
+	var expectedGate *types.GateIdentity
+	if step.Gate != nil {
+		snapshot := *step.Gate
+		expectedGate = &snapshot
+	}
 	return func() tea.Msg {
 		params := &ipc.RespondParams{
-			RunID:  m.runID,
-			Step:   step.StepName,
-			Action: action,
+			ExpectedGate: expectedGate,
+			RunID:        m.runID,
+			Step:         step.StepName,
+			Action:       action,
 		}
 		if action == types.ActionFix {
 			ids := m.selectedFindingIDs(step.StepName)
@@ -204,8 +210,8 @@ func (m Model) respondCmd(action types.ApprovalAction) tea.Cmd {
 			}
 		}
 		if !result.OK {
-			// The daemon refused the response (the gate stays parked): show
-			// what it named rather than silently dropping the keypress.
+			// Show the refusal even if the displayed gate has already been
+			// superseded, rather than silently dropping the keypress.
 			message := result.Refusal
 			if message == "" {
 				message = "the daemon refused the response"

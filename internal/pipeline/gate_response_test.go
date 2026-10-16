@@ -215,7 +215,7 @@ func respondFixStepFindings(t *testing.T) (*Executor, *db.DB, *db.Run, *db.Repo,
 func TestExecutor_FixResponseRefusalLeavesTheGateParked(t *testing.T) {
 	exec, database, run, _, done := respondFixStepFindings(t)
 
-	_, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1"}, nil, nil, nil, "")
+	_, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1"}, nil, nil, nil, "", gateSnapshot(exec))
 	var refusal *RespondRefusal
 	if !errors.As(err, &refusal) {
 		t.Fatalf("err = %v, want a refusal", err)
@@ -224,7 +224,7 @@ func TestExecutor_FixResponseRefusalLeavesTheGateParked(t *testing.T) {
 		t.Fatalf("missing = %v, want [R2 R3]", refusal.Missing)
 	}
 
-	dispositions, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1"}, []string{"R2", "R3"}, nil, nil, "")
+	dispositions, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1"}, []string{"R2", "R3"}, nil, nil, "", gateSnapshot(exec))
 	if err != nil {
 		t.Fatalf("corrected response refused: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestExecutor_FixResponseRefusalLeavesTheGateParked(t *testing.T) {
 		t.Fatalf("dispositions = %+v, want fixed=[R1] ignored=[R2,R3]", dispositions)
 	}
 	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusFixReview)
-	if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+	if err := exec.Respond(types.StepReview, types.ActionApprove, nil, gateSnapshot(exec)); err != nil {
 		t.Fatal(err)
 	}
 	waitExecutorDone(t, done)
@@ -257,7 +257,7 @@ func TestExecutor_FixResponseRefusedWhenEarlierDecisionsAreUnavailable(t *testin
 		t.Fatalf("parked step result id = %q, want %q", parkedID, steps[0].ID)
 	}
 
-	_, err = exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1", "R2", "R3"}, nil, nil, nil, "")
+	_, err = exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1", "R2", "R3"}, nil, nil, nil, "", gateSnapshot(exec))
 	var refusal *RespondRefusal
 	if !errors.As(err, &refusal) {
 		t.Fatalf("err = %v, want a refusal", err)
@@ -271,11 +271,11 @@ func TestExecutor_FixResponseRefusedWhenEarlierDecisionsAreUnavailable(t *testin
 	exec.mu.Lock()
 	exec.waitingStepResultID = parkedID
 	exec.mu.Unlock()
-	if _, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1", "R2", "R3"}, nil, nil, nil, ""); err != nil {
+	if _, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1", "R2", "R3"}, nil, nil, nil, "", gateSnapshot(exec)); err != nil {
 		t.Fatalf("corrected response refused: %v", err)
 	}
 	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusFixReview)
-	if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+	if err := exec.Respond(types.StepReview, types.ActionApprove, nil, gateSnapshot(exec)); err != nil {
 		t.Fatal(err)
 	}
 	waitExecutorDone(t, done)
@@ -287,11 +287,15 @@ func TestExecutor_FixResponseRefusedWhenEarlierDecisionsAreUnavailable(t *testin
 // with a fix response at all.
 func TestExecutor_FixResponseRefusedWhenTheRoundReadFails(t *testing.T) {
 	exec, database, _, _, _ := respondFixStepFindings(t)
+	// The parked row is visible before the executor finishes publishing its
+	// identity. Snapshot under its lock before closing the DB so the injected
+	// failure hits round validation, not the park's identity read.
+	expected := gateSnapshot(exec)
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1", "R2", "R3"}, nil, nil, nil, "")
+	_, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1", "R2", "R3"}, nil, nil, nil, "", expected)
 	var refusal *RespondRefusal
 	if !errors.As(err, &refusal) {
 		t.Fatalf("err = %v, want a refusal", err)
@@ -334,7 +338,7 @@ func TestExecutor_AllIgnoredFixResponseRecordsTheDeclines(t *testing.T) {
 		return nil
 	}
 
-	dispositions, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, nil, []string{"R1", "R2", "R3"}, nil, nil, "")
+	dispositions, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, nil, []string{"R1", "R2", "R3"}, nil, nil, "", gateSnapshot(exec))
 	if err != nil {
 		t.Fatalf("declining every finding must be accepted: %v", err)
 	}
@@ -356,7 +360,7 @@ func TestExecutor_AllIgnoredFixResponseRecordsTheDeclines(t *testing.T) {
 	// them. Without the record it would be refused as unaccounted.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		kept, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, nil, nil, nil, nil, "")
+		kept, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, nil, nil, nil, nil, "", gateSnapshot(exec))
 		if err == nil {
 			if strings.Join(kept.Kept, ",") != "R1,R2,R3" {
 				t.Fatalf("kept = %v, want [R1 R2 R3]", kept.Kept)
@@ -372,7 +376,7 @@ func TestExecutor_AllIgnoredFixResponseRecordsTheDeclines(t *testing.T) {
 	// after this point, so approve once the gate is there.
 	approvalDeadline := time.Now().Add(5 * time.Second)
 	for {
-		err := exec.Respond(types.StepReview, types.ActionApprove, nil)
+		err := exec.Respond(types.StepReview, types.ActionApprove, nil, gateSnapshot(exec))
 		if err == nil {
 			break
 		}
@@ -409,7 +413,7 @@ func TestExecutor_FixResponseNormalizesIDsBeforeDispatchAndPersistence(t *testin
 		t.Fatalf("steps = %+v, %v", steps, err)
 	}
 
-	dispositions, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"  R1  "}, []string{" R2 ", "\tR3"}, nil, nil, "")
+	dispositions, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"  R1  "}, []string{" R2 ", "\tR3"}, nil, nil, "", gateSnapshot(exec))
 	if err != nil {
 		t.Fatalf("a padded selection must be accepted: %v", err)
 	}
@@ -464,7 +468,7 @@ func TestExecutor_FixResponseNormalizesIDsBeforeDispatchAndPersistence(t *testin
 	// End the run: the fix round re-parks, possibly after this point.
 	approvalDeadline := time.Now().Add(5 * time.Second)
 	for {
-		err := exec.Respond(types.StepReview, types.ActionApprove, nil)
+		err := exec.Respond(types.StepReview, types.ActionApprove, nil, gateSnapshot(exec))
 		if err == nil {
 			break
 		}
@@ -493,7 +497,7 @@ func TestExecutor_FixResponseKeepsEarlierDecisionsAndRefusesTheirReversal(t *tes
 		t.Helper()
 		deadline := time.Now().Add(5 * time.Second)
 		for {
-			dispositions, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, selected, ignored, nil, nil, "")
+			dispositions, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, selected, ignored, nil, nil, "", gateSnapshot(exec))
 			if err == nil {
 				return dispositions
 			}
@@ -540,14 +544,14 @@ func TestExecutor_FixResponseKeepsEarlierDecisionsAndRefusesTheirReversal(t *tes
 	refusalDeadline := time.Now().Add(5 * time.Second)
 	var refusal *RespondRefusal
 	for {
-		_, err = exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R2", "R3"}, []string{"R1"}, nil, nil, "")
+		_, err = exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R2", "R3"}, []string{"R1"}, nil, nil, "", gateSnapshot(exec))
 		if errors.As(err, &refusal) {
 			break
 		}
 		if err == nil {
 			t.Fatal("declining a finding an earlier round chose to fix was accepted")
 		}
-		if !strings.Contains(err.Error(), "no step awaiting approval") {
+		if !strings.Contains(err.Error(), "gate already resolved or superseded") {
 			t.Fatalf("unexpected respond error: %v", err)
 		}
 		if time.Now().After(refusalDeadline) {
@@ -583,7 +587,7 @@ func TestExecutor_FixResponseKeepsEarlierDecisionsAndRefusesTheirReversal(t *tes
 	// after this point, so approve once the gate is there.
 	approvalDeadline := time.Now().Add(5 * time.Second)
 	for {
-		err := exec.Respond(types.StepReview, types.ActionApprove, nil)
+		err := exec.Respond(types.StepReview, types.ActionApprove, nil, gateSnapshot(exec))
 		if err == nil {
 			break
 		}
@@ -622,7 +626,7 @@ func TestExecutor_RecoveredGateValidatesAndRecordsTheDecision(t *testing.T) {
 	if _, err := database.InsertReviewStepRound(stepResult.ID, 1, "initial", &findings, nil, "1111111111111111111111111111111111111111", 25); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.UpdateStepStatusWithDuration(stepResult.ID, types.StepStatusAwaitingApproval, 25); err != nil {
+	if err := parkGateFixture(database, stepResult.ID, types.StepStatusAwaitingApproval, 25); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.SetRunAwaitingAgent(run.ID); err != nil {
@@ -653,7 +657,7 @@ func TestExecutor_RecoveredGateValidatesAndRecordsTheDecision(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	refused := false
 	for time.Now().Before(deadline) {
-		_, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1"}, nil, nil, nil, "")
+		_, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1"}, nil, nil, nil, "", gateSnapshot(exec))
 		var refusal *RespondRefusal
 		if errors.As(err, &refusal) {
 			if strings.Join(refusal.Missing, ",") != "R2,R3" {
@@ -662,7 +666,7 @@ func TestExecutor_RecoveredGateValidatesAndRecordsTheDecision(t *testing.T) {
 			refused = true
 			break
 		}
-		if err != nil && !strings.Contains(err.Error(), "no step awaiting approval") {
+		if err != nil && !strings.Contains(err.Error(), "gate already resolved or superseded") {
 			t.Fatalf("unexpected respond error: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -674,7 +678,7 @@ func TestExecutor_RecoveredGateValidatesAndRecordsTheDecision(t *testing.T) {
 	dispositions := RespondDispositions{}
 	sent := false
 	for time.Now().Before(deadline) {
-		dispositions, err = exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1"}, []string{"R2", "R3"}, nil, nil, "")
+		dispositions, err = exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1"}, []string{"R2", "R3"}, nil, nil, "", gateSnapshot(exec))
 		if err == nil {
 			sent = true
 			break
@@ -706,7 +710,7 @@ func TestExecutor_RecoveredGateValidatesAndRecordsTheDecision(t *testing.T) {
 
 	approvalSent := false
 	for time.Now().Before(deadline) {
-		if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err == nil {
+		if err := exec.Respond(types.StepReview, types.ActionApprove, nil, gateSnapshot(exec)); err == nil {
 			approvalSent = true
 			break
 		}
@@ -773,11 +777,16 @@ func TestExecutor_DispositionEchoIncludesNormalizedAdditions(t *testing.T) {
 				t.Fatal(err)
 			}
 			exec.waitingRoundID = round.ID
+			if err := database.ParkStepForApproval(run.ID, sr.ID, types.StepStatusAwaitingApproval, 0, 1, &gate); err != nil {
+				t.Fatal(err)
+			}
+			parked, _ := database.GetStepResult(sr.ID)
+			exec.gate = parked.GateIdentity()
 			var ignored []string
 			if strings.Contains(gate, "existing") {
 				ignored = []string{"user-1"}
 			}
-			got, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, nil, ignored, nil, []types.Finding{{Description: "repair logger"}}, "")
+			got, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, nil, ignored, nil, []types.Finding{{Description: "repair logger"}}, "", gateSnapshot(exec))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -832,7 +841,7 @@ func TestExecutor_AddedFindingCannotTakeADeclinedGateFindingID(t *testing.T) {
 	<-contexts // the parking round
 
 	added := []types.Finding{{ID: " lint-2 ", Severity: "warning", Description: "independent user-added fix"}}
-	dispositions, err := exec.RespondWithOverrides(types.StepLint, types.ActionFix, []string{"lint-1"}, []string{"lint-2"}, nil, added, "")
+	dispositions, err := exec.RespondWithOverrides(types.StepLint, types.ActionFix, []string{"lint-1"}, []string{"lint-2"}, nil, added, "", gateSnapshot(exec))
 	if err != nil {
 		t.Fatalf("response refused: %v", err)
 	}
@@ -893,7 +902,7 @@ dispatched:
 recorded:
 	approvalDeadline := time.Now().Add(5 * time.Second)
 	for {
-		if err := exec.Respond(types.StepLint, types.ActionApprove, nil); err == nil {
+		if err := exec.Respond(types.StepLint, types.ActionApprove, nil, gateSnapshot(exec)); err == nil {
 			break
 		} else if time.Now().After(approvalDeadline) {
 			t.Fatalf("gate never accepted approval: %v", err)
@@ -948,7 +957,7 @@ func TestExecutor_FixResponseRefusedWhenAStoredDecisionCannotBeDecoded(t *testin
 		t.Fatal(err)
 	}
 
-	_, err = exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1"}, []string{"R2", "R3"}, nil, nil, "")
+	_, err = exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1"}, []string{"R2", "R3"}, nil, nil, "", gateSnapshot(exec))
 	var refusal *RespondRefusal
 	if !errors.As(err, &refusal) {
 		t.Fatalf("err = %v, want a refusal: an undecodable stored decision is unreadable state", err)
@@ -963,12 +972,12 @@ func TestExecutor_FixResponseRefusedWhenAStoredDecisionCannotBeDecoded(t *testin
 	if err := database.SetStepRoundUserDecision(rounds[0].ID, &restored, db.RoundSelectionSourceUser, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1"}, []string{"R2", "R3"}, nil, nil, ""); err != nil {
+	if _, err := exec.RespondWithOverrides(types.StepReview, types.ActionFix, []string{"R1"}, []string{"R2", "R3"}, nil, nil, "", gateSnapshot(exec)); err != nil {
 		t.Fatalf("the still-parked gate refused the response once its history decoded: %v", err)
 	}
 	approvalDeadline := time.Now().Add(5 * time.Second)
 	for {
-		if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err == nil {
+		if err := exec.Respond(types.StepReview, types.ActionApprove, nil, gateSnapshot(exec)); err == nil {
 			break
 		} else if time.Now().After(approvalDeadline) {
 			t.Fatalf("gate never accepted approval: %v", err)

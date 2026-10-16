@@ -71,6 +71,7 @@ func (e *Executor) acquireSlot(ctx context.Context) error {
 // run is waiting for a run slot. It carries everything dispatch needs, so a
 // daemon that stops during the wait can re-apply the response after a restart.
 type pendingGateResponse struct {
+	Gate             types.GateIdentity   `json:"gate"`
 	ParkedMS         *int64               `json:"parked_ms,omitempty"`
 	Kind             string               `json:"kind,omitempty"`
 	Action           types.ApprovalAction `json:"action,omitempty"`
@@ -82,8 +83,8 @@ type pendingGateResponse struct {
 	AcceptedGaps     *db.AcceptedGaps     `json:"accepted_gaps,omitempty"`
 }
 
-func encodePendingResponse(r *approvalResponse, parkedMS int64) (string, error) {
-	p := pendingGateResponse{Kind: "reconcile", ParkedMS: &parkedMS}
+func encodePendingResponse(r *approvalResponse, parkedMS int64, gate types.GateIdentity) (string, error) {
+	p := pendingGateResponse{Gate: gate, Kind: "reconcile", ParkedMS: &parkedMS}
 	if r != nil {
 		p.Kind = ""
 		p.Action = r.action
@@ -98,10 +99,13 @@ func encodePendingResponse(r *approvalResponse, parkedMS int64) (string, error) 
 	return string(raw), err
 }
 
-func decodePendingResponse(raw string) (*approvalResponse, *int64, error) {
+func decodePendingResponse(raw string, current types.GateIdentity) (*approvalResponse, *int64, error) {
 	var p pendingGateResponse
 	if err := json.Unmarshal([]byte(raw), &p); err != nil {
 		return nil, nil, fmt.Errorf("decode recorded gate response: %w", err)
+	}
+	if !p.Gate.SameGate(current) {
+		return nil, nil, &GateSupersededError{Current: current}
 	}
 	if p.Kind == "reconcile" {
 		return nil, p.ParkedMS, nil
@@ -112,6 +116,7 @@ func decodePendingResponse(raw string) (*approvalResponse, *int64, error) {
 		return nil, nil, fmt.Errorf("recorded gate response has unusable action %q", p.Action)
 	}
 	return &approvalResponse{
+		gate:             p.Gate,
 		action:           p.Action,
 		findingIDs:       p.FindingIDs,
 		ignoreFindingIDs: p.IgnoreFindingIDs,
@@ -148,6 +153,14 @@ func (e *Executor) acceptApprovalGate(resp *approvalResponse) error {
 	if row == nil {
 		return fmt.Errorf("cannot read the parked step")
 	}
+	current := row.GateIdentity()
+	expected := e.currentGateLocked()
+	if resp != nil {
+		expected = resp.gate
+	}
+	if !expected.SameGate(current) || (row.Status != types.StepStatusAwaitingApproval && row.Status != types.StepStatusFixReview) || row.PendingResponse != nil {
+		return &GateSupersededError{Current: current}
+	}
 	run, err := e.db.GetRun(row.RunID)
 	if err != nil {
 		return err
@@ -162,15 +175,15 @@ func (e *Executor) acceptApprovalGate(resp *approvalResponse) error {
 	if e.slot == nil {
 		// No daemon, no run slots: nothing can make dispatch wait, so the step
 		// moves at once (embeddings and focused tests).
-		if err := e.db.ResumeStepFromApproval(run.ID, row.ID, "gate resumed", parkedMS); err != nil {
+		if err := e.db.ResumeStepFromApproval(run.ID, row.ID, "gate resumed", parkedMS, current); err != nil {
 			return fmt.Errorf("resume answered gate: %w", err)
 		}
 	} else {
-		raw, err := encodePendingResponse(resp, parkedMS)
+		raw, err := encodePendingResponse(resp, parkedMS, current)
 		if err != nil {
 			return fmt.Errorf("record gate response: %w", err)
 		}
-		if err := e.db.SetStepPendingResponse(row.ID, raw, answeredActivity); err != nil {
+		if err := e.db.SetStepPendingResponse(row.ID, raw, answeredActivity, current); err != nil {
 			return err
 		}
 		e.slot.Reserve()
@@ -213,16 +226,21 @@ func (e *Executor) endGateWait(runID string, parkStart time.Time, waitErr error)
 // then begins dispatch: the step moves to running and the pending response and
 // awaiting-agent marker are cleared together. Until then the gate stays
 // recoverable.
-func (e *Executor) acquireAnsweredGateSlot(ctx context.Context, runID, stepID string) error {
-	if e.slot == nil {
-		return nil
-	}
+func (e *Executor) acquireAnsweredGateSlot(ctx context.Context, runID, stepID string, expected types.GateIdentity) (err error) {
 	e.mu.Lock()
 	parkedMS := e.answeredParkedMS
+	pending := e.slotWaitStep != ""
 	e.mu.Unlock()
 	defer func() {
 		e.mu.Lock()
-		e.slotWaitStep = ""
+		if expected.SameGate(e.gate) {
+			if err != nil && !errors.Is(err, ErrParkedAtShutdown) && !errors.Is(err, ErrDaemonShutdown) {
+				if dbErr := e.db.CompleteRunAwaitingAgent(runID, parkedMS); dbErr != nil {
+					slog.Warn("failed to complete awaiting-agent state in db", "run", runID, "error", dbErr)
+				}
+			}
+			e.slotWaitStep = ""
+		}
 		e.mu.Unlock()
 	}()
 	if err := e.acquireSlot(ctx); err != nil {
@@ -231,17 +249,37 @@ func (e *Executor) acquireAnsweredGateSlot(ctx context.Context, runID, stepID st
 		if errors.Is(err, ErrDaemonShutdown) {
 			return ErrParkedAtShutdown
 		}
-		if dbErr := e.db.CompleteRunAwaitingAgent(runID, parkedMS); dbErr != nil {
-			slog.Warn("failed to complete awaiting-agent state in db", "run", runID, "error", dbErr)
-		}
 		return err
 	}
-	if err := e.db.ResumeStepFromApproval(runID, stepID, "gate resumed", parkedMS); err != nil {
-		// The caller fails the step and the run; the run must not stay
-		// durably marked as parked, and the accepted gate's wait still counts.
-		if dbErr := e.db.CompleteRunAwaitingAgent(runID, parkedMS); dbErr != nil {
-			slog.Warn("failed to complete awaiting-agent state in db", "run", runID, "error", dbErr)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// Cancellation may race a capacity grant. Never dispatch an accepted
+	// response after abort, even when Acquire returned a slot successfully.
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if !expected.SameGate(e.gate) {
+		return &GateSupersededError{Current: e.gate}
+	}
+	row, err := e.db.GetStepResult(stepID)
+	if err != nil {
+		return err
+	}
+	if row == nil {
+		return fmt.Errorf("cannot read answered gate")
+	}
+	if !expected.SameGate(row.GateIdentity()) || (pending && (row.PendingResponse == nil || (row.Status != types.StepStatusAwaitingApproval && row.Status != types.StepStatusFixReview))) {
+		return &GateSupersededError{Current: row.GateIdentity()}
+	}
+	if row.PendingResponse != nil {
+		if _, _, err := decodePendingResponse(*row.PendingResponse, row.GateIdentity()); err != nil {
+			return err
 		}
+	}
+	if e.slot == nil {
+		return nil
+	}
+	if err := e.db.ResumeStepFromApproval(runID, stepID, "gate resumed", parkedMS, expected); err != nil {
 		return fmt.Errorf("resume answered gate: %w", err)
 	}
 	return nil

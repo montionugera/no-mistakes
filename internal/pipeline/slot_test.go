@@ -192,7 +192,7 @@ func TestExecutorAbortDoesNotWaitForOccupiedSlot(t *testing.T) {
 				if _, err := database.InsertReviewStepRound(sr.ID, 1, "initial", &findings, nil, run.HeadSHA, 1); err != nil {
 					t.Fatal(err)
 				}
-				if err := database.UpdateStepStatusWithDuration(sr.ID, types.StepStatusAwaitingApproval, 1); err != nil {
+				if err := parkGateFixture(database, sr.ID, types.StepStatusAwaitingApproval, 1); err != nil {
 					t.Fatal(err)
 				}
 				if err := database.SetRunAwaitingAgent(run.ID); err != nil {
@@ -229,7 +229,7 @@ func TestExecutorAbortDoesNotWaitForOccupiedSlot(t *testing.T) {
 				time.Sleep(time.Millisecond)
 			}
 			beforeAcquire, beforeGuard := slot.acquires.Load(), guards.Load()
-			if err := exec.Respond(types.StepReview, types.ActionAbort, nil); err != nil {
+			if err := exec.Respond(types.StepReview, types.ActionAbort, nil, nil); err != nil {
 				t.Fatal(err)
 			}
 			select {
@@ -292,7 +292,7 @@ func TestExecutor_YieldsSlotWhileParkedAndReacquiresOnResponse(t *testing.T) {
 	if got := slot.log(); len(got) != 2 || got[0] != "acquire" || got[1] != "yield" {
 		t.Fatalf("slot events while parked = %v, want [acquire yield] (taken for the step, yielded at the gate)", got)
 	}
-	if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+	if err := exec.Respond(types.StepReview, types.ActionApprove, nil, gateSnapshot(exec)); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -332,7 +332,7 @@ func TestExecutor_FailsRunWhenSlotWaitIsCancelled(t *testing.T) {
 	slot.mu.Lock()
 	slot.acquireOK = cancelled
 	slot.mu.Unlock()
-	if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+	if err := exec.Respond(types.StepReview, types.ActionApprove, nil, gateSnapshot(exec)); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -536,7 +536,7 @@ func TestExecutorAnsweredGateWaitsAsRunning(t *testing.T) {
 				for len(events) > 0 {
 					<-events
 				}
-				if err := exec.Respond(types.StepReview, action, nil); err != nil {
+				if err := exec.Respond(types.StepReview, action, nil, gateSnapshot(exec)); err != nil {
 					t.Fatal(err)
 				}
 				select {
@@ -564,7 +564,7 @@ func TestExecutorAnsweredGateWaitsAsRunning(t *testing.T) {
 				if current.AwaitingAgentSince == nil {
 					t.Fatal("answered gate lost its parked marker before dispatch; a restart could not recover it")
 				}
-				if err := exec.Respond(types.StepReview, action, nil); err == nil || !strings.Contains(err.Error(), "already answered; waiting for a run slot") {
+				if err := exec.Respond(types.StepReview, action, nil, gateSnapshot(exec)); err == nil || !strings.Contains(err.Error(), "gate already resolved or superseded") {
 					t.Fatalf("second response: %v", err)
 				}
 				select {
@@ -675,7 +675,7 @@ func TestExecutorParkPublicationPrecedesAcceptedResponse(t *testing.T) {
 				defer func() { unblock(); cancel(); <-done }()
 				if !recovered && parkedStatus == types.StepStatusFixReview {
 					waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
-					if err := exec.Respond(types.StepReview, types.ActionFix, nil); err != nil {
+					if err := exec.Respond(types.StepReview, types.ActionFix, nil, gateSnapshot(exec)); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -688,7 +688,7 @@ func TestExecutorParkPublicationPrecedesAcceptedResponse(t *testing.T) {
 				responseDone := make(chan error, 1)
 				go func() {
 					close(attempted)
-					responseDone <- exec.Respond(types.StepReview, types.ActionApprove, nil)
+					responseDone <- exec.Respond(types.StepReview, types.ActionApprove, nil, gateSnapshot(exec))
 				}()
 				<-attempted
 				select {
@@ -754,7 +754,7 @@ func TestExecutorReconciliationWaitsDurablyForCapacity(t *testing.T) {
 				if err := database.ParkStepForApproval(run.ID, row.ID, status, 0, 1, &findings); err != nil {
 					t.Fatal(err)
 				}
-				if err := database.SetStepPendingResponse(row.ID, `{"kind":"reconcile"}`, answeredActivity); err != nil {
+				if err := database.SetStepPendingResponse(row.ID, boundPendingFixture(t, database, row.ID, `{"kind":"reconcile"}`), answeredActivity, databaseGateSnapshot(t, database, row.ID)); err != nil {
 					t.Fatal(err)
 				}
 				run, err = database.GetRun(run.ID)
@@ -807,7 +807,7 @@ func TestExecutorReconciliationWaitsDurablyForCapacity(t *testing.T) {
 			if status != "" && step.calls.Load() != 0 {
 				t.Fatal("recovered reconciliation ran before admission")
 			}
-			if err := exec.Respond(types.StepCI, types.ActionApprove, nil); err == nil || !strings.Contains(err.Error(), answeredActivity) {
+			if err := exec.Respond(types.StepCI, types.ActionApprove, nil, gateSnapshot(exec)); err == nil || !strings.Contains(err.Error(), "gate already resolved or superseded") {
 				t.Fatalf("repeat response = %v", err)
 			}
 			release()
@@ -833,10 +833,20 @@ func TestExecutorReconciliationWaitsDurablyForCapacity(t *testing.T) {
 	}
 }
 
+type acquisitionHookSlot struct {
+	recordingSlot
+	onAcquire func()
+}
+
+func (s *acquisitionHookSlot) Acquire(ctx context.Context) error {
+	s.onAcquire()
+	return s.recordingSlot.Acquire(ctx)
+}
+
 func TestRecoveredGateKeepsAcceptanceParkedDuration(t *testing.T) {
 	for _, reconcile := range []bool{false, true} {
-		for _, cancelled := range []bool{false, true} {
-			t.Run(fmt.Sprintf("reconcile=%t/cancelled=%t", reconcile, cancelled), func(t *testing.T) {
+		for _, cancellation := range []string{"none", "before-resume", "on-acquire"} {
+			t.Run(fmt.Sprintf("reconcile=%t/cancellation=%s", reconcile, cancellation), func(t *testing.T) {
 				database, p, run, repo := setupTest(t)
 				workDir := completionFixture(t, database, run)
 				if err := database.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
@@ -862,10 +872,12 @@ func TestRecoveredGateKeepsAcceptanceParkedDuration(t *testing.T) {
 				original.SetRunSlot(&recordingSlot{})
 				original.waitingStep = types.StepCI
 				original.waitingStepResultID = row.ID
+				parked, _ := database.GetStepResult(row.ID)
+				original.gate = parked.GateIdentity()
 				original.waitingSince = time.Now().Add(-10 * time.Second)
 				var response *approvalResponse
 				if !reconcile {
-					response = &approvalResponse{action: types.ActionApprove}
+					response = &approvalResponse{action: types.ActionApprove, gate: original.gate}
 				}
 				original.mu.Lock()
 				err = original.acceptApprovalGate(response)
@@ -891,12 +903,18 @@ func TestRecoveredGateKeepsAcceptanceParkedDuration(t *testing.T) {
 				run.AwaitingAgentSince = &parkedAt
 				recovered := NewExecutor(database, p, nil, nil, []Step{step}, nil)
 				recovered.SetRunSlot(&recordingSlot{})
-				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
-				if cancelled {
-					cancel()
+				ctx, cancel := context.WithCancelCause(context.Background())
+				defer cancel(context.Canceled)
+				if cancellation == "before-resume" {
+					cancel(errors.New(types.RunCancelReasonAbortedByUser))
+				}
+				if cancellation == "on-acquire" {
+					recovered.SetRunSlot(&acquisitionHookSlot{onAcquire: func() {
+						cancel(errors.New(types.RunCancelReasonAbortedByUser))
+					}})
 				}
 				err = recovered.Resume(ctx, run, repo, workDir)
+				cancelled := cancellation != "none"
 				if (err != nil) != cancelled {
 					t.Fatalf("Resume error = %v, cancelled = %t", err, cancelled)
 				}

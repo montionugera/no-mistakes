@@ -113,10 +113,10 @@ func TestShippingNoSurfaceManagerAdmission(t *testing.T) {
 						if err := database.StartStep(sr.ID); err != nil {
 							t.Fatal(err)
 						}
-						if err := database.ParkStepForApproval(run.ID, sr.ID, types.StepStatusAwaitingApproval, exit, 10, &raw); err != nil {
+						if _, err := database.InsertStepRound(sr.ID, 1, "initial", &raw, nil, 10); err != nil {
 							t.Fatal(err)
 						}
-						if _, err := database.InsertStepRound(sr.ID, 1, "initial", &raw, nil, 10); err != nil {
+						if err := database.ParkStepForApproval(run.ID, sr.ID, types.StepStatusAwaitingApproval, exit, 10, &raw); err != nil {
 							t.Fatal(err)
 						}
 						run, err = database.GetRun(run.ID)
@@ -159,7 +159,7 @@ func TestShippingNoSurfaceManagerAdmission(t *testing.T) {
 							t.Fatal(err)
 						}
 					}
-					_, err = manager.HandleRespondWithOverrides(run.ID, types.StepTest, types.ActionApprove, nil, nil, nil, nil, reason)
+					_, err = manager.HandleRespondWithOverrides(run.ID, types.StepTest, types.ActionApprove, nil, nil, nil, nil, reason, managerGateSnapshot(t, manager, run.ID, types.StepTest))
 					if kind == "genuine" {
 						if err != nil {
 							t.Fatalf("genuine no-surface acknowledgment refused: %v", err)
@@ -181,7 +181,7 @@ func TestShippingNoSurfaceManagerAdmission(t *testing.T) {
 						if err == nil {
 							t.Fatal("invalid no-surface acknowledgment accepted by manager")
 						}
-						if _, err := executor.RespondWithOverrides(types.StepTest, types.ActionApprove, nil, nil, nil, nil, reason); err == nil {
+						if _, err := executor.RespondWithOverrides(types.StepTest, types.ActionApprove, nil, nil, nil, nil, reason, gateSnapshot(executor)); err == nil {
 							t.Fatal("invalid acknowledgment accepted by executor")
 						}
 						got, err := database.GetStepResult(parked.ID)
@@ -191,7 +191,7 @@ func TestShippingNoSurfaceManagerAdmission(t *testing.T) {
 						if got.Status != types.StepStatusAwaitingApproval || got.ApprovalReason != nil {
 							t.Fatalf("refusal changed durable gate: %+v", got)
 						}
-						if err := executor.Respond(types.StepTest, types.ActionAbort, nil); err != nil {
+						if err := executor.Respond(types.StepTest, types.ActionAbort, nil, nil); err != nil {
 							t.Fatal(err)
 						}
 						<-done

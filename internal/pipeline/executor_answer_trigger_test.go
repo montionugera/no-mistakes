@@ -49,7 +49,7 @@ func TestExecutor_RecoveredAnswerRoundIsTriggeredAsAnAnswer(t *testing.T) {
 	if _, err := database.InsertReviewStepRound(stepResult.ID, 1, "initial", &findings, nil, "", 25); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.UpdateStepStatusWithDuration(stepResult.ID, types.StepStatusAwaitingApproval, 25); err != nil {
+	if err := parkGateFixture(database, stepResult.ID, types.StepStatusAwaitingApproval, 25); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.SetRunAwaitingAgent(run.ID); err != nil {
@@ -82,7 +82,7 @@ func TestExecutor_RecoveredAnswerRoundIsTriggeredAsAnAnswer(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if err := exec.Respond(types.StepReview, types.ActionAnswer, nil); err == nil {
+		if err := exec.Respond(types.StepReview, types.ActionAnswer, nil, gateSnapshot(exec)); err == nil {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -142,7 +142,7 @@ func TestExecutor_AnswerActionIsRefusedForAnyStepButReview(t *testing.T) {
 	go func() { done <- exec.Execute(context.Background(), run, repo, completionDir) }()
 	waitForStepStatus(t, database, run.ID, types.StepDocument, types.StepStatusAwaitingApproval)
 
-	if err := exec.Respond(types.StepDocument, types.ActionAnswer, nil); err != nil {
+	if err := exec.Respond(types.StepDocument, types.ActionAnswer, nil, gateSnapshot(exec)); err != nil {
 		t.Fatalf("Respond() error = %v", err)
 	}
 
@@ -218,7 +218,7 @@ func TestExecutor_RecoveredAnswerRoundInheritsAFixReviewGatesContext(t *testing.
 	if _, err := database.InsertReviewStepRound(stepResult.ID, 2, "auto_fix", &findings, nil, "", 30); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.UpdateStepStatusWithDuration(stepResult.ID, types.StepStatusFixReview, 30); err != nil {
+	if err := parkGateFixture(database, stepResult.ID, types.StepStatusFixReview, 30); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.SetRunAwaitingAgent(run.ID); err != nil {
@@ -251,7 +251,7 @@ func TestExecutor_RecoveredAnswerRoundInheritsAFixReviewGatesContext(t *testing.
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if err := exec.Respond(types.StepReview, types.ActionAnswer, nil); err == nil {
+		if err := exec.Respond(types.StepReview, types.ActionAnswer, nil, gateSnapshot(exec)); err == nil {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -336,7 +336,7 @@ func TestExecutor_RecoveredAnswerRoundKeepsTheOutstandingFindings(t *testing.T) 
 	if _, err := database.InsertReviewStepRound(stepResult.ID, 2, "auto_fix", &findings, &selected, "", 30); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.UpdateStepStatusWithDuration(stepResult.ID, types.StepStatusFixReview, 30); err != nil {
+	if err := parkGateFixture(database, stepResult.ID, types.StepStatusFixReview, 30); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.SetRunAwaitingAgent(run.ID); err != nil {
@@ -369,7 +369,7 @@ func TestExecutor_RecoveredAnswerRoundKeepsTheOutstandingFindings(t *testing.T) 
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if err := exec.Respond(types.StepReview, types.ActionAnswer, nil); err == nil {
+		if err := exec.Respond(types.StepReview, types.ActionAnswer, nil, gateSnapshot(exec)); err == nil {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -394,7 +394,7 @@ func TestExecutor_RecoveredAnswerRoundKeepsTheOutstandingFindings(t *testing.T) 
 		t.Fatalf("the recovered answer round dropped the outstanding findings: %+v", got)
 	}
 
-	if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+	if err := exec.Respond(types.StepReview, types.ActionApprove, nil, gateSnapshot(exec)); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 	select {

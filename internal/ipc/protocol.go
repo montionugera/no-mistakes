@@ -289,6 +289,9 @@ type SubscribeParams struct {
 // already decided it, and the daemon refuses the response (leaving the gate
 // parked) when one is left out. An omission is never a decline.
 type RespondParams struct {
+	// ExpectedGate is required for every action except abort. Missing or stale
+	// bindings return gate_superseded with CurrentGate, without admission.
+	ExpectedGate     *types.GateIdentity  `json:"expected_gate"`
 	RunID            string               `json:"run_id"`
 	Step             types.StepName       `json:"step"`
 	Action           types.ApprovalAction `json:"action"`
@@ -424,16 +427,19 @@ type RerunResult struct {
 // instead of two rounds later. Kept names the findings the response omitted
 // that an earlier round of the same step had already decided.
 //
-// A refusal is a result rather than a transport error because it is not a
-// transport failure: the gate is intact, the caller's response was wrong, and
-// the caller can correct it. Refusal is non-empty exactly when OK is false.
+// A refusal is a result rather than a transport error: no action was admitted.
+// For gate_superseded, CurrentGate describes the current or last gate with its
+// current status; the caller must re-read state before deciding on a response.
+// Refusal is non-empty exactly when OK is false.
 type RespondResult struct {
-	OK      bool     `json:"ok"`
-	Fixed   []string `json:"fixed,omitempty"`
-	Ignored []string `json:"ignored,omitempty"`
-	Kept    []string `json:"kept,omitempty"`
-	Refusal string   `json:"refusal,omitempty"`
-	Missing []string `json:"missing,omitempty"`
+	Code        string              `json:"code,omitempty"`
+	CurrentGate *types.GateIdentity `json:"current_gate,omitempty"`
+	OK          bool                `json:"ok"`
+	Fixed       []string            `json:"fixed,omitempty"`
+	Ignored     []string            `json:"ignored,omitempty"`
+	Kept        []string            `json:"kept,omitempty"`
+	Refusal     string              `json:"refusal,omitempty"`
+	Missing     []string            `json:"missing,omitempty"`
 	// DeclinedEarlierFix names the findings the response tried to decline that
 	// an earlier round of the same step already chose to fix. Reverting an
 	// applied fix is out of scope for a gate response, so the response was
@@ -455,15 +461,10 @@ type AnswerReviewQuestionParams struct {
 }
 
 // AnswerReviewQuestionResult reports what the recorded answer did. Open counts
-// the questions still unanswered after it, and Resumed is true when that count
-// reached zero and the reviewer's own session was resumed to finish its pass.
-// Resumed false with Open zero covers TWO cases, and Note distinguishes them:
-// the reviewer is still working and reads the answer at its next checkpoint, so
-// there is no gate to release; or this answer closed no question that was open
-// before it was appended - an id nobody asked, or a correction sent after the
-// last question was already answered - in which case it is recorded durably and
-// deliberately releases nothing, because the gate may be parked on ordinary
-// findings that are the operator's to answer.
+// the questions still unanswered. Resumed reports acceptance of this handler's
+// gate-bound release, not whether another path resumed the reviewer. Note
+// explains why a recorded answer released no gate. Answer delivery is owned by
+// docs/src/content/docs/concepts/review-conversation.md.
 type AnswerReviewQuestionResult struct {
 	OK      bool     `json:"ok"`
 	Open    int      `json:"open"`
@@ -471,11 +472,9 @@ type AnswerReviewQuestionResult struct {
 	Resumed bool     `json:"resumed"`
 	// ClosedLast is true when this answer closed the last question that was
 	// open before it, whether or not a parked gate was there to release yet.
-	// It tells the caller the run is moving again because of this answer, so
-	// the caller follows it to the next decision point exactly as
-	// `axi respond` does. Resumed alone cannot say that: an answer that lands
-	// before the park registers resumes nothing itself, and the gate's own
-	// resumer releases that park when it registers.
+	// It makes the caller follow the run to its next decision point even if
+	// this handler's release was superseded or no gate had registered yet.
+	// Resumed alone cannot cover those cases.
 	ClosedLast bool   `json:"closed_last,omitempty"`
 	Note       string `json:"note,omitempty"`
 }
@@ -582,13 +581,14 @@ const WorkScopeDocumentLintHousekeeping = "document+lint housekeeping"
 
 // StepResultInfo is the IPC representation of a step result.
 type StepResultInfo struct {
-	ID         string           `json:"id"`
-	RunID      string           `json:"run_id"`
-	StepName   types.StepName   `json:"step_name"`
-	StepOrder  int              `json:"step_order"`
-	Status     types.StepStatus `json:"status"`
-	ExitCode   *int             `json:"exit_code,omitempty"`
-	DurationMS *int64           `json:"duration_ms,omitempty"`
+	Gate       *types.GateIdentity `json:"gate,omitempty"`
+	ID         string              `json:"id"`
+	RunID      string              `json:"run_id"`
+	StepName   types.StepName      `json:"step_name"`
+	StepOrder  int                 `json:"step_order"`
+	Status     types.StepStatus    `json:"status"`
+	ExitCode   *int                `json:"exit_code,omitempty"`
+	DurationMS *int64              `json:"duration_ms,omitempty"`
 	// WorkScope names shared work whose wall time is recorded on this logical
 	// step. For example, the document step can own one combined document+lint
 	// housekeeping invocation while lint only records the cached handoff.
@@ -650,21 +650,22 @@ const (
 
 // Event is a real-time update sent to subscribers.
 type Event struct {
-	Type             EventType       `json:"type"`
-	RunID            string          `json:"run_id"`
-	RepoID           string          `json:"repo_id"`
-	StepName         *types.StepName `json:"step_name,omitempty"`
-	Status           *string         `json:"status,omitempty"`
-	Error            *string         `json:"error,omitempty"`
-	Stream           *string         `json:"stream,omitempty"`
-	Content          *string         `json:"content,omitempty"`
-	Branch           *string         `json:"branch,omitempty"`
-	Findings         *string         `json:"findings,omitempty"` // JSON-encoded findings for step_completed events
-	ReportedFindings *int            `json:"reported_findings,omitempty"`
-	FixedFindings    *int            `json:"fixed_findings,omitempty"`
-	DurationMS       *int64          `json:"duration_ms,omitempty"` // execution-only duration for step events
-	WorkScope        string          `json:"work_scope,omitempty"`  // shared work attributed to this step
-	PRURL            *string         `json:"pr_url,omitempty"`      // PR URL for run_updated/run_completed events
+	Gate             *types.GateIdentity `json:"gate,omitempty"`
+	Type             EventType           `json:"type"`
+	RunID            string              `json:"run_id"`
+	RepoID           string              `json:"repo_id"`
+	StepName         *types.StepName     `json:"step_name,omitempty"`
+	Status           *string             `json:"status,omitempty"`
+	Error            *string             `json:"error,omitempty"`
+	Stream           *string             `json:"stream,omitempty"`
+	Content          *string             `json:"content,omitempty"`
+	Branch           *string             `json:"branch,omitempty"`
+	Findings         *string             `json:"findings,omitempty"` // JSON-encoded findings for step_completed events
+	ReportedFindings *int                `json:"reported_findings,omitempty"`
+	FixedFindings    *int                `json:"fixed_findings,omitempty"`
+	DurationMS       *int64              `json:"duration_ms,omitempty"` // execution-only duration for step events
+	WorkScope        string              `json:"work_scope,omitempty"`  // shared work attributed to this step
+	PRURL            *string             `json:"pr_url,omitempty"`      // PR URL for run_updated/run_completed events
 	// StateRev is the daemon-assigned monotonic revision of the run state
 	// this event reflects, or zero for activity. A consumer applies a state
 	// delta only when StateRev exceeds the revision it has already applied,

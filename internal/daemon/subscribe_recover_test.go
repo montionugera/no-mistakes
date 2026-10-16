@@ -77,8 +77,7 @@ subscribeNow:
 	err = client.Call(ipc.MethodRespond, &ipc.RespondParams{
 		RunID:  pushResult.RunID,
 		Step:   types.StepReview,
-		Action: types.ActionApprove,
-	}, &respondResult)
+		Action: types.ActionApprove, ExpectedGate: ipcGateSnapshot(t, client, pushResult.RunID, types.StepReview)}, &respondResult)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -500,7 +499,7 @@ func TestRecoverOnStartup_ResumesParkedRun(t *testing.T) {
 	if _, err := d.InsertReviewStepRound(step.ID, 1, "initial", &findings, nil, headSHA, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.UpdateStepStatusWithDuration(step.ID, types.StepStatusAwaitingApproval, 1); err != nil {
+	if err := parkGateFixture(d, step.ID, types.StepStatusAwaitingApproval, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.SetRunAwaitingAgent(run.ID); err != nil {
@@ -550,10 +549,9 @@ func TestRecoverOnStartup_ResumesParkedRun(t *testing.T) {
 			err = client.Call(ipc.MethodRespond, &ipc.RespondParams{
 				RunID:  run.ID,
 				Step:   types.StepReview,
-				Action: types.ActionApprove,
-			}, &response)
+				Action: types.ActionApprove, ExpectedGate: ipcGateSnapshot(t, client, run.ID, types.StepReview)}, &response)
 			_ = client.Close()
-			if err == nil {
+			if err == nil && response.OK {
 				break
 			}
 			lastErr = err
@@ -700,7 +698,7 @@ func TestRecoverOnStartup_ReconcilesHistoricalCIGateFromCurrentPRState(t *testin
 				if _, err := d.InsertStepRound(step.ID, 1, "initial", &findings, nil, 1); err != nil {
 					t.Fatal(err)
 				}
-				if err := d.UpdateStepStatusWithDuration(step.ID, types.StepStatusAwaitingApproval, 1); err != nil {
+				if err := parkGateFixture(d, step.ID, types.StepStatusAwaitingApproval, 1); err != nil {
 					t.Fatal(err)
 				}
 				if err := d.SetRunAwaitingAgent(run.ID); err != nil {

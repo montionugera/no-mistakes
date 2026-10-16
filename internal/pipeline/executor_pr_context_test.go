@@ -81,7 +81,9 @@ func TestExecutorParkedApprovalRevalidatesPRTargetBeforeFinalStepCompletes(t *te
 	executor = NewExecutor(database, p, nil, nil, steps, func(event ipc.Event) {
 		if event.Type == ipc.EventStepCompleted && event.StepName != nil && *event.StepName == types.StepReview &&
 			event.Status != nil && *event.Status == string(types.StepStatusAwaitingApproval) {
-			go func() { responseDone <- executor.Respond(types.StepReview, types.ActionApprove, nil) }()
+			go func() {
+				responseDone <- executor.Respond(types.StepReview, types.ActionApprove, nil, gateSnapshot(executor))
+			}()
 		}
 	})
 	checks := 0
@@ -848,7 +850,7 @@ func TestExecutorRecoveredApprovalRevalidatesMovedPRTargetBeforeUsingParkedVerdi
 	if _, err := database.InsertReviewStepRound(review.ID, 1, "initial", &findings, nil, oldHead, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.UpdateStepStatusWithDuration(review.ID, types.StepStatusAwaitingApproval, 1); err != nil {
+	if err := parkGateFixture(database, review.ID, types.StepStatusAwaitingApproval, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.SetRunAwaitingAgent(run.ID); err != nil {
@@ -894,7 +896,9 @@ func TestExecutorRecoveredApprovalRevalidatesMovedPRTargetBeforeUsingParkedVerdi
 			if len(rounds) != 2 {
 				t.Fatalf("approval used parked review before revalidation: rounds=%d", len(rounds))
 			}
-			go func() { responseDone <- executor.Respond(types.StepReview, types.ActionApprove, nil) }()
+			go func() {
+				responseDone <- executor.Respond(types.StepReview, types.ActionApprove, nil, gateSnapshot(executor))
+			}()
 		}
 	})
 	executor.workDir = workDir
