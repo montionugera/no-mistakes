@@ -33,6 +33,26 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 		if err := assertReviewApprovedPushHead(sctx, sctx.Run.HeadSHA); err != nil {
 			return nil, err
 		}
+		target := resolvePushURL(sctx)
+		if hasAttachedCommitStatusPublication(sctx, sctx.Run.HeadSHA, target) {
+			ref := normalizedBranchRef(sctx.Run.Branch)
+			// Immutable promotions use this run's exact-head gates, rather than
+			// carrying an earlier attestation forward as an unvalidated CI repair.
+			if err := recordCommitStatusAttempt(sctx, sctx.Run.HeadSHA, target, ref, localValidationPassed(sctx, sctx.Run.HeadSHA), false); err != nil {
+				statusWarning(sctx.Log, "record immutable publication", err)
+			}
+			publication, err := confirmVerifiedCommitStatus(sctx, sctx.Run.HeadSHA, target, ref)
+			if err != nil {
+				statusWarning(sctx.Log, "record verified publication", err)
+			}
+			if publication != nil {
+				report := commitStatusReporter(sctx, publication)
+				report(sctx.Ctx, "pending", "", sctx.Log)
+				if localValidationPassed(sctx, sctx.Run.HeadSHA) {
+					report(sctx.Ctx, "success", "", sctx.Log)
+				}
+			}
+		}
 		sctx.Log("verified already published immutable source; no push performed")
 		return &pipeline.StepOutcome{}, nil
 	}
@@ -235,7 +255,8 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 		return err
 	}
 
-	if !decision.upToDate {
+	recordStatus := !decision.upToDate || hasAttachedCommitStatusPublication(sctx, headBeingPushed, pushURL)
+	if recordStatus {
 		if err := recordCommitStatusAttempt(sctx, headBeingPushed, pushURL, ref, attestationSteps != nil && localValidationPassed(sctx, headBeingPushed), attestationSteps == nil && localValidationPassed(sctx, "")); err != nil {
 			statusWarning(sctx.Log, "record publication before push", err)
 		}
@@ -263,7 +284,7 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 	}
 	// Resume status reporting for this run's recorded attempt, including a
 	// push whose response was lost. A head already upstream without an attempt
-	// never earns a status.
+	// never earns a status; attachment provides its own confirmed attempt.
 	reportStatus := func(string) {}
 	defer func() {
 		if publicationErr != nil {
