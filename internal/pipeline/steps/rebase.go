@@ -27,7 +27,7 @@ func (s *RebaseStep) Name() types.StepName { return types.StepRebase }
 
 const forkBranchRefPrefix = "refs/remotes/no-mistakes-push/"
 
-func (s *RebaseStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+func (s *RebaseStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutcome, err error) {
 	if sctx.Run.Shipping != nil && sctx.Run.Shipping.Mode == types.ShippingImmutableSource {
 		if err := shipping.CheckImmutable(sctx.Ctx, sctx.Run, sctx.Repo, sctx.WorkDir); err != nil {
 			return nil, err
@@ -84,33 +84,50 @@ func (s *RebaseStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 		}
 	}
 
-	// Stop before rebasing when the gated branch carries commits that live on
-	// the contributor's local default branch but were never pushed to
-	// origin/<default>. Rebasing onto the fresh remote default keeps those
-	// commits in the branch's history, so the PR may bundle another
-	// workstream's unpushed work. Surface the ambiguity for a human decision.
-	if outcome := detectBundledLocalDefaultCommits(ctx, sctx, branch, defaultBranch); outcome != nil {
-		return outcome, nil
-	}
-	if forcePush && branch == defaultBranch && remoteDefaultBranchAdvanced(ctx, sctx.WorkDir, defaultBranch, sctx.Run.BaseSHA) {
-		findingsJSON, _ := json.Marshal(Findings{
-			Items: []Finding{{
-				Severity:    "warning",
-				File:        filepath.Join("internal", "pipeline", "steps", "rebase.go"),
-				Description: fmt.Sprintf("origin/%s advanced after the force push; manual review required before updating the default branch", defaultBranch),
-			}},
-			Summary: fmt.Sprintf("remote %s advanced during force push", defaultBranch),
-		})
-		return &pipeline.StepOutcome{
-			NeedsApproval: true,
-			Findings:      string(findingsJSON),
-		}, nil
-	}
-
 	targets := rebaseTargetsForBranch(branch, defaultBranch, branchTarget)
 	if forcePush {
 		sctx.Log("force push detected, skipping " + branchTarget + " sync")
 		targets = forcePushRebaseTargets(branch, defaultBranch)
+	}
+
+	// Mandatory fresh observations are separate from optional source sync.
+	// Preserve force-push policy: observe source, but never integrate it.
+	targets, cleanup, err := checkedRewindTargets(sctx, targets)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = errors.Join(err, cleanup()) }()
+
+	checkedTarget := ""
+	pending, pendingErr := sctx.DB.GetPendingTargetRewind(sctx.Run.ID)
+	if pendingErr != nil {
+		return nil, pendingErr
+	}
+	if pending != nil {
+		checkedTarget = pending.TargetSHA
+	} else {
+		// Stop before rebasing when the gated branch carries commits that live on
+		// the contributor's local default branch but were never pushed to
+		// origin/<default>. Rebasing onto the fresh remote default keeps those
+		// commits in the branch's history, so the PR may bundle another
+		// workstream's unpushed work. Surface the ambiguity for a human decision.
+		if outcome := detectBundledLocalDefaultCommits(ctx, sctx, branch, defaultBranch); outcome != nil {
+			return outcome, nil
+		}
+		if forcePush && branch == defaultBranch && remoteDefaultBranchAdvanced(ctx, sctx.WorkDir, defaultBranch, sctx.Run.BaseSHA) {
+			findingsJSON, _ := json.Marshal(Findings{
+				Items: []Finding{{
+					Severity:    "warning",
+					File:        filepath.Join("internal", "pipeline", "steps", "rebase.go"),
+					Description: fmt.Sprintf("origin/%s advanced after the force push; manual review required before updating the default branch", defaultBranch),
+				}},
+				Summary: fmt.Sprintf("remote %s advanced during force push", defaultBranch),
+			})
+			return &pipeline.StepOutcome{
+				NeedsApproval: true,
+				Findings:      string(findingsJSON),
+			}, nil
+		}
 	}
 
 	merging := mergesMovedBase(sctx)
@@ -130,8 +147,13 @@ func (s *RebaseStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 			if err != nil {
 				return nil, err
 			}
+			if checkedTarget != "" {
+				if err := verifyRewindIntegration(sctx, target); err != nil {
+					return nil, err
+				}
+			}
 		}
-		outcome, err := updateHeadSHA(ctx, sctx, defaultBranch)
+		outcome, err := updateHeadSHA(ctx, sctx, defaultBranch, checkedTarget)
 		if err == nil {
 			if sctx.Run.HeadSHA == before {
 				outcome.FixSummary = NoChangesAppliedSummary
@@ -162,6 +184,12 @@ func (s *RebaseStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 		if err != nil {
 			return nil, err
 		}
+
+		if checkedTarget != "" && len(conflictFiles) == 0 {
+			if err := verifyRewindIntegration(sctx, target); err != nil {
+				return nil, err
+			}
+		}
 		if len(conflictFiles) > 0 {
 			conflictTargets = append(conflictTargets, target)
 			for _, file := range conflictFiles {
@@ -175,6 +203,11 @@ func (s *RebaseStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	}
 
 	if len(conflictTargets) > 0 {
+		if pending != nil {
+			if _, err := git.Run(ctx, sctx.WorkDir, "reset", "--hard", pending.LocalHeadSHA); err != nil {
+				return nil, fmt.Errorf("restore pending rewind entry head: %w", err)
+			}
+		}
 		summary := fmt.Sprintf("conflict %s %s", integrationVerb(merging), strings.Join(conflictTargets, ", "))
 		findingsJSON, _ := json.Marshal(Findings{Items: dedupeRebaseFindings(conflictFindings), Summary: summary})
 		return &pipeline.StepOutcome{
@@ -184,7 +217,7 @@ func (s *RebaseStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 		}, nil
 	}
 
-	return updateHeadSHA(ctx, sctx, defaultBranch)
+	return updateHeadSHA(ctx, sctx, defaultBranch, checkedTarget)
 }
 
 // rebaseTargets returns the ordered list of refs to rebase onto.
@@ -730,6 +763,16 @@ func restorePreMergeHead(ctx context.Context, sctx *pipeline.StepContext, preMer
 // Returns true if targetRef doesn't exist, is already merged, or can be fast-forwarded.
 func shouldSkipRebase(ctx context.Context, sctx *pipeline.StepContext, targetRef string) (bool, error) {
 	if _, err := git.Run(ctx, sctx.WorkDir, "rev-parse", "--verify", targetRef); err != nil {
+
+		if sctx.DB != nil && sctx.Run != nil {
+			pending, readErr := sctx.DB.GetPendingTargetRewind(sctx.Run.ID)
+			if readErr != nil {
+				return false, readErr
+			}
+			if pending != nil {
+				return false, fmt.Errorf("resolve checked rewind target: %w", err)
+			}
+		}
 		return true, nil
 	}
 	localSHA, err := git.HeadSHA(ctx, sctx.WorkDir)
@@ -823,7 +866,13 @@ func dedupeRebaseFindings(findings []Finding) []Finding {
 
 // updateHeadSHA syncs the run's head SHA after rebase and checks for an empty
 // diff against the same PR target selected before integration.
-func updateHeadSHA(ctx context.Context, sctx *pipeline.StepContext, targetBranch string) (*pipeline.StepOutcome, error) {
+func updateHeadSHA(ctx context.Context, sctx *pipeline.StepContext, targetBranch string, checkedTarget ...string) (*pipeline.StepOutcome, error) {
+	pinned := len(checkedTarget) > 0 && checkedTarget[0] != ""
+	if pinned {
+		if err := verifyRewindIntegration(sctx, checkedTarget[0]); err != nil {
+			return nil, err
+		}
+	}
 	headSHA, err := git.HeadSHA(ctx, sctx.WorkDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve head after rebase: %w", err)
@@ -843,11 +892,24 @@ func updateHeadSHA(ctx context.Context, sctx *pipeline.StepContext, targetBranch
 	// Execute already fetched the base branch (fail-closed) before integrating,
 	// so reuse that ref instead of fetching again after HEAD was rewritten and
 	// persisted: a failure here could not undo either.
-	baseSHA := mergeBaseWithDefaultBranch(ctx, sctx.WorkDir, targetBranch)
-	if baseSHA == "" {
-		baseSHA = resolveBaseSHA(ctx, sctx.WorkDir, sctx.Run.BaseSHA, targetBranch)
+
+	baseSHA := ""
+	if pinned {
+		baseSHA, err = git.Run(ctx, sctx.WorkDir, "merge-base", checkedTarget[0], headSHA)
+		if err != nil {
+			return nil, fmt.Errorf("resolve checked rewind merge base: %w", err)
+		}
+	} else {
+		baseSHA = mergeBaseWithDefaultBranch(ctx, sctx.WorkDir, targetBranch)
+		if baseSHA == "" {
+			baseSHA = resolveBaseSHA(ctx, sctx.WorkDir, sctx.Run.BaseSHA, targetBranch)
+		}
 	}
 	diff, err := git.Diff(ctx, sctx.WorkDir, baseSHA, "HEAD")
+	if pinned && err != nil {
+		return nil, fmt.Errorf("read checked rewind diff: %w", err)
+	}
+
 	if err == nil && strings.TrimSpace(diff) == "" {
 		sctx.Log("empty diff after rebase, skipping remaining steps")
 		return &pipeline.StepOutcome{SkipRemaining: true}, nil

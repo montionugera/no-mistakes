@@ -155,7 +155,7 @@ Pipeline prompts steer agents to keep intentional writes inside the disposable w
 This reduces macOS App Management prompts from agent-invoked commands, but it is not an OS sandbox.
 
 If you still see prompts, check the step log for commands that intentionally write outside the worktree and move that setup into your normal development environment or an explicit repo-local command.
-Requested test evidence may still be written under the managed evidence directory (`<NM_HOME>/evidence/<run-id>` by default). On GitHub.com/GHEC, supported image and video artifacts are uploaded when the PR is rendered; an orphan evidence branch is added when `test.evidence.store_in_repo` is enabled. The [Global Config Reference](/no-mistakes/reference/global-config/#testevidence) lists the cases that leave a local citation instead.
+Requested test evidence may still be written under the managed evidence directory. On GitHub.com/GHEC, supported image and video artifacts are uploaded when the PR is rendered; an orphan evidence branch is added when `test.evidence.store_in_repo` is enabled. The [Global Config Reference](/no-mistakes/reference/global-config/#testevidence) owns the local paths and lists the cases that leave a local citation instead.
 Normal tool temp or cache writes can still happen outside the worktree.
 Testing prompts ask agents to remove transient working-tree artifacts they created, such as downloaded models, caches, build outputs, large binaries, or generated data directories, before completion.
 
@@ -221,8 +221,7 @@ A branch that touches no `.github/workflows/*.yml` or `*.yaml` pushes normally w
 
 ### Rebase pauses because the branch carries unpushed default-branch commits
 
-This means a local default branch ahead of `origin/<default_branch>` is a strict ancestor of your branch, so the branch may contain unrelated local-default work.
-`no-mistakes` pauses with an `ask-user` finding instead of silently bundling that ambiguous work into the PR. If the local default tip and your branch `HEAD` are equal, it treats the commits as the intended delivery work and continues.
+This finding warns that the branch may contain unrelated local-default work. See [Rebase](/no-mistakes/reference/pipeline-steps/#rebase) for the exact conditions and the pending target-advance rewind exception.
 
 Push the default branch to `origin` if those commits belong in the shared base, or rebuild the feature branch from `origin/<default_branch>` to remove the unrelated work before running the gate again.
 Approve the finding only when you have confirmed the local default-branch work belongs in the delivery branch.
