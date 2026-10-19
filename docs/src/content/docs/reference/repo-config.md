@@ -8,7 +8,7 @@ Per-repo configuration lives in `.no-mistakes.yaml` at the root of your reposito
 :::caution[Security: gate-control fields are read from the default branch]
 `commands.*` and `gates[].command` execute arbitrary shell on the daemon host via `sh -c` / `cmd.exe /c`, and `agent` selects which process launches there (including ordered fallback lists, ACP aliases such as `cursor` and `devin`, and `acp:` targets) with the maintainer's credentials.
 To prevent a supply-chain attack where a contributor lands a hostile value on a gated branch, the daemon always reads **`commands` and `agent` from your default branch** (e.g. `origin/main`), never from the pushed SHA, and reads them at the exact commit a fresh fetch resolved (so a stale `origin/<default>` ref cannot serve a value the live default branch removed).
-The daemon also reads `document.instructions`, `review.conversation`, `review.path_instructions`, `gates`, `auto_fix.gates`, `protected_paths`, `staging_exclude`, `max_file_size_bytes`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `ci.review_bot_comments`, `ci.required_checks`, `ci.must_pass`, `ci.external_checks`, `ci.rebase_behind`, `ci.carry_review_on_replay`, `rebase.strategy`, `rebase.max_target_advance_rewinds`, `test.prepare`, `test.base_attribution`, `test.instructions`, `test.allow_approve_over_failure`, `test.evidence.branch`, `pr.template`, `pr.publish_intent`, and `pr.appendix` only from that trusted copy.
+The daemon also reads `document.instructions`, `document.doc_only_paths`, `document.max_commits_per_run`, `review.conversation`, `review.path_instructions`, `gates`, `auto_fix.gates`, `protected_paths`, `staging_exclude`, `max_file_size_bytes`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `ci.review_bot_comments`, `ci.required_checks`, `ci.must_pass`, `ci.external_checks`, `ci.rebase_behind`, `ci.carry_review_on_replay`, `rebase.strategy`, `rebase.max_target_advance_rewinds`, `test.prepare`, `test.base_attribution`, `test.instructions`, `test.allow_approve_over_failure`, `test.evidence.branch`, `pr.template`, `pr.publish_intent`, and `pr.appendix` only from that trusted copy.
 `pr.base_branch` is trusted-default-branch-only as well, but unlike those fields it follows the same `allow_repo_commands: true` opt-in exception as `commands`/`agent` (see [`pr.base_branch`](#prbase_branch) below).
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
@@ -36,8 +36,12 @@ ignore_patterns:
 
 # Optional documentation ownership policy, read only from the trusted default branch.
 document:
+  max_commits_per_run: 2  # 0 disables Document commits
   instructions: |
     docs/ owns detailed product guidance; README.md owns the introduction.
+  # Paths whose commits carry Review and Test credit instead of restarting them.
+  doc_only_paths:
+    - "documentation/**"
 
 # Optional review settings, read only from the trusted default branch:
 # whether the reviewer may ask you questions while it works (off by default),
@@ -431,6 +435,26 @@ It augments or clarifies the built-in policy; it cannot disable documentation in
 Like `commands.*` and `agent`, this field steers gate behavior, so it is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`: a contributor's pushed branch cannot weaken the documentation rules that gate its own review.
 
 An operator can add their own policy for this repository through a machine-local [`repository_overrides`](/no-mistakes/reference/global-config/#machine-local-review-and-documentation-guidance) entry; it is rendered as a separate, labeled section and never replaces this field.
+
+### document.doc_only_paths
+
+Globs naming this repository's documentation, in the same syntax as `ignore_patterns` (`documentation/**`, `docs/**/*.html`, `*.md`).
+
+When a completed, recorded Document pass changes only documentation, the pipeline atomically carries the Review approval and completed Test credit from that pass's starting head to its new head, recording the source head as provenance. Both must still name the starting head; a skipped Test stays skipped and carries only Review approval. Review and Test do not restart, and their historical rounds and review generation stay unchanged. The actual Git diff of every commit must pass the rule; agent claims and `ignore_patterns` do not grant credit. Push can recover the same carry. The [PR attestation reference](/no-mistakes/reference/pipeline-steps/#pipeline-step-attestation) owns how live-validation evidence remains tied to the head actually exercised.
+
+Unset, only prose files (`.md`, `.mdx`, `.markdown`, `.rst`, `.adoc`) at the repository root or under `docs/` count. Configured globs replace those locations and also permit `.html`; they cannot admit code, YAML, or other file types.
+
+The following exclusions always win: hidden path segments; `skill`, `skills`, `prompt`, or `prompts` directories; instruction filenames (`AGENTS.md`, `AGENTS.override.md`, `AGENT.md`, `CLAUDE.md`, `CLAUDE.local.md`, `GEMINI.md`, `SKILL.md`, `RULES.md`, `QWEN.md`, `copilot-instructions.md`, `instructions.md`, `prompt.md`); filename stems containing `prompt` or ending in `-instructions` or `_instructions`; and absolute, unclean, or ambiguous paths. Instruction names and directory exclusions ignore case. Both old and new file modes must be regular, non-executable files or absent. Symlinks, submodules, merges, and unknown changes fail closed. Renames are checked as deletion plus addition, so moving or deleting code cannot carry. Intermediate changes count even when a later commit reverts them. Strict shipping never carries.
+
+This field decides which commits skip revalidation, so it is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`: a pushed branch cannot widen it for its own run.
+
+### document.max_commits_per_run
+
+Maximum accepted Document commits in one run, including commits the agent creates itself. Default: `2`. Values must be non-negative; `0` disables Document commits. This field is read only from the trusted default branch, even when `allow_repo_commands` is enabled.
+
+The budget survives step resets and database reopen. After a committed pass reports no remaining documentation gap, another pass at that head finishes without invoking the agent. Otherwise, when changes need documenting and the budget is exhausted (including a zero limit), Document stops before invoking the agent and parks for an owner decision. Repeat suppression requires both the same input-tree hash as the previous committed Document pass's accepted head and a proposal touching only files from that pass. A new commit with identical tree content is still the same input; a changed input tree allows a new repair to the same filename within the remaining budget. A proposal that exceeds the remaining budget is also discarded. Unresolved findings remain visible for an owner decision; discarded edits never count as fixes. Every discarded repeated or over-budget proposal adds an ask-user finding describing the unapplied repair alongside any earlier findings. Identical discard notices are deduplicated and persist across attempts and database reopen. Stopping at the cap before a proposal exists does not report a discard. Skipped or discarded combined housekeeping work leaves lint to its own pass, which reassesses the restored bytes rather than using the discarded proposal's result.
+
+Document checks for a clean starting worktree before cached completion, ignored or empty changes, and exhausted-budget outcomes, so it can discard only its own proposal, including agent-created commits. Dirty entry is refused before any agent launch or convergence outcome. Entries marked `--assume-unchanged` or `--skip-worktree` are refused even when Git status shows no edits: the error reports the total and up to ten affected paths. Document checks these flags again before rollback. If an agent introduced them, the pass stops with its proposal commits and raw file bytes untouched and its pass record pending. Otherwise, rollback restores only the proposal paths and rewinds its commit ref with a compare-and-swap check; it does not use a whole-tree hard reset. Restoration never recurses into submodules, even with `submodule.recurse=true`: their HEAD, index, and working files remain untouched. If submodule dirt remains after restoration, Document fails and leaves the pass pending rather than reporting a completed discard. An interrupted pass with uncertain state fails closed rather than receiving a fresh budget; start a new run after resolving that state.
 
 ### review.conversation
 
@@ -954,7 +978,7 @@ A rebase repair is a pure replay only when every part of this holds:
 
 Any git error while checking also counts as not a pure replay. The check is deliberately narrower than "the rebase did not stop": a base change that lands within a few lines of a reviewed hunk changes that hunk's context, so its patch-id changes and the repair revalidates from Review, even though Git applied it cleanly.
 
-The carry applies only when the repaired head's own commits are exactly the reviewed commits. If any commit was added after Review approved the head (a Test, Document, or Lint auto-fix commit, or an earlier published CI repair), the repair is not a pure replay of the reviewed commits and Review re-runs as it does with the key off.
+The replay check uses the run's current review-approved head, which a permitted [documentation-only carry](#documentdoc_only_paths) can advance. If the repaired branch includes additional commits beyond that approved head (for example, a Test or Lint auto-fix commit, or an earlier published CI repair), the repair is not a pure replay of the approved commits and Review re-runs as it does with the key off.
 
 This setting applies only to ordinary runs without a fixed pull request comparison. When a run uses a fixed comparison, it repeats the full Review after a rebase, even if the replay is pure. Current guarded network runs use a fixed comparison, so enabling this setting does not transfer their Review approval. Strict shipping also requires a fresh Review receipt for its exact pinned comparison and never carries Review approval through a replay or changed comparison, regardless of this value.
 
