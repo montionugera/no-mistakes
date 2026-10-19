@@ -5,6 +5,7 @@ package e2e
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/testgit"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -55,6 +57,21 @@ func TestTargetAdvanceRewindJourney(t *testing.T) {
 			}
 			gitIn(t, h, h.WorkDir, "reset", "--hard", base)
 			h.Checkout(branch)
+			if kind == "fresh branch" {
+				old, err := os.ReadFile(h.Scenario)
+				if err != nil {
+					t.Fatal(err)
+				}
+				evidenceAction := func(match, name string) string {
+					header := fmt.Sprintf("  - match: %q\n    write_evidence:\n      - path: %s\n        content: %q", match, name, name)
+					return strings.Replace(cleanCatchAllAction, `  - text: "no issues found"`, header, 1)
+				}
+				oldMatch := fmt.Sprintf("You are validating a code change by driving the product itself. Derive the scenarios this change must satisfy, then run each one against the real running product.\n\nContext:\n- branch: %s\n- base commit: %s\n- target commit: %s", branch, base, feature)
+				actions := "actions:\n" + evidenceAction(oldMatch, "old-head-only.log") + evidenceAction("You are validating a code change by driving the product itself.", "new-head-only.log")
+				if err := os.WriteFile(h.Scenario, []byte(strings.Replace(string(old), "actions:\n", actions, 1)), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			var commands strings.Builder
 			commands.WriteString("#!/bin/sh\nset -eu\nn=0\nif [ -f " + shellQuote(count) + " ]; then n=$(cat " + shellQuote(count) + "); fi\ncase $n in\n")
 			for i, sha := range targetSHAs {
@@ -139,8 +156,39 @@ func TestTargetAdvanceRewindJourney(t *testing.T) {
 						tests++
 					}
 				}
-				if reviews < 2 || tests < 2 {
-					t.Fatalf("stale validation reused: reviews=%d tests=%d", reviews, tests)
+				if reviews != 1 || tests < 2 {
+					t.Fatalf("identical review must retain credit and Test must rerun: reviews=%d tests=%d", reviews, tests)
+				}
+				if kind == "fresh branch" {
+					root := paths.WithRoot(h.NMHome).RunEvidenceDir("", run.ID)
+					for path, want := range map[string]string{"superseded/g0/old-head-only.log": "old-head-only.log", "g1/new-head-only.log": "new-head-only.log"} {
+						if data, err := os.ReadFile(filepath.Join(root, path)); err != nil || string(data) != want {
+							t.Fatalf("generation evidence %s = %q: %v", path, data, err)
+						}
+					}
+					if _, err := os.Stat(filepath.Join(root, "g1", "old-head-only.log")); !os.IsNotExist(err) {
+						t.Fatal("old evidence transferred to the new head")
+					}
+					database, err := db.OpenReadOnly(filepath.Join(h.NMHome, "state.sqlite"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					history, err := database.GetTargetRewindHistory(run.ID)
+					_ = database.Close()
+					if err != nil || len(history) != 1 || history[0].BoundaryJSON == nil {
+						t.Fatalf("missing old Test boundary: %+v %v", history, err)
+					}
+					var boundary pipeline.StepOutcome
+					if err := json.Unmarshal([]byte(*history[0].BoundaryJSON), &boundary); err != nil {
+						t.Fatal(err)
+					}
+					oldFindings, err := types.ParseFindingsJSON(boundary.Findings)
+					current, _ := findStep(run.Steps, types.StepTest)
+					newFindings, currentErr := types.ParseFindingsJSON(deref(current.FindingsJSON))
+					if err != nil || currentErr != nil || oldFindings.TestedHeadSHA != feature || newFindings.TestedHeadSHA != published {
+						t.Fatalf("Test head bindings moved: old=%+v new=%+v (%v, %v)", oldFindings, newFindings, err, currentErr)
+					}
+					t.Logf("old Test remains bound to %s with old-head-only.log under superseded/g0; fresh Test binds %s and g1 contains only new-head-only.log", feature, published)
 				}
 			}
 			t.Logf("run=%s rewinds=%d final=%s head=%s target=%s", run.ID, rewinds, run.Status, run.HeadSHA, h.UpstreamBranchSHA("main"))
@@ -170,7 +218,7 @@ func TestTargetAdvanceExistingPRJourney(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				script := "#!/bin/sh\ncase \"$PWD\" in\n*/worktrees/*)\n" +
+				script := "#!/bin/sh\ncase \"$PWD\" in\n" + shellQuote(filepath.Join(h.NMHome, "worktrees")) + "/*)\n" +
 					"if [ \"$1\" = ls-remote ] && [ \"${3-}\" = refs/heads/" + branch + " ] && [ ! -f " + shellQuote(attachFailure) + " ]; then\n" +
 					"  : > " + shellQuote(attachFailure) + "; echo 'attach observation unavailable' >&2; exit 1\nfi;;\nesac\nexec " + shellQuote(realGit) + " \"$@\"\n"
 				if err := os.WriteFile(filepath.Join(h.BinDir, "git"), []byte(script), 0700); err != nil {
@@ -219,7 +267,7 @@ func TestTargetAdvanceExistingPRJourney(t *testing.T) {
 				t.Fatalf("read real attach provenance: %v %v", pubErr, attemptErr)
 			}
 			if kind == "G attached" {
-				if publication == nil || publication.Validated || publication.CIEligible {
+				if publication == nil || !publication.AdoptedOnly || publication.Validated || publication.CIEligible {
 					t.Fatalf("real G attach publication missing or credited validation: %+v", publication)
 				}
 			} else if publication != nil || attempt != nil {
@@ -237,9 +285,6 @@ func TestTargetAdvanceExistingPRJourney(t *testing.T) {
 			}
 			run := h.WaitForRun(branch, 120*time.Second)
 			want := types.RunCompleted
-			if kind != "attached without G" {
-				want = types.RunFailed
-			}
 			result := <-launch
 			if want == types.RunCompleted && result.err != nil {
 				t.Fatalf("CLI run failed: %v\n%s", result.err, result.out)

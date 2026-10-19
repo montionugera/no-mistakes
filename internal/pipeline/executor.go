@@ -2,12 +2,12 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1850,6 +1850,11 @@ rounds:
 		if refusal := ProtectedPathOutcome(err); refusal != nil {
 			outcome, err = refusal, nil
 		}
+		boundaryOutcome := outcome
+		if err == nil && outcome != nil && carryFindings {
+			// Resolve against the old generation before the guard resets carry.
+			boundaryOutcome = resolvedReviewBoundary(sctx, outcome, outstandingFindings, pendingVerificationIDs, selectedOutstandingIDs)
+		}
 		if err == nil && e.prContextGuard != nil && stepName.Order() >= types.StepRebase.Order() {
 			currentIndex, indexErr := e.stepIndex(stepName)
 			if indexErr != nil {
@@ -1864,6 +1869,27 @@ rounds:
 			resetComparisonState(priorGeneration, restartIndex >= 0)
 			sctx.PRTarget, sctx.PRContext = e.prTarget, e.prContext
 			sctx.EvidenceDir = e.runEvidenceDir(run.ID)
+			if restartIndex >= 0 && e.evidenceGeneration.Load() > priorGeneration && outcome != nil {
+				// The guard runs before round persistence. Keep its just-produced
+				// verdict as superseded evidence, never as active validation.
+				data, err := json.Marshal(boundaryOutcome)
+				if err != nil {
+					return false, "", err
+				}
+				if err := e.db.RecordTargetRewindBoundary(run.ID, e.evidenceGeneration.Load(), string(stepName), string(data)); err != nil {
+					return false, "", err
+				}
+				root := e.runEvidenceRoot(run.ID)
+				if root != "" {
+					dir := filepath.Join(root, "superseded", fmt.Sprintf("g%d", priorGeneration))
+					if err := os.MkdirAll(dir, 0700); err != nil {
+						return false, "", err
+					}
+					if err := os.WriteFile(filepath.Join(dir, "boundary-"+string(stepName)+".json"), data, 0600); err != nil {
+						return false, "", err
+					}
+				}
+			}
 			if restartIndex >= 0 {
 				if restartIndex < currentIndex {
 					return false, e.steps[restartIndex].Name(), nil
@@ -1919,57 +1945,20 @@ rounds:
 		roundFindings := outcome.Findings
 		effectiveFindings := roundFindings
 		if carryFindings {
-			// This round is the verification round for the selection the
-			// previous round dispatched: a selected item leaves the outstanding
-			// set only on a positive coverage record that also no longer reports
-			// the defect.
-			// A review question is resolved by its answer, not by a coverage
-			// record, so it never joins the append-only carry-forward; this
-			// round's own output re-emits every question still open.
-			//
-			// It is dropped from the VERIFICATION INPUT for the same reason and
-			// one more: resolveVerifiedFindingsJSON reads this round's findings
-			// to decide what the round did and did not still report, and a
-			// question is neither. A question's file is optional and the
-			// omission marker never has one, so leaving them in makes
-			// hasUnanchoredFinding true and refuses to clear ANY selected
-			// finding while a question is open; a question that does carry a
-			// file instead poisons that path in reportedFiles. Either way an
-			// answered-and-verified finding would stay outstanding for a reason
-			// that has nothing to do with it.
-			verificationFindings := dropReviewQuestionFindingsJSON(roundFindings)
-			outstandingFindings = dropReviewQuestionFindingsJSON(outstandingFindings)
-			// Answer rounds may retract unselected carry by name. A selected
-			// fix stays subject to verification; strict scope adjudications
-			// are checked separately against their durable human decisions.
-			var withdrawn []types.WithdrawnFinding
-			if sctx.FinalizingAnswers {
-				var retractable []types.WithdrawnFinding
-				for _, w := range outcome.WithdrawnFindings {
-					if !slices.Contains(selectedOutstandingIDs, w.ID) {
-						retractable = append(retractable, w)
-					}
+			var answered, scoped []types.WithdrawnFinding
+			effectiveFindings, outstandingFindings, answered, scoped = resolveReviewRoundFindings(sctx, outstandingFindings, pendingVerificationIDs, selectedOutstandingIDs, outcome, roundFindings)
+			for _, w := range answered {
+				reason := w.Reason
+				if reason == "" {
+					reason = "no reason given"
 				}
-				outstandingFindings, withdrawn = dropWithdrawnFindingsJSON(outstandingFindings, retractable)
-				for _, w := range withdrawn {
-					reason := w.Reason
-					if reason == "" {
-						reason = "no reason given"
-					}
-					writeLog(fmt.Sprintf("answers retracted finding %s: %s", w.ID, safeurl.RedactText(reason)))
-				}
+				writeLog(fmt.Sprintf("answers retracted finding %s: %s", w.ID, safeurl.RedactText(reason)))
 			}
-			var scopeWithdrawn []types.WithdrawnFinding
-			outstandingFindings, scopeWithdrawn = resolveReviewCarry(sctx, outstandingFindings, pendingVerificationIDs, outcome, verificationFindings)
-			withdrawn = append(withdrawn, scopeWithdrawn...)
-			for _, w := range scopeWithdrawn {
+			for _, w := range scoped {
 				writeLog(fmt.Sprintf("independent review accepted scope disposition %s: %s", w.ID, safeurl.RedactText(w.Reason)))
 			}
 			pendingVerificationIDs = retainFindingIDs(outstandingFindings, pendingVerificationIDs)
 			selectedOutstandingIDs = retainFindingIDs(outstandingFindings, selectedOutstandingIDs)
-			effectiveFindings = mergeOutstandingFindingsJSON(outstandingFindings, roundFindings, outcome.ReviewedPaths)
-			outstandingFindings = effectiveFindings
-			effectiveFindings = recordWithdrawnFindingsJSON(effectiveFindings, withdrawn)
 		}
 
 		if effectiveFindings != "" {

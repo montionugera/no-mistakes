@@ -18,12 +18,14 @@ var ErrFatalGateReconciliation = errors.New("fatal gate reconciliation")
 // pipeline work. An empty PRURL means no PR is attached; discovery may still
 // supply an existing PR's target when its head differs from the local head.
 type PRTargetSelection struct {
-	PRURL        string
-	SourceRepo   string
-	SourceBranch string
-	ForgeHeadSHA string
-	TargetBranch string
-	State        scm.PRState
+	// ObservedPRURL identifies an existing PR without granting mutation authority.
+	ObservedPRURL string
+	PRURL         string
+	SourceRepo    string
+	SourceBranch  string
+	ForgeHeadSHA  string
+	TargetBranch  string
+	State         scm.PRState
 }
 
 // ErrDaemonShutdown is the cancellation cause RunManager.Shutdown gives every
@@ -224,10 +226,14 @@ type StepOutcome struct {
 	// FixSummary, when non-empty, records the result of a fix attempt.
 	FixSummary      string
 	RepairPublished bool
-	// ReviewApprovedHeadSHA is set only by a successfully executed full review
-	// round. The executor durably records it only when the review step actually
-	// completes, never while that outcome is parked or after a failed round.
-	ReviewApprovedHeadSHA      string
+	// ReviewApprovedHeadSHA is set by a successful full review or proven reuse
+	// of clean review credit after target integration. The executor durably
+	// records it only when the review step completes, never while that outcome
+	// is parked or after a failed round.
+	ReviewApprovedHeadSHA string
+	// Set only by the executor after applying outstanding-finding resolution.
+	// Legacy raw boundary outcomes cannot prove a clean effective gate.
+	ReviewCarryResolved        bool
 	ReviewComparisonGeneration int64
 	// MergedHeadSHA is set only after exact CI forge merge verification.
 	MergedHeadSHA string

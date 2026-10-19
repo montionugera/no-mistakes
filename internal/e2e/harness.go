@@ -93,7 +93,8 @@ func NewHarness(t *testing.T, opts SetupOpts) *Harness {
 
 	// A workspace-local tmp can approach the Unix socket path limit. Its
 	// containing tmp segment already satisfies the daemon reaper's safety gate.
-	prefix := "nm-e2e-*"
+	// Otherwise nmh-* keeps the root short and is recognized by the reaper.
+	prefix := "nmh-*"
 	if filepath.Base(os.TempDir()) == "tmp" {
 		prefix = ""
 	}
@@ -107,7 +108,7 @@ func NewHarness(t *testing.T, opts SetupOpts) *Harness {
 		NMBin:             nmBin,
 		FakeAgent:         fakeBin,
 		BinDir:            filepath.Join(root, "bin"),
-		NMHome:            filepath.Join(root, "nmhome"),
+		NMHome:            filepath.Join(root, "h"),
 		HomeDir:           filepath.Join(root, "home"),
 		UpstreamDir:       filepath.Join(root, "upstream.git"),
 		WorkDir:           filepath.Join(root, "work"),
@@ -505,17 +506,28 @@ func (h *Harness) Runs() []ipc.RunInfo {
 
 func (h *Harness) RunInfo(runID string) *ipc.RunInfo {
 	h.t.Helper()
-	p := paths.WithRoot(h.NMHome)
-	client, err := ipc.Dial(p.Socket())
+	ctx, cancel := context.WithDeadline(h.t.Context(), pollDeadline(h.t, 30*time.Second))
+	defer cancel()
+	run, err := h.runInfoWithContext(ctx, runID)
 	if err != nil {
-		h.t.Fatalf("dial daemon: %v", err)
+		h.t.Fatalf("get run %s: %v", runID, err)
+	}
+	return run
+}
+
+func (h *Harness) runInfoWithContext(ctx context.Context, runID string) (*ipc.RunInfo, error) {
+	p := paths.WithRoot(h.NMHome)
+	deadline, _ := ctx.Deadline()
+	client, err := ipc.DialWithDeadline(p.Socket(), deadline)
+	if err != nil {
+		return nil, err
 	}
 	defer client.Close()
 	var result ipc.GetRunResult
-	if err := client.Call(ipc.MethodGetRun, &ipc.GetRunParams{RunID: runID}, &result); err != nil {
-		h.t.Fatalf("get run %s: %v", runID, err)
+	if err := client.CallWithContext(ctx, ipc.MethodGetRun, &ipc.GetRunParams{RunID: runID}, &result, 0); err != nil {
+		return nil, err
 	}
-	return result.Run
+	return result.Run, nil
 }
 
 func (h *Harness) ActiveRun(branch string) *ipc.RunInfo {
@@ -676,7 +688,9 @@ func (h *Harness) CancelRun(runID string) {
 
 func (h *Harness) waitForRunStatus(branch string, timeout time.Duration, match func(types.RunStatus) bool, action string) *ipc.RunInfo {
 	h.t.Helper()
-	deadline := time.Now().Add(timeout)
+	deadline := pollDeadline(h.t, timeout)
+	ctx, cancel := context.WithDeadline(h.t.Context(), deadline)
+	defer cancel()
 
 	var lastRun *ipc.RunInfo
 	for time.Now().Before(deadline) {
@@ -684,12 +698,12 @@ func (h *Harness) waitForRunStatus(branch string, timeout time.Duration, match f
 		var ok bool
 		func() {
 			p := paths.WithRoot(h.NMHome)
-			client, err := ipc.Dial(p.Socket())
+			client, err := ipc.DialWithDeadline(p.Socket(), deadline)
 			if err != nil {
 				return
 			}
 			defer client.Close()
-			if err := client.Call(ipc.MethodGetRuns, &ipc.GetRunsParams{RepoID: h.repoID()}, &result); err != nil {
+			if err := client.CallWithContext(ctx, ipc.MethodGetRuns, &ipc.GetRunsParams{RepoID: h.repoID()}, &result, 0); err != nil {
 				return
 			}
 			ok = true
@@ -718,6 +732,22 @@ func (h *Harness) waitForRunStatus(branch string, timeout time.Duration, match f
 	}
 	h.t.Fatalf("no run found for branch %s within %v", branch, timeout)
 	return nil
+}
+
+// Keep a stalled wait's diagnostic and cleanup ahead of testing's package
+// alarm. A late journey must not consume a fresh timeout beyond that alarm.
+func pollDeadline(t *testing.T, timeout time.Duration) time.Time {
+	t.Helper()
+	now := time.Now()
+	deadline := now.Add(timeout)
+	if alarm, ok := t.Deadline(); ok {
+		remaining := alarm.Sub(now)
+		reserve := min(5*time.Second, remaining/2)
+		if diagnosticDeadline := alarm.Add(-reserve); diagnosticDeadline.Before(deadline) {
+			deadline = diagnosticDeadline
+		}
+	}
+	return deadline
 }
 
 // dumpDebugState writes the daemon log, agent log, and per-step run
