@@ -91,10 +91,9 @@ func NewHarness(t *testing.T, opts SetupOpts) *Harness {
 
 	nmBin, fakeBin := buildBinaries(t)
 
-	// A workspace-local tmp can approach the Unix socket path limit. Its
-	// containing tmp segment already satisfies the daemon reaper's safety gate.
-	// Otherwise nmh-* keeps the root short and is recognized by the reaper.
-	prefix := "nmh-*"
+	// Keep Unix socket paths short. A containing tmp segment already
+	// satisfies the daemon reaper's safety gate; elsewhere nmh-* does too.
+	prefix := "nmh-"
 	if filepath.Base(os.TempDir()) == "tmp" {
 		prefix = ""
 	}
@@ -149,6 +148,9 @@ func NewHarness(t *testing.T, opts SetupOpts) *Harness {
 	t.Setenv("PATH", h.BinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("HOME", h.HomeDir)
 	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(h.HomeDir, "gitconfig-isolated"))
+	// Non-repository fixtures must stay outside Git even when TMPDIR is
+	// nested inside the checkout that is running this suite.
+	t.Setenv("GIT_CEILING_DIRECTORIES", os.TempDir())
 	t.Setenv("NM_HOME", h.NMHome)
 	t.Setenv("FAKEAGENT_LOG", h.AgentLog)
 	t.Setenv("FAKEAGENT_PR_UPSTREAM", h.UpstreamDir)
