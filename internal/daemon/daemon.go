@@ -214,6 +214,9 @@ func RunWithOptions(p *paths.Paths, d *db.DB, stepFactory StepFactory) error {
 // consumer would let one startup act on two different documents, and every later
 // read needs a fallback for a failure the caller has already refused to start on.
 func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConfig, stepFactory StepFactory, startupStarted time.Time) error {
+	if err := cleanupPushNotificationTemps(p, startupStarted); err != nil {
+		return err
+	}
 	// Refuse an unusable worktree placement before anything walks, sweeps, or
 	// removes a directory under it. This is the second half of worktree_roots
 	// validation: internal/config checks every entry it can judge without
@@ -1421,40 +1424,34 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		if p.Shipping != nil && p.ExternalCIOwner != "" {
 			return nil, fmt.Errorf("strict shipping cannot be combined with external CI ownership")
 		}
-		run, claimed, err := d.ClaimLaunchReceiptWithAllOptions(p.RepoID, p.Branch, p.LaunchNonce, p.SubmittedHeadSHA, p.ValidationGeneration, p.IntentDigest, prBaseBranch, p.OmitIntent, p.Shipping, p.ExternalCIOwner, p.PiProfile)
-		if err != nil {
-			return nil, fmt.Errorf("claim launch receipt: %w", err)
-		}
-		if run == nil {
-			return &ipc.ClaimLaunchReceiptResult{}, nil
-		}
-		if !run.Shipping.Matches(p.Shipping) {
-			return nil, fmt.Errorf("conflicting launch_nonce: shipping pin differs")
-		}
-		if !run.PiProfile.Matches(p.PiProfile) {
-			return nil, fmt.Errorf("conflicting launch_nonce: Pi profile differs from run pin")
-		}
-		if !launchPRBaseBranchMatches(run, prBaseBranch) {
-			return nil, conflictingLaunchPRBaseBranch(p.LaunchNonce)
-		}
-		if p.OmitIntent && !run.OmitIntent {
-			return nil, conflictingLaunchOmitIntent(p.LaunchNonce)
-		}
-		if run.ExternalCIOwner != p.ExternalCIOwner {
-			return nil, fmt.Errorf("conflicting launch_nonce: external CI owner differs from run")
-		}
+		var result *ipc.ClaimLaunchReceiptResult
+		_, err = mgr.withBranchLock(p.RepoID, p.Branch, func() (string, error) {
+			var claimErr error
+			result, claimErr = mgr.claimLaunchReceiptLocked(&p, prBaseBranch)
+			return "", claimErr
+		})
+		return result, err
+	})
 
-		receipt, err := receiptForRun(run, claimed)
+	// Check caller ownership support before the CLI takes branch custody.
+	srv.Handle(ipc.MethodProbeRunOwner, func(_ context.Context, params json.RawMessage) (interface{}, error) {
+		var p ipc.ProbeRunOwnerParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if err := types.ValidateRunOwner(p.Owner); err != nil {
+			return nil, err
+		}
+		cfg, err := config.LoadGlobal(mgr.paths.ConfigFile())
 		if err != nil {
 			return nil, err
 		}
-		if receipt.SubmittedHeadSHA != p.SubmittedHeadSHA || receipt.ValidationGeneration != p.ValidationGeneration || receipt.IntentDigest != p.IntentDigest {
-			return nil, fmt.Errorf("conflicting launch_nonce is already bound to a different validation generation, submitted head, or intent")
+		if cfg.Intent.RequireOwner && strings.TrimSpace(p.Owner) == "" {
+			return nil, fmt.Errorf("launch requires an owner: pass --owner or NO_MISTAKES_OWNER")
 		}
-		return &ipc.ClaimLaunchReceiptResult{Receipt: &receipt}, nil
+		return &ipc.ProbeRunOwnerResult{OK: true}, nil
 	})
 
-	// Capability probe for --no-publish-intent: see ipc.ProbeOmitIntentResult.
 	srv.Handle(ipc.MethodProbeShipping, func(context.Context, json.RawMessage) (interface{}, error) {
 		return &ipc.ProbeOmitIntentResult{OK: true}, nil
 	})
@@ -1544,13 +1541,46 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
-		runID, err := mgr.HandleRerun(ctx, p.RepoID, p.Branch, p.PreviousRunID, p.SkipSteps, p.Intent, p.PRBaseBranch, p.OmitIntent, p.ExternalCIOwner, p.CallerHeadSHA, p.VerificationPlanID, p.ClosingIssueRefs, p.PiProfile)
+		if err := types.ValidateRunOwner(p.Owner); err != nil {
+			return nil, err
+		}
+		runID, err := mgr.HandleRerun(types.WithRunOwner(ctx, p.Owner), p.RepoID, p.Branch, p.PreviousRunID, p.SkipSteps, p.Intent, p.PRBaseBranch, p.OmitIntent, p.ExternalCIOwner, p.CallerHeadSHA, p.VerificationPlanID, p.ClosingIssueRefs, p.PiProfile)
 		if err != nil {
 			return nil, err
 		}
 		return &ipc.RerunResult{RunID: runID}, nil
 	})
 
+	srv.Handle(ipc.MethodListPushNotifications, func(_ context.Context, raw json.RawMessage) (interface{}, error) {
+		var p ipc.PushNotificationParams
+		if len(raw) > 0 && string(raw) != "null" {
+			if err := json.Unmarshal(raw, &p); err != nil {
+				return nil, err
+			}
+		}
+		return mgr.ListPushNotifications(p)
+	})
+	srv.Handle(ipc.MethodInspectPushNotification, func(_ context.Context, raw json.RawMessage) (interface{}, error) {
+		var p ipc.PushNotificationParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, err
+		}
+		return mgr.InspectPushNotification(p.ID)
+	})
+	srv.Handle(ipc.MethodReplayPushNotification, func(ctx context.Context, raw json.RawMessage) (interface{}, error) {
+		if err := refuseNested(ctx, false); err != nil {
+			return nil, err
+		}
+		var p ipc.PushNotificationParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, err
+		}
+		id, err := mgr.ReplayPushNotification(ctx, p.ID)
+		if err != nil {
+			return nil, err
+		}
+		return &ipc.PushReceivedResult{RunID: id}, nil
+	})
 	srv.Handle(ipc.MethodPushReceived, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
 		// Hooks execute in a managed bare gate by definition, so only the
 		// authenticated peer ancestry is meaningful at this ingress.
@@ -1703,6 +1733,7 @@ func gateContextResult(result gatecontext.Result) ipc.GateContextResult {
 
 func runToInfo(d *db.DB, r *db.Run, steps []*db.StepResult) *ipc.RunInfo {
 	info := &ipc.RunInfo{
+		Owner:                r.Owner(),
 		TargetAdvanceRewinds: r.TargetAdvanceRewinds,
 		Shipping:             r.Shipping,
 		ID:                   r.ID,
@@ -1725,6 +1756,11 @@ func runToInfo(d *db.DB, r *db.Run, steps []*db.StepResult) *ipc.RunInfo {
 		AwaitingAgentSince:   r.AwaitingAgentSince,
 		CreatedAt:            r.CreatedAt,
 		UpdatedAt:            r.UpdatedAt,
+	}
+	var admissionErr error
+	info.OwnerAdmission, admissionErr = d.GetOwnerAdmission(r.ID)
+	if admissionErr != nil {
+		info.OwnerAdmissionError = admissionErr.Error()
 	}
 	if r.Shipping != nil {
 		if c := shipping.CachedStatusIdentity(d, r); c != nil {

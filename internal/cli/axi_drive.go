@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -222,6 +223,11 @@ func newAxiRunCmd() *cobra.Command {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, ownerErr := launchOwner(cmd)
+			if ownerErr != nil {
+				return emitError(cmd, 2, ownerErr.Error())
+			}
+			cmd.SetContext(types.WithRunOwner(cmd.Context(), owner))
 			resolvedIntent, err := resolveAxiRunIntent(cmd, intent, intentFile)
 			if err != nil {
 				return emitError(cmd, 2, err.Error())
@@ -274,6 +280,7 @@ func newAxiRunCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noPublishIntent, "no-publish-intent", false, "keep the generated Intent section out of the PR body for this run (tighten-only; full intent still reaches every step prompt except PR drafting)")
 	cmd.Flags().StringArrayVar(&closesIssues, "closes", nil, "issue this PR closes when merged; repeat for multiple issues (42, owner/repo#42, or a nested GitLab project path)")
 	cmd.Flags().String("verification-plan", "", "capture a nonempty UTF-8 verification plan as separate run evidence (new runs only)")
+	bindOwnerFlag(cmd)
 	bindAxiWaitFlag(cmd, &wait)
 	bindPiProfileFlags(cmd, &model, &effort)
 	return cmd
@@ -382,7 +389,7 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		if strings.TrimSpace(validationGeneration) == "" {
 			return emitError(cmd, 2, "--validation-generation is required with --launch-nonce")
 		}
-		receipt, err := claimLaunchReceiptWithOptions(types.ShippingFromContext(ctx), externalCIOwner, env.client, env.repo.ID, branch, launchNonce, headSHA, validationGeneration, digestLaunchIntent(intent), baseBranch, omitIntent, profile)
+		receipt, err := claimLaunchReceiptWithOptions(types.ShippingFromContext(ctx), externalCIOwner, types.RunOwnerFromContext(ctx), env.client, env.repo.ID, branch, launchNonce, headSHA, validationGeneration, digestLaunchIntent(intent), baseBranch, omitIntent, profile)
 		if err != nil {
 			return emitError(cmd, 1, fmt.Sprintf("claim launch receipt: %v", err))
 		}
@@ -426,6 +433,12 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		return emitError(cmd, 2, "--verification-plan is accepted only when starting a new run; omit it to reattach")
 	}
 	if runID == "" {
+		if err := probeLaunchOwner(env.client, types.RunOwnerFromContext(ctx)); err != nil {
+			return emitError(cmd, 2, err.Error())
+		}
+		if types.RunOwnerFromContext(ctx) == "" {
+			fmt.Fprintln(cmd.ErrOrStderr(), "warning: launching without an owner; pass --owner or set NO_MISTAKES_OWNER so approval gates have someone responsible")
+		}
 		if shipping != nil && launchNonce == "" {
 			launchNonce = ulid.Make().String()
 			validationGeneration = "shipping-" + ulid.Make().String()
@@ -865,6 +878,7 @@ func freshRunBranchOwnershipState(ctx context.Context, env *axiEnv) *branchsync.
 func triggerRun(ctx context.Context, env *axiEnv, branch string, skipSteps []types.StepName, intent, baseBranch string, omitIntent bool, externalCIOwner, planID string, closesIssues []string, profiles ...*agentcfg.PiProfile) (string, error) {
 	profile := agentcfg.OptionalPiProfile(profiles)
 	pushOptions := append(formatSkipPushOptions(skipSteps), formatPiProfilePushOptions(profile)...)
+	pushOptions = append(pushOptions, formatOwnerPushOption(types.RunOwnerFromContext(ctx)))
 	pushOptions = append(pushOptions, formatVerificationPlanPushOptions(planID)...)
 	pushOptions = append(pushOptions, formatClosingIssueRefsPushOptions(closesIssues)...)
 	if opt := formatIntentPushOption(intent); opt != "" {
@@ -934,6 +948,9 @@ func triggerRun(ctx context.Context, env *axiEnv, branch string, skipSteps []typ
 	}
 
 	if run, _ := waitForTriggeredRunForHead(ctx, env.client, env.repo.ID, branch, submissionHead, priorRunIDs, triggerWaitTimeout); run != nil {
+		if owner := types.RunOwnerFromContext(ctx); owner != "" && run.Owner != owner {
+			return "", fmt.Errorf("triggered run did not retain the requested owner")
+		}
 		if run.ExternalCIOwner != externalCIOwner {
 			return "", fmt.Errorf("triggered run did not retain the requested external CI owner")
 		}
@@ -953,6 +970,7 @@ func triggerRun(ctx context.Context, env *axiEnv, branch string, skipSteps []typ
 	// clean-head evidence because it may have changed while waiting above.
 	var rr ipc.RerunResult
 	params := rerunParams(env.repo.ID, branch, skipSteps, intent, baseBranch)
+	params.Owner = types.RunOwnerFromContext(ctx)
 	params.OmitIntent = omitIntent
 	params.ExternalCIOwner = externalCIOwner
 	params.PiProfile = profile
@@ -1046,16 +1064,23 @@ func claimLaunchReceipt(client *ipc.Client, repoID, branch, launchNonce, submitt
 }
 
 func claimShippingLaunchReceipt(shipping *types.ShippingOptions, client *ipc.Client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, baseBranch string, omitIntent bool, profiles ...*agentcfg.PiProfile) (*ipc.LaunchReceipt, error) {
-	return claimLaunchReceiptWithOptions(shipping, "", client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, baseBranch, omitIntent, profiles...)
+	return claimLaunchReceiptWithOptions(shipping, "", "", client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, baseBranch, omitIntent, profiles...)
 }
 
-func claimLaunchReceiptWithOptions(shipping *types.ShippingOptions, externalCIOwner string, client *ipc.Client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, baseBranch string, omitIntent bool, profiles ...*agentcfg.PiProfile) (*ipc.LaunchReceipt, error) {
+func claimLaunchReceiptWithOptions(shipping *types.ShippingOptions, externalCIOwner, owner string, client *ipc.Client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, baseBranch string, omitIntent bool, profiles ...*agentcfg.PiProfile) (*ipc.LaunchReceipt, error) {
 	if shipping != nil && externalCIOwner != "" {
 		return nil, fmt.Errorf("strict shipping cannot be combined with an external CI owner")
 	}
+	// An ownerless lookup may reattach to an existing receipt even when new
+	// ownerless launches are forbidden. Admission is checked after a miss.
+	if owner != "" {
+		if err := probeLaunchOwner(client, owner); err != nil {
+			return nil, err
+		}
+	}
 	var result ipc.ClaimLaunchReceiptResult
 	if err := client.Call(ipc.MethodClaimLaunchReceipt, &ipc.ClaimLaunchReceiptParams{
-		Shipping: shipping, ExternalCIOwner: externalCIOwner, RepoID: repoID, Branch: branch, LaunchNonce: launchNonce, PiProfile: agentcfg.OptionalPiProfile(profiles),
+		Owner: owner, Shipping: shipping, ExternalCIOwner: externalCIOwner, RepoID: repoID, Branch: branch, LaunchNonce: launchNonce, PiProfile: agentcfg.OptionalPiProfile(profiles),
 		SubmittedHeadSHA: submittedHeadSHA, ValidationGeneration: validationGeneration, IntentDigest: intentDigest, PRBaseBranch: baseBranch, OmitIntent: omitIntent,
 	}, &result); err != nil {
 		return nil, err
@@ -1075,6 +1100,7 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 	if shipping != nil && shipping.Mode == types.ShippingImmutableSource {
 		var result ipc.StartFreshRunResult
 		if err := env.client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
+			Owner:  types.RunOwnerFromContext(ctx),
 			RepoID: env.repo.ID, Branch: branch, HeadSHA: headSHA, SkipSteps: skipSteps,
 			Intent: intent, LaunchNonce: launchNonce, ValidationGeneration: validationGeneration,
 			PRBaseBranch: baseBranch, OmitIntent: omitIntent, PiProfile: profile, Shipping: shipping,
@@ -1082,9 +1108,13 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 		}, &result); err != nil {
 			return nil, err
 		}
+		if result.Receipt.Owner != types.RunOwnerFromContext(ctx) {
+			return nil, fmt.Errorf("launch receipt has a conflicting owner")
+		}
 		return &result.Receipt, nil
 	}
 	pushOptions := append(formatSkipPushOptions(skipSteps), formatPiProfilePushOptions(profile)...)
+	pushOptions = append(pushOptions, formatOwnerPushOption(types.RunOwnerFromContext(ctx)))
 	pushOptions = append(pushOptions, formatVerificationPlanPushOptions(planID)...)
 	pushOptions = append(pushOptions, formatClosingIssueRefsPushOptions(closesIssues)...)
 	if opt := formatShippingPushOption(shipping); opt != "" {
@@ -1127,16 +1157,23 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 	if receipt, err := waitForLaunchReceipt(ctx, env.client, env.repo.ID, branch, launchNonce, headSHA, validationGeneration, intent, baseBranch, omitIntent, externalCIOwner, triggerWaitTimeout, profile); err != nil {
 		return nil, err
 	} else if receipt != nil {
+		if receipt.Owner != types.RunOwnerFromContext(ctx) {
+			return nil, fmt.Errorf("launch receipt has a conflicting owner")
+		}
 		return receipt, nil
 	}
 	var result ipc.StartFreshRunResult
 	if err := env.client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
+		Owner:    types.RunOwnerFromContext(ctx),
 		Shipping: shipping, ExternalCIOwner: externalCIOwner,
 		RepoID: env.repo.ID, Branch: branch, HeadSHA: headSHA, SkipSteps: skipSteps,
 		Intent: intent, LaunchNonce: launchNonce, ValidationGeneration: validationGeneration, PRBaseBranch: baseBranch, OmitIntent: omitIntent, PiProfile: profile, VerificationPlanID: planID,
 		ClosingIssueRefs: closesIssues,
 	}, &result); err != nil {
 		return nil, fmt.Errorf("start fresh run: %w", err)
+	}
+	if result.Receipt.Owner != types.RunOwnerFromContext(ctx) {
+		return nil, fmt.Errorf("launch receipt has a conflicting owner")
 	}
 	return &result.Receipt, nil
 }
@@ -1147,7 +1184,7 @@ func waitForLaunchReceipt(ctx context.Context, client *ipc.Client, repoID, branc
 	poll := time.NewTicker(150 * time.Millisecond)
 	defer poll.Stop()
 	for {
-		receipt, err := claimLaunchReceiptWithOptions(types.ShippingFromContext(ctx), externalCIOwner, client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, digestLaunchIntent(intent), baseBranch, omitIntent, profiles...)
+		receipt, err := claimLaunchReceiptWithOptions(types.ShippingFromContext(ctx), externalCIOwner, types.RunOwnerFromContext(ctx), client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, digestLaunchIntent(intent), baseBranch, omitIntent, profiles...)
 		if err != nil {
 			return nil, err
 		}
@@ -1266,6 +1303,7 @@ func emitLaunchReceipt(cmd *cobra.Command, receipt ipc.LaunchReceipt) {
 	emitDoc(cmd, toon.Field{Key: "launch_receipt", Value: toon.NewObject(
 		toon.Field{Key: "run_id", Value: receipt.RunID},
 		toon.Field{Key: "disposition", Value: receipt.Disposition},
+		toon.Field{Key: "owner", Value: receipt.Owner},
 		toon.Field{Key: "launch_nonce", Value: receipt.LaunchNonce},
 		toon.Field{Key: "validation_generation", Value: receipt.ValidationGeneration},
 		toon.Field{Key: "branch", Value: receipt.Branch},
@@ -2370,14 +2408,17 @@ func resolveInactiveAbortTruth(cmd *cobra.Command, client *ipc.Client, runID str
 // recorded nonterminal or unreadable run is the nonzero terminal-unconfirmed
 // contract - never a claimed cancellation and never a started daemon.
 func resolveDaemonDownAbortTruth(cmd *cobra.Command, p *paths.Paths, runID string) error {
-	database, err := db.Open(p.DB())
-	if err != nil {
+	database, err := db.OpenReader(p.DB())
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return emitUnconfirmedAbort(cmd, runID, "", fmt.Sprintf("the daemon is not running and the durable run record could not be opened: %v", err), nil, false)
 	}
-	defer database.Close()
-	run, err := database.GetRun(runID)
-	if err != nil {
-		return emitUnconfirmedAbort(cmd, runID, "", fmt.Sprintf("the daemon is not running and the durable run record could not be read: %v", err), nil, false)
+	var run *db.Run
+	if database != nil {
+		defer database.Close()
+		run, err = database.GetRun(runID)
+		if err != nil {
+			return emitUnconfirmedAbort(cmd, runID, "", fmt.Sprintf("the daemon is not running and the durable run record could not be read: %v", err), nil, false)
+		}
 	}
 	if run == nil {
 		emitDoc(cmd,

@@ -100,10 +100,14 @@ Commit and push the generated file to enable the checks.
 
 Agent eXperience Interface for non-interactive agents.
 Most agent workflows use the installed `/no-mistakes` skill, which drives this command surface underneath.
-It prints TOON to stdout, except [`review-receipt`](#no-mistakes-axi-review-receipt) and [`ci-handoff`](#no-mistakes-axi-ci-handoff), which emit JSON on success. It prints progress to stderr and uses structured stdout errors with exit code `1` for operational failures and `2` for bad usage; `ci-handoff` uses JSON errors and exit code `1`.
+It prints TOON to stdout by default. [`status --json`](#no-mistakes-axi-status) selects JSON; [`review-receipt`](#no-mistakes-axi-review-receipt) and [`ci-handoff`](#no-mistakes-axi-ci-handoff) emit JSON on success. It prints progress to stderr and uses structured stdout errors with exit code `1` for operational failures and `2` for bad usage; `ci-handoff` uses JSON errors and exit code `1`.
 At the TOON output boundary, unsupported C0 control bytes are rendered as visible `\xNN` escapes while tabs, carriage returns, newlines, printable Unicode, and the underlying durable logs remain unchanged.
 If TOON encoding still fails, AXI prints a structured error instead of returning successful empty stdout.
 The calling agent drives AXI approval gates but does not replace the configured pipeline agent that performs validation.
+
+Observation commands (`status`, `runs`, `stats`, AXI home/status/logs, and the database check in `doctor`) open the existing state database read-only. The database reads for `eval capture`, `eval miss ingest`, and `eval relabel` use the same nonmigrating reader; those commands can still update the local evaluation corpus. Readers neither create application directories nor create or migrate the database, including when the daemon is stopped. If its schema is too old, update and start the daemon to upgrade it before querying again. Schema upgrades preserve historical runs; subsequent opens at the current schema skip DDL and backfills.
+
+`status`, `runs`, and implicit AXI home/status/logs queries resolve Git context before accessing `NM_HOME`, including before any database stat or open. Outside Git, they report `not in a git repository`; human `status` exits successfully, while `runs` and AXI queries exit nonzero. This also applies to `axi status --awaiting` and JSON status. Explicit `axi status --run` and `axi logs --run` work outside a repository, as does the durable-record check for `axi abort --run` with the daemon stopped. Global `stats`, evaluation commands, and `doctor` do not require a Git worktree.
 
 ```sh
 no-mistakes axi
@@ -140,6 +144,7 @@ no-mistakes axi run --intent "the user's goal" --closes 95 --closes owner/repo#1
 | Flag            | Type     | Default | Description                                                                                          |
 | --------------- | -------- | ------- | ---------------------------------------------------------------------------------------------------- |
 | `--intent`      | `string` | (none)  | What the user set out to accomplish; `-` reads stdin to EOF; exclusive with `--intent-file` |
+| `--owner` | `string` | `NO_MISTAKES_OWNER` | Session/thread or person responsible for answering this run’s gates |
 | `--intent-file` | `string` | (none)  | Read intent from a file relative to the caller's working directory; exclusive with `--intent` |
 | `--verification-plan` | `string` | (none) | Path to a nonempty UTF-8 verification plan, at most 64 KiB (65,536 bytes), captured as separate evidence for a new run only |
 | `-y`, `--yes`   | `bool`   | `false` | Auto-resolve eligible gates until a decision point or outcome                                       |
@@ -161,6 +166,30 @@ no-mistakes uses the supplied text instead of transcript inference; see [Intent 
 Err on the side of completeness: include the goal, important decisions and tradeoffs, constraints or approaches ruled in or out, and explicit requests that might otherwise look surprising in the diff.
 When starting an ordinary or `full` run, `axi run` refuses the default branch and uncommitted working trees with actionable errors instead of auto-branching or auto-committing. [`immutable-source`](#strict-shipping-and-review-receipts) permits a default-branch caller but still requires a clean checkout.
 Ordinary reattachment to an in-flight run does not require intent input and never replaces that run's intent, even if new text is supplied. [Strict launch receipts](#strict-launch-receipts) require the original intent bytes on every retry, using any of the input transports below.
+
+### Launch owner
+
+Use `--owner <session-or-thread-id>` on `axi run` or `rerun` to record who will drive the run's approval gates. For environment input and flag precedence, see [`NO_MISTAKES_OWNER`](/no-mistakes/reference/environment/#no_mistakes_owner). Values must be valid UTF-8, at most 256 bytes before trimming, and contain no control characters; surrounding whitespace is trimmed. Ordinary reattachment keeps the existing run's owner; a new run or rerun uses the launching caller's input rather than inheriting an old owner.
+
+See global [`intent.require_owner`](/no-mistakes/reference/global-config/#intent) for ownerless-launch policy and its enforcement scope. Owner metadata assigns responsibility but grants no approval authority, sends no notification, and never answers a gate. Owned launches probe daemon support before taking branch custody. Owned receipt claims also probe before sending the claim, on both initial nonce replay and polling, so an unsupported daemon cannot consume the first `created` disposition. Ownerless calls remain compatible with older daemons. The explicit owner is stored independently of transcript provenance, so later intent inference cannot erase it; historical transcript session IDs do not establish ownership.
+
+Ownership uses additive RPC extensions (`probe_run_owner` and fields on launch, receipt, rerun and run-info messages) with the existing envelope, plus the `no-mistakes.owner=<base64>` Git push option. An emulated legacy RPC endpoint tests only the specified message behavior; it proves neither released-binary compatibility nor database downgrade safety.
+
+For post-receive notifications, malformed base64, duplicate owner options, or invalid decoded owners are admitted **ownerless with an explicit warning**, because Git has already accepted the refs. The run and `owner_admission_events` record are committed atomically. Status/JSON exposes `owner_admission_event`, including the validation error, branch, caller path, run ID and `ownerless_admitted`; this durable record survives `log_level: error` and subsequent policy changes. Successful hook output is captured, so the warning is visible in status/JSON but not on push stdout ([#88](https://github.com/vifar/no-mistakes/issues/88)). It is not a silent successful owner assignment. Valid owned admissions, deletions, and valid ownerless admissions with the policy off produce no bypass event. Historical runs are not backfilled with admission events.
+
+Post-receive admission is not atomic with Git's ref update. Before attempting admission, the daemon fsyncs a notification under the owning root's private `push-notifications/` directory. If config loading or run/event insertion fails, active predecessors remain intact and the notification stays pending. A legacy unpinned launch without an active predecessor may record a failed diagnostic row; that row does not acknowledge admission. After correcting the fault, replay can admit the retained notification without another push. If retention itself fails, the daemon returns `retain post-receive notification failed`; the accepted ref may then lack a recoverable notification or run.
+
+Use the supported recovery commands against the owning root:
+
+```sh
+NM_HOME=/path/to/root no-mistakes daemon notifications list
+NM_HOME=/path/to/root no-mistakes daemon notifications inspect <id>
+NM_HOME=/path/to/root no-mistakes daemon notifications replay <id>
+```
+
+These commands return JSON. List returns summary metadata (`id`, `path`, `pending`, any diagnostic/admitted run ID, or a bounded corruption error); inspect returns the full original received options. Listing defaults to at most 100 summaries and stays below 128 KiB per page. When more records remain, the last summary includes `next_cursor`; pass it with `list --after <next_cursor>`. `--limit` accepts 1–100. Continue until `next_cursor` is absent, including when discovering pending or corrupt records amid successful history. Replay resolves admission and revalidates the registered repository, canonical owned gate, current ref/head, and branch run context; stale or corrupt notifications are refused and retained. A notification's admission binding commits with its run and owner event, so duplicate delivery and replay after a lost acknowledgement cannot create another run or cancel newer work. Every new receive is assigned a daemon-minted unique ID, stored in its retained record; payload and predecessor context never decide receive identity. Explicit replay uses that original ID verbatim and does not mint another. A separate receive may reattach to an existing matching run, but still has its own receive ID. Run reattachment and nonce/proof identity are separate from receive identity. A→B, B→A, A→B receives retain separate IDs and validations. Ordinary ref creation and receives whose old SHA matches the run’s different current or published head start new validation, even when returning to its original submitted commit. A return through multiple intermediate receives can also start new validation when their retained version-3 records carry explicit validation markers and match the same root, repository, ref, and predecessor context. The marker is persisted only after owned-gate, live-ref, and context validation succeed, before config loading or run insertion; a checksum alone is not validation proof. Legacy, unmarked, foreign, or corrupt records, and records with stale context, cannot supply that history. Compatible delivery reattachment remains available for other matching requests; a nonce retains its original proof binding. Legacy retained records remain inspectable/replayable without rewriting their stored IDs. The [daemon startup rules](/no-mistakes/concepts/daemon/#crash-recovery) own journal temporary-file cleanup. Files remain available for inspection after admission; they are private operational records, not published evidence. If predecessor cancellation fails after admission commits, the replacement is settled through setup-failure handling. Inspect/list expose the actual failure; replay and nonce receipts return the named failed outcome instead of reporting an unscheduled or failed replacement as success. The original receive and run/event binding remain for inspection, without another run on replay. Correct the reported fault and use `no-mistakes rerun` from the repository to start a new validation; replay does not promote a failed setup into active work. Successful admission does not guarantee pipeline completion. The running daemon is required; `NM_HOME` selects its owning root.
+
+New read-only clients reject an older database schema and ask the daemon to migrate it. This does not make an upgraded database safe against pre-versioning executables: they ignore `user_version` and may run DDL/backfills. Do not point an older executable at the upgraded root; use a separate root or a compatible backup.
 
 ### Intent input
 
@@ -276,13 +305,14 @@ no-mistakes axi run --intent "the user's goal" \
 
 After durable creation or claim, AXI writes a TOON `launch_receipt` object to stdout **before** driving the run.
 The receipt remains available to a caller that captures stdout even if driving later stops at a gate or fails.
-It contains `run_id`, `disposition` (`created` or `reused`), `launch_nonce`, `validation_generation`, `branch`, `head_sha`, `submitted_head_sha`, and `intent_digest`.
+It contains `run_id`, `disposition` (`created` or `reused`), `owner`, `launch_nonce`, `validation_generation`, `branch`, `head_sha`, `submitted_head_sha`, and `intent_digest`. The `owner` field contains the persisted launch owner and is explicitly empty for an ownerless run.
 Both head fields contain the full, immutable submitted commit SHA; `intent_digest` is the lowercase SHA-256 digest of the exact persisted intent bytes, including whitespace.
 Raw intent is not included in receipts, and generic run/status output does not expose the nonce binding or intent digest.
 
 The nonce is scoped to the repository and branch.
-The first successful receipt claim returns `created`; subsequent matching claims return `reused` for that same run, including after the gate or pipeline head advances.
+For an eligible run, the first successful receipt claim returns `created`; subsequent matching claims return `reused` for that same run, including after the gate or pipeline head advances. Failed runs, cancellations other than supersession, and pending runs without scheduler or manager ownership are refused. Eligibility and first-claim consumption are [validated atomically](/no-mistakes/concepts/daemon/#concurrent-push-handling), so rejection leaves an unclaimed `created` disposition unconsumed.
 A conflicting submitted head, validation generation, intent, [pinned Pi profile](/no-mistakes/reference/global-config/#per-run-pi-profiles), or explicit [shipping mode/draft pin](#strict-shipping-and-review-receipts) is refused.
+The [launch owner](#launch-owner) must also match exactly on strict-launch replay; omitting it does not match a run created with an owner.
 A different nonce creates a distinct run rather than reattaching to a same-head run; both post-receive creation and the up-to-date-push fallback follow this contract.
 The up-to-date-push fallback preserves the latest same-head run's PR URL unless its recorded PR state is closed or merged, including when an explicit `--base-branch` retargets that PR.
 An explicit `--base-branch` is persisted on creation and must match the stored per-run base on replay; omitting it on replay preserves the stored base.
@@ -406,7 +436,7 @@ Answering requires an active run, because only its executor can resume the revie
 
 ## no-mistakes axi status
 
-When `--run` is omitted, show this branch's run: its active run, else its most recent one.
+When neither `--run` nor `--awaiting` is supplied, show this branch's run: its active run, else its most recent one.
 Resolution is scoped to the current branch and never falls back to another branch's run, because one clone commonly has several worktrees on different branches.
 On a successful status response, when the current branch has no run of its own - including a detached `HEAD`, which owns no branch and so reports `current_branch: unknown` - the output carries no run object at all.
 It reports `current_branch`, `runs_on_current_branch: 0` where a branch is known, and the recent-runs listing, so an unrelated run can never be read as this worktree's.
@@ -418,11 +448,18 @@ An explicit `--run <id>` rendered under `run:` while the current branch is unkno
 ```sh
 no-mistakes axi status
 no-mistakes axi status --run <id>
+no-mistakes axi status --awaiting --json
 ```
 
 | Flag    | Type     | Default            | Description               |
 | ------- | -------- | ------------------ | ------------------------- |
 | `--run` | `string` | current-branch run | Inspect a specific run ID |
+| `--awaiting` | `bool` | `false` | List unanswered live gates across this repository's branches; exclusive with `--run` |
+| `--json` | `bool` | `false` | Render the same status document as JSON instead of TOON |
+
+Every run object and recent-run row includes `owner` (empty when absent) and `ownerless` (a boolean). Run objects also include `awaiting_person`: true only for a nonterminal run with an `awaiting_approval` or `fix_review` step and its matching durable gate identity. An accepted response waiting for a slot is already answered and reports false. The signal does not use `pending_response` being populated as evidence of a wait, nor the historical `N awaiting` findings count; a completed step retaining findings reports false.
+
+A waiting run includes `awaiting_step`, `awaiting_since` (Unix seconds), `awaiting_seconds`, `gate_question`, and `gate_questions` (full finding descriptions). `gate_question` uses the summary, falling back to newline-joined descriptions when the summary is empty; either source is limited to a 1,200-rune prefix plus a truncation disclosure when shortened. This leaves `gate_questions` complete in home, status, and `--awaiting` output, including JSON status. Age uses the persisted park timestamp, clamped at zero if the clock moves backward, with human-readable `awaiting_for` when the timestamp is known. An unavailable timestamp yields null `awaiting_since` and `awaiting_seconds` and omits `awaiting_for`. `--awaiting` returns an `awaiting_runs` array, including ownerless runs, age, questions, and an explicit inspection command per run. The empty result is an empty array. This read-only repository-wide query does not change the default current-branch resolution or answer any gate.
 
 A parked `gate:` includes `run_id`, `step_result_id`, `round_id`, and `nonce`, alongside its step and status. The nonce changes on every park, even when the same round parks again. IPC run-status payloads expose the same identity as each step's `gate` object. Every non-abort IPC response must supply it as `expected_gate`; missing or mismatched identities are refused with `gate_superseded` and the current gate identity. Abort is exempt. Accepted pending responses always store their full identity and are replayed only against that same park after restart. Recovery refuses a park without a saved nonce and matching round ID, even when no response is pending; it also refuses a pending response with a missing or mismatched identity.
 
@@ -582,7 +619,7 @@ Remove the gate from the current repository.
 no-mistakes eject
 ```
 
-Removes the `no-mistakes` remote, deletes the bare repo directory, cleans up worktrees, and deletes the database record (cascades to runs and steps).
+Removes the `no-mistakes` remote, deletes the bare repo directory, cleans up worktrees, and deletes the repository database record together with its runs, steps, owner-admission events, and admitted/diagnostic notification bindings in one database transaction. Private notification journal files remain on disk; removing the repository registration prevents them from admitting new work.
 It does not remove any legacy repo-local agent skill files left by older versions; current `init` installs the skill at user level instead.
 
 ## no-mistakes attach
@@ -602,6 +639,8 @@ Opens the TUI for the active run anywhere in the current repo. If `--run` is spe
 ## no-mistakes rerun
 
 Rerun the pipeline for the current branch.
+
+`--owner` selects the [launch owner](#launch-owner) for the new run.
 
 ```sh
 no-mistakes rerun
@@ -651,6 +690,7 @@ use rerun to bypass a gate.
 
 | Flag | Type | Default | Description |
 | ---- | ---- | ------- | ----------- |
+| `--owner` | `string` | `NO_MISTAKES_OWNER` | [Launch owner](#launch-owner) for the new run |
 | `--intent` | `string` | (none) | Explicit intent overriding inherited intent or fresh inference |
 | `--no-publish-intent` | `bool` | `false` | Keep the generated `## Intent` section out of the PR body for this rerun (adds to the inherited decision; tighten-only) |
 | `--closes` | `string`, repeatable | (none) | Issue the PR fully resolves; adds to the [closing references](#closing-issues) inherited from the selected prior run |

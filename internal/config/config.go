@@ -1444,7 +1444,9 @@ type IntentRaw struct {
 // the trusted `pr.publish_intent`, and the caller-side control below is owned
 // by the operator of the machine that runs the gate.
 type GlobalIntentRaw struct {
-	IntentRaw `yaml:",inline"`
+	// RequireOwner is enforced on AXI launches; TUI and direct push are warned, not refused, until #82.
+	RequireOwner bool `yaml:"require_owner"`
+	IntentRaw    `yaml:",inline"`
 	// PublishIntent is the contributor-side, tighten-only publication
 	// preference for the generated public Intent section. `false` omits that
 	// section for runs started on this machine; it can never publish intent

@@ -1401,7 +1401,10 @@ When enabled and no intent was supplied directly for the run, no-mistakes can re
 | `intent.threshold`        | `float`    | `0.2`   | Minimum raw match score for selecting a transcript session |
 | `intent.slack_days`       | `int`      | `3`     | Extra days to look back before the change window           |
 | `intent.disabled_readers` | `string[]` | Empty   | Transcript readers to disable                              |
+| `intent.require_owner` | `bool` | `false` | Require explicit launch ownership on AXI launches; warn on TUI/direct push until #82 |
 | `intent.publish_intent`   | `bool`     | `true`  | Publish the generated Intent section on PR bodies by default |
+
+`intent.require_owner` is global-only and defaults to false, accepting ownerless launches with a warning. When true, `axi run` probes the daemon’s policy even when no owner was supplied, so refusal leaves private-mirror refs unchanged and permits an immediate retry with `--owner`. The daemon rejects ownerless fresh RPC launches and reruns before cancelling existing work or creating a replacement row. TUI/direct pushes are warned rather than refused after receive: `require_owner not enforced for post-receive (TUI/direct push): no pre-receive check (follow-up #82)`. [Issue #82](https://github.com/vifar/no-mistakes/issues/82) tracks pre-receive enforcement. Ownerless status views also show the current policy limitation. The policy does not change existing runs or gate approval authority; ordinary reattachment and matching ownerless receipt claims remain allowed. See [launch owner](/no-mistakes/reference/cli/#launch-owner) for caller input, the durable admission audit and status fields, malformed-owner handling, and retained-notification recovery.
 
 Valid `disabled_readers` values are `claude`, `codex`, `opencode`, `rovodev`, `pi`, and `copilot`.
 

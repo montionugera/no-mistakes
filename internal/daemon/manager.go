@@ -59,7 +59,13 @@ type RunManager struct {
 	paths        *paths.Paths
 	steps        StepFactory
 
-	branchLocks sync.Map // repoID+"/"+branch → *sync.Mutex
+	notificationMu           sync.Mutex
+	afterPushRetained        func()
+	beforeNotificationRename func() error
+	beforeRunInsert          func()
+	afterReceiptLookup       func(*db.Run)
+	afterPushCommitted       func()
+	branchLocks              sync.Map // repoID+"/"+branch → *sync.Mutex
 
 	// sched enforces daemon.max_concurrent_runs and owns the start order of
 	// queued runs; limitsMu/limitsCache memoise the live global config it reads.
@@ -1360,11 +1366,19 @@ func assertTrustedConfigReadable(ctx context.Context, wtDir, defaultBranch, trus
 	return nil
 }
 
-// HandlePushReceived processes a push notification from the post-receive hook.
-// A proof-mode push creates an unclaimed row: the first matching observer
-// receives the sole `created` disposition by atomically claiming it.
-func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushReceivedParams) (string, error) {
+type ownerAdmissionIssueKey struct{}
+
+func (m *RunManager) handleRetainedPushLocked(ctx context.Context, params *ipc.PushReceivedParams) (string, error) {
+	owner, issue := params.Owner, params.OwnerValidationError
+	if err := types.ValidateRunOwner(owner); err != nil {
+		issue = err.Error()
+	}
+	if issue != "" {
+		owner = ""
+	}
+	ctx = context.WithValue(ctx, ownerAdmissionIssueKey{}, issue)
 	ctx = types.WithShippingOptions(ctx, params.Shipping)
+	ctx = types.WithRunOwner(ctx, owner)
 	// Ref deletion (git push remote :branch) sends new SHA as all-zeros.
 	// Nothing to validate - skip pipeline.
 	if git.IsZeroSHA(params.New) {
@@ -1394,19 +1408,23 @@ func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushRec
 		baseSHA = strings.TrimSpace(params.ReconciledPreviousHead)
 	}
 	if params.LaunchNonce != "" {
-		receipt, err := m.startFreshLaunch(ctx, repo, branch, params.New, baseSHA, params.Gate, params.SkipSteps, params.Intent, params.LaunchNonce, params.ValidationGeneration, params.PRBaseBranch, params.OmitIntent, params.ExternalCIOwner, "push", params.VerificationPlanID, params.ClosingIssueRefs, params.PiProfile)
+		receipt, err := m.startFreshLaunchLocked(ctx, repo, branch, params.New, baseSHA, params.Gate, params.SkipSteps, params.Intent, params.LaunchNonce, params.ValidationGeneration, params.PRBaseBranch, params.OmitIntent, params.ExternalCIOwner, "push", params.VerificationPlanID, params.ClosingIssueRefs, params.PiProfile)
 		if err != nil {
 			return "", err
 		}
 		return receipt.RunID, nil
 	}
-	return m.startRun(ctx, repo, branch, params.New, baseSHA, "push", params.SkipSteps, params.Intent, params.PRBaseBranch, params.OmitIntent, params.ExternalCIOwner, params.VerificationPlanID, params.ClosingIssueRefs, params.PiProfile)
+	return m.startRunWithIntentSourceLocked(ctx, repo, branch, params.New, baseSHA, "push", params.SkipSteps, params.Intent, db.RunIntentSourceAgent, "", "", "", params.PRBaseBranch, strings.TrimSpace(params.PRBaseBranch) != "", params.OmitIntent, params.ExternalCIOwner, "", params.VerificationPlanID, params.ClosingIssueRefs, params.PiProfile)
 }
 
 // HandleStartFreshRun creates or replays a proof-mode launch only after
 // checking the creation context under the repository/branch lock.
 func (m *RunManager) HandleStartFreshRun(ctx context.Context, params *ipc.StartFreshRunParams) (ipc.LaunchReceipt, error) {
+	if err := types.ValidateRunOwner(params.Owner); err != nil {
+		return ipc.LaunchReceipt{}, err
+	}
 	ctx = types.WithShippingOptions(ctx, params.Shipping)
+	ctx = types.WithRunOwner(ctx, params.Owner)
 	repo, err := m.db.GetRepo(params.RepoID)
 	if err != nil {
 		return ipc.LaunchReceipt{}, fmt.Errorf("get repo: %w", err)
@@ -1421,6 +1439,16 @@ func (m *RunManager) HandleStartFreshRun(ctx context.Context, params *ipc.StartF
 // replay only its immutable submitted-head, generation, and persisted-intent
 // digest. It must never fall back to ordinary same-head reattachment.
 func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, gateDir string, skipSteps []types.StepName, intent, launchNonce, validationGeneration, prBaseBranch string, omitIntent bool, externalCIOwner, trigger, planID string, closingIssues []string, profiles ...*agentcfg.PiProfile) (ipc.LaunchReceipt, error) {
+	var receipt ipc.LaunchReceipt
+	_, err := m.withBranchLock(repo.ID, branch, func() (string, error) {
+		var err error
+		receipt, err = m.startFreshLaunchLocked(ctx, repo, branch, headSHA, baseSHA, gateDir, skipSteps, intent, launchNonce, validationGeneration, prBaseBranch, omitIntent, externalCIOwner, trigger, planID, closingIssues, profiles...)
+		return receipt.RunID, err
+	})
+	return receipt, err
+}
+
+func (m *RunManager) startFreshLaunchLocked(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, gateDir string, skipSteps []types.StepName, intent, launchNonce, validationGeneration, prBaseBranch string, omitIntent bool, externalCIOwner, trigger, planID string, closingIssues []string, profiles ...*agentcfg.PiProfile) (ipc.LaunchReceipt, error) {
 	if err := types.ValidateExternalCIOwnerRequest(externalCIOwner, skipSteps); err != nil {
 		return ipc.LaunchReceipt{}, err
 	}
@@ -1450,12 +1478,15 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 	persistedIntent := intent
 	requestDigest := digestIntent(persistedIntent)
 	var receipt ipc.LaunchReceipt
-	_, err = m.withBranchLock(repo.ID, branch, func() (string, error) {
+	_, err = func() (string, error) {
 		existing, err := m.db.GetRunByLaunchNonce(repo.ID, branch, launchNonce)
 		if err != nil {
 			return "", err
 		}
 		if existing != nil {
+			if existing.Owner() != types.RunOwnerFromContext(ctx) {
+				return "", fmt.Errorf("conflicting launch_nonce: owner differs from run")
+			}
 			if planID != "" && (existing.VerificationPlan == nil || existing.VerificationPlan.ID != planID) {
 				return "", fmt.Errorf("verification plan cannot replace an existing run attachment")
 			}
@@ -1478,7 +1509,7 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 				return "", fmt.Errorf("conflicting launch_nonce: external CI owner differs from run")
 			}
 
-			replayed, err := receiptForRun(existing, false)
+			replayed, err := m.receiptForRun(existing, false)
 			if err != nil {
 				return "", err
 			}
@@ -1490,10 +1521,20 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 			// Duplicate hook delivery is not observation: preserve an
 			// unclaimed push row for the first matching receipt observer.
 			if trigger == "push" {
+				if retained, _ := ctx.Value(pushNotificationKey{}).(*retainedPush); retained != nil {
+					if err := m.validateAndMarkNotification(ctx, retained); err != nil {
+						return "", err
+					}
+					if err := m.db.BindPushNotification(retained.ID, existing.ID); err != nil {
+						return "", err
+					}
+				}
 				receipt = replayed
 				return existing.ID, nil
 			}
-			claimedRun, claimed, err := m.db.ClaimLaunchReceiptWithAllOptions(repo.ID, branch, launchNonce, headSHA, validationGeneration, requestDigest, storedPRBaseBranch, omitIntent, types.ShippingFromContext(ctx), externalCIOwner, request)
+			m.mu.Lock()
+			claimedRun, claimed, err := m.db.ClaimLaunchReceiptWithAllOptions(repo.ID, branch, launchNonce, headSHA, validationGeneration, requestDigest, storedPRBaseBranch, omitIntent, types.ShippingFromContext(ctx), externalCIOwner, types.RunOwnerFromContext(ctx), request, m.receiptEligibilityLocked)
+			m.mu.Unlock()
 			if err != nil {
 				return "", err
 			}
@@ -1504,10 +1545,7 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 				return "", conflictingLaunchPRBaseBranch(launchNonce)
 			}
 
-			receipt, err = receiptForRun(claimedRun, claimed)
-			if err != nil {
-				return "", err
-			}
+			receipt = launchReceiptForEligibleRun(claimedRun, claimed)
 			return existing.ID, nil
 		}
 
@@ -1555,12 +1593,14 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 			return "", fmt.Errorf("read created run: %w", err)
 		}
 		if trigger == "push" {
-			receipt, err = receiptForRun(run, true)
+			receipt, err = m.receiptForRun(run, true)
 			if err != nil {
 				return "", err
 			}
 		} else {
-			claimedRun, claimed, err := m.db.ClaimLaunchReceiptWithAllOptions(repo.ID, branch, launchNonce, headSHA, validationGeneration, requestDigest, storedPRBaseBranch, omitIntent, types.ShippingFromContext(ctx), externalCIOwner, request)
+			m.mu.Lock()
+			claimedRun, claimed, err := m.db.ClaimLaunchReceiptWithAllOptions(repo.ID, branch, launchNonce, headSHA, validationGeneration, requestDigest, storedPRBaseBranch, omitIntent, types.ShippingFromContext(ctx), externalCIOwner, types.RunOwnerFromContext(ctx), request, m.receiptEligibilityLocked)
+			m.mu.Unlock()
 			if err != nil {
 				return "", err
 			}
@@ -1571,13 +1611,10 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 				return "", conflictingLaunchPRBaseBranch(launchNonce)
 			}
 
-			receipt, err = receiptForRun(claimedRun, claimed)
-			if err != nil {
-				return "", err
-			}
+			receipt = launchReceiptForEligibleRun(claimedRun, claimed)
 		}
 		return runID, nil
-	})
+	}()
 	if err != nil {
 		return ipc.LaunchReceipt{}, err
 	}
@@ -1633,21 +1670,81 @@ func digestIntent(intent string) string {
 	return fmt.Sprintf("%x", sum)
 }
 
-func receiptForRun(run *db.Run, created bool) (ipc.LaunchReceipt, error) {
+func (m *RunManager) claimLaunchReceiptLocked(p *ipc.ClaimLaunchReceiptParams, prBaseBranch string) (*ipc.ClaimLaunchReceiptResult, error) {
+	existing, err := m.db.GetRunByLaunchNonce(p.RepoID, p.Branch, p.LaunchNonce)
+	if err != nil {
+		return nil, err
+	}
+	if m.afterReceiptLookup != nil {
+		m.afterReceiptLookup(existing)
+	}
+	if existing != nil {
+		if err := m.runAdmissionError(existing); err != nil {
+			return nil, err
+		}
+	}
+	m.mu.Lock()
+	run, claimed, err := m.db.ClaimLaunchReceiptWithAllOptions(p.RepoID, p.Branch, p.LaunchNonce, p.SubmittedHeadSHA, p.ValidationGeneration, p.IntentDigest, prBaseBranch, p.OmitIntent, p.Shipping, p.ExternalCIOwner, p.Owner, p.PiProfile, m.receiptEligibilityLocked)
+	m.mu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("claim launch receipt: %w", err)
+	}
 	if run == nil {
-		return ipc.LaunchReceipt{}, fmt.Errorf("run is required")
+		return &ipc.ClaimLaunchReceiptResult{}, nil
+	}
+	if !run.Shipping.Matches(p.Shipping) {
+		return nil, fmt.Errorf("conflicting launch_nonce: shipping pin differs")
+	}
+	if !run.PiProfile.Matches(p.PiProfile) {
+		return nil, fmt.Errorf("conflicting launch_nonce: Pi profile differs from run pin")
+	}
+	if !launchPRBaseBranchMatches(run, prBaseBranch) {
+		return nil, conflictingLaunchPRBaseBranch(p.LaunchNonce)
+	}
+	if p.OmitIntent && !run.OmitIntent {
+		return nil, conflictingLaunchOmitIntent(p.LaunchNonce)
+	}
+	if run.ExternalCIOwner != p.ExternalCIOwner {
+		return nil, fmt.Errorf("conflicting launch_nonce: external CI owner differs from run")
+	}
+
+	receipt := launchReceiptForEligibleRun(run, claimed)
+	if receipt.SubmittedHeadSHA != p.SubmittedHeadSHA || receipt.ValidationGeneration != p.ValidationGeneration || receipt.IntentDigest != p.IntentDigest {
+		return nil, fmt.Errorf("conflicting launch_nonce is already bound to a different validation generation, submitted head, or intent")
+	}
+	return &ipc.ClaimLaunchReceiptResult{Receipt: &receipt}, nil
+}
+
+func (m *RunManager) receiptEligibilityLocked(run *db.Run) error {
+	if err := m.runAdmissionErrorLocked(run); err != nil {
+		return err
 	}
 	if run.SubmittedHeadSHA == nil || *run.SubmittedHeadSHA == "" {
-		return ipc.LaunchReceipt{}, fmt.Errorf("run %s has no submitted head binding", run.ID)
+		return fmt.Errorf("run %s has no submitted head binding", run.ID)
 	}
 	if run.LaunchNonce == nil || run.LaunchValidationGeneration == nil || run.LaunchIntentDigest == nil {
-		return ipc.LaunchReceipt{}, fmt.Errorf("run %s has no launch binding", run.ID)
+		return fmt.Errorf("run %s has no launch binding", run.ID)
 	}
+	return nil
+}
+
+func (m *RunManager) receiptForRun(run *db.Run, created bool) (ipc.LaunchReceipt, error) {
+	m.mu.Lock()
+	err := m.receiptEligibilityLocked(run)
+	m.mu.Unlock()
+	if err != nil {
+		return ipc.LaunchReceipt{}, err
+	}
+	return launchReceiptForEligibleRun(run, created), nil
+}
+
+func launchReceiptForEligibleRun(run *db.Run, created bool) ipc.LaunchReceipt {
 	disposition := "reused"
 	if created {
 		disposition = "created"
 	}
 	return ipc.LaunchReceipt{
+		Owner:                run.Owner(),
 		PiProfile:            run.PiProfile,
 		RunID:                run.ID,
 		Disposition:          disposition,
@@ -1657,7 +1754,7 @@ func receiptForRun(run *db.Run, created bool) (ipc.LaunchReceipt, error) {
 		HeadSHA:              *run.SubmittedHeadSHA,
 		SubmittedHeadSHA:     *run.SubmittedHeadSHA,
 		IntentDigest:         *run.LaunchIntentDigest,
-	}, nil
+	}
 }
 
 // HandleRerun creates a new run for the latest recoverable head on a branch:
@@ -1999,6 +2096,49 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		trackStartFailure("daemon_shutdown")
 		return "", fmt.Errorf("daemon is shutting down")
 	}
+	retained, _ := ctx.Value(pushNotificationKey{}).(*retainedPush)
+	if retained != nil {
+		if err := m.validateAndMarkNotification(ctx, retained); err != nil {
+			return "", err
+		}
+		previous, _, err := m.db.PushNotificationRuns(retained.ID)
+		if err != nil {
+			return "", err
+		}
+		if previous != nil {
+			return previous.ID, m.runAdmissionError(previous)
+		}
+		if id, handled, err := m.reattachReceivedRun(retained); handled || err != nil {
+			return id, err
+		}
+	}
+	globalCfg, globalCfgErr := config.LoadGlobal(m.paths.ConfigFile())
+	if globalCfgErr != nil {
+		active, err := m.db.GetActiveRun(repo.ID, branch)
+		if err != nil {
+			return "", err
+		}
+		if active == nil && launchNonce == "" && agentcfg.OptionalPiProfile(profiles) == nil && types.ShippingFromContext(ctx) == nil && planID == "" {
+			creation := db.RunCreation{DiagnosticError: fmt.Sprintf("load config: %s", globalCfgErr)}
+			var diagnostic *db.Run
+			if retained != nil {
+				creation.NotificationID = retained.ID
+				_, diagnostic, err = m.db.PushNotificationRuns(retained.ID)
+				if err != nil {
+					return "", err
+				}
+			}
+			if diagnostic == nil {
+				owner := types.RunOwnerFromContext(ctx)
+				_, err = m.db.InsertRunWithAllOptions(repo.ID, branch, headSHA, baseSHA, &db.RunIntent{Summary: intent, Source: source, Owner: owner, SessionID: owner}, "", "", "", "", false, omitIntent, externalCIOwner, nil, nil, nil, creation)
+				if err != nil {
+					return "", fmt.Errorf("load global config: %w; record diagnostic: %v", globalCfgErr, err)
+				}
+			}
+		}
+		trackStartFailure("load_global_config")
+		return "", fmt.Errorf("load global config: %w", globalCfgErr)
+	}
 	// Best-effort only: a clone's remotes may change after init. Refresh the
 	// registered URLs before constructing any run-owned Git operation, but keep
 	// the exact prior repo value and continue when discovery, validation, or the
@@ -2018,16 +2158,19 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 	//
 	// The global config also decides the caller-side omit-intent default,
 	// which is stamped on the row at creation so recovery and reruns read the
-	// stamp back instead of a since-changed config file. Legacy launches keep
-	// their failed-row diagnostics on a bad global config: the load error is
-	// held until the row exists.
-	globalCfg, globalCfgErr := config.LoadGlobal(m.paths.ConfigFile())
+	// stamp back instead of a since-changed config file.
+	owner := types.RunOwnerFromContext(ctx)
+	if err := types.ValidateRunOwner(owner); err != nil {
+		return "", err
+	}
+	if owner == "" {
+		if globalCfg != nil && globalCfg.Intent.RequireOwner && trigger != "push" {
+			return "", fmt.Errorf("launch requires an owner: pass --owner or NO_MISTAKES_OWNER")
+		}
+		slog.Warn("launch has no owner; nobody is recorded to drive approval gates", "repo_id", repo.ID, "branch", branch)
+	}
 	var pin *agentcfg.PiProfile
 	if request := agentcfg.OptionalPiProfile(profiles); request != nil {
-		if globalCfgErr != nil {
-			trackStartFailure("load_global_config")
-			return "", fmt.Errorf("load global config: %w", globalCfgErr)
-		}
 		var err error
 		pin, err = globalCfg.ResolvePiProfile(request)
 		if err != nil {
@@ -2109,23 +2252,31 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 			}
 		}
 	}
-	// Cancel any active run for this repo+branch.
-	if err := m.cancelActiveRuns(repo.ID, branch); err != nil {
-		return "", err
-	}
+	predecessors := m.activeRunIDs(repo.ID, branch)
 
 	storedIntent := intent
 	if source != db.RunIntentSourceRerun && launchNonce == "" && plan == nil {
 		storedIntent = strings.TrimSpace(storedIntent)
 	}
 	var runIntent *db.RunIntent
-	if strings.TrimSpace(storedIntent) != "" {
+	if strings.TrimSpace(storedIntent) != "" || owner != "" {
 		if source == "" {
 			source = db.RunIntentSourceAgent
 		}
-		runIntent = &db.RunIntent{Summary: storedIntent, Source: source, Score: 1}
+		runIntent = &db.RunIntent{Summary: storedIntent, Source: source, Owner: owner, SessionID: owner, Score: 1}
 	}
 
+	issue, _ := ctx.Value(ownerAdmissionIssueKey{}).(string)
+	if owner == "" && trigger == "push" && (globalCfg.Intent.RequireOwner || issue != "") {
+		if runIntent == nil {
+			runIntent = &db.RunIntent{}
+		}
+		warning := "require_owner not enforced for post-receive (TUI/direct push): no pre-receive check (follow-up #82)"
+		if issue != "" {
+			warning = "invalid launch ownership: " + issue + "; admitted ownerless after receive (follow-up #82)"
+		}
+		runIntent.OwnerAdmission = &types.OwnerAdmissionEvent{Event: "launch_owner_policy_bypassed", CallerPath: "post-receive (TUI/direct push)", OwnerlessAdmitted: true, OwnerValidationError: issue, Warning: warning}
+	}
 	storedPRBaseBranch, err := normalizeRunPRBaseBranch(prBaseBranch)
 	if err != nil {
 		trackStartFailure("invalid_pr_base_branch")
@@ -2137,34 +2288,22 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 	// pr.publish_intent is enforced independently by the PR step.
 	storedOmitIntent := omitIntent || (globalCfg != nil && !globalCfg.Intent.PublishesIntentByDefault())
 
-	run, err := m.db.InsertRunWithAllOptions(repo.ID, branch, headSHA, baseSHA, runIntent, launchNonce, validationGeneration, intentDigest, storedPRBaseBranch, prBaseBranchRequested, storedOmitIntent, externalCIOwner, plan, pin, shippingPin)
+	creation := db.RunCreation{PRURL: strings.TrimSpace(inheritedPRURL), ClosingIssueRefs: closingIssues}
+	if retained != nil {
+		creation.NotificationID = retained.ID
+	}
+	if m.beforeRunInsert != nil {
+		m.beforeRunInsert()
+	}
+	run, err := m.db.InsertRunWithAllOptions(repo.ID, branch, headSHA, baseSHA, runIntent, launchNonce, validationGeneration, intentDigest, storedPRBaseBranch, prBaseBranchRequested, storedOmitIntent, externalCIOwner, plan, pin, shippingPin, creation)
 	if err != nil {
 		trackStartFailure("create_run")
 		return "", fmt.Errorf("create run: %w", err)
 	}
-	if inherited := strings.TrimSpace(inheritedPRURL); inherited != "" {
-		if err := m.db.UpdateRunPRURL(run.ID, inherited); err != nil {
-			m.failRunSetup(ctx, run.ID, false, fmt.Sprintf("inherit PR URL: %s", err))
-			trackStartFailure("inherit_pr_url")
-			return "", fmt.Errorf("inherit PR URL: %w", err)
-		}
-		run.PRURL = &inherited
-	}
-	if len(closingIssues) > 0 {
-		if err := m.db.UpdateRunClosingIssueRefs(run.ID, closingIssues); err != nil {
-			msg := fmt.Sprintf("persist closing issue references: %s", err)
-			m.failRunSetup(ctx, run.ID, false, msg)
-			trackStartFailure("persist_closing_issue_refs")
-			return "", fmt.Errorf("persist closing issue references: %w", err)
-		}
-	}
-
-	// Legacy launches retain their existing failed-row diagnostics on a bad
-	// global config. Explicit profiles already resolved before supersession.
-	if globalCfgErr != nil {
-		m.failRunSetup(ctx, run.ID, false, fmt.Sprintf("load config: %s", globalCfgErr))
-		trackStartFailure("load_global_config")
-		return "", fmt.Errorf("load global config: %w", globalCfgErr)
+	if err := m.cancelRunIDs(predecessors); err != nil {
+		m.failRunSetup(ctx, run.ID, false, fmt.Sprintf("supersede predecessor: %s", err))
+		trackStartFailure("supersede_predecessor")
+		return "", fmt.Errorf("supersede predecessor for replacement run %s: %w; inspect no-mistakes axi status --run %s and correct the fault before no-mistakes rerun", run.ID, err, run.ID)
 	}
 
 	// Admission. The run row is durable from here on. A run that fits under
@@ -2180,6 +2319,14 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		m.failRunSetup(ctx, run.ID, false, fmt.Sprintf("queue run: %s", err))
 		trackStartFailure("queue_run")
 		return "", fmt.Errorf("queue run: %w", err)
+	}
+	if m.afterPushCommitted != nil && retained != nil {
+		m.afterPushCommitted()
+	}
+	if runIntent != nil && runIntent.OwnerAdmission != nil {
+		slog.Warn(runIntent.OwnerAdmission.Warning,
+			"event", "launch_owner_policy_bypassed", "run_id", run.ID, "repo_id", repo.ID, "branch", branch,
+			"caller_path", "post-receive (TUI/direct push)", "ownerless_admitted", true)
 	}
 	if slot == nil {
 		telemetry.Track("run", telemetry.Fields{
@@ -3145,6 +3292,10 @@ func (m *RunManager) HandleCancel(runID string) error {
 // The cancellation cause is propagated to the executor via context.Cause,
 // which uses it as the run's error message in the DB.
 func (m *RunManager) cancelActiveRuns(repoID, branch string) error {
+	return m.cancelRunIDs(m.activeRunIDs(repoID, branch))
+}
+
+func (m *RunManager) activeRunIDs(repoID, branch string) []string {
 	m.mu.Lock()
 	var ids []string
 	for id, owned := range m.runs {
@@ -3155,6 +3306,10 @@ func (m *RunManager) cancelActiveRuns(repoID, branch string) error {
 		}
 	}
 	m.mu.Unlock()
+	return ids
+}
+
+func (m *RunManager) cancelRunIDs(ids []string) error {
 	if m.afterSupersedeSnapshot != nil {
 		m.afterSupersedeSnapshot()
 	}

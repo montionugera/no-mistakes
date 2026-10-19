@@ -54,11 +54,9 @@ func openEvalStore() (*paths.Paths, *eval.Store, error) {
 // back to the fingerprint rather than failing an eval command that otherwise
 // needs no database at all.
 //
-// The read goes through db.OpenReadOnly, never db.Open. db.Open creates the
-// database and runs every migration, so routing a display lookup through it
-// made `eval sets`, `eval report`, and `eval run` initialize pipeline state on
-// a machine that has none, and migrate the schema of a database a running
-// daemon owns. A missing database is the ordinary case here (os.IsNotExist),
+// The read goes through db.OpenReadOnly, never db.Open, which can create a
+// database or migrate an older schema. A display lookup must do neither.
+// A missing database is the ordinary case here (os.IsNotExist),
 // not an error worth reporting: the dashboards simply show fingerprints.
 func evalRepoNames(p *paths.Paths) map[string]string {
 	database, err := db.OpenReadOnly(p.DB())
@@ -79,7 +77,7 @@ func newEvalCaptureCmd() *cobra.Command {
 		Short: "Capture every review pass from a run into local cases",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p, database, err := openResources()
+			p, database, err := openReadResources()
 			if err != nil {
 				return err
 			}
@@ -134,7 +132,7 @@ func newEvalMissIngestCmd() *cobra.Command {
 				}
 				misses = append(misses, miss)
 			}
-			p, database, err := openResources()
+			p, database, err := openReadResources()
 			if err != nil {
 				return err
 			}
@@ -264,7 +262,7 @@ func newEvalRelabelCmd() *cobra.Command {
 		Short: "Refresh gold labels when a source PR has merged after capture",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p, database, err := openResources()
+			p, database, err := openReadResources()
 			if err != nil {
 				return err
 			}

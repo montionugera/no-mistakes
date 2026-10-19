@@ -11,6 +11,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/daemon"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
@@ -23,7 +24,7 @@ import (
 const recentRunsHomeLimit = 10
 
 // newAxiCmd builds the agent-facing command tree. Everything under `axi`
-// follows AXI conventions: TOON on stdout, progress on stderr, structured
+// follows AXI conventions: structured stdout, progress on stderr, structured
 // errors, and explicit exit codes. It is the surface an agent (or the
 // /no-mistakes skill) drives; humans use the bare `no-mistakes` TUI instead.
 func newAxiCmd() *cobra.Command {
@@ -82,7 +83,7 @@ func (e *axiEnv) close() {
 // openAxiEnv resolves paths, opens the DB, and finds the repo for the current
 // directory. When ensureDaemon is true it also starts (if needed) and dials
 // the daemon, populating client. Errors are returned for the caller to render
-// as structured TOON.
+// as structured output in the command's selected format.
 func openAxiEnv(ensureDaemonConn bool) (*axiEnv, error) {
 	return openAxiEnvWithOptions(axiEnvOptions{ensureDaemonConn: ensureDaemonConn})
 }
@@ -96,7 +97,18 @@ func openAxiRunEnv() (*axiEnv, error) {
 }
 
 func openAxiEnvWithOptions(opts axiEnvOptions) (*axiEnv, error) {
-	p, d, err := openResources()
+	// Implicit observations need a repository even before a database exists.
+	// Explicit run IDs can be inspected from any directory.
+	if !opts.ensureDaemonConn && opts.explicitRunID == "" {
+		if _, err := git.FindGitRoot("."); err != nil {
+			return nil, fmt.Errorf("not in a git repository")
+		}
+	}
+	open := openReadResources
+	if opts.ensureDaemonConn {
+		open = openResources
+	}
+	p, d, err := open()
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +293,7 @@ func runsFields(runs []*db.Run, limit int) []toon.Field {
 		if r.PRURL != nil {
 			pr = *r.PRURL
 		}
-		rows = append(rows, runRow{ID: r.ID, Branch: r.Branch, Status: string(r.Status), Head: shortSHA(r.HeadSHA), PR: pr})
+		rows = append(rows, runRow{Owner: r.Owner(), Ownerless: r.Owner() == "", ID: r.ID, Branch: r.Branch, Status: string(r.Status), Head: shortSHA(r.HeadSHA), PR: pr})
 	}
 	return []toon.Field{
 		{Key: "count", Value: fmt.Sprintf("%d of %d total", len(shown), len(runs))},

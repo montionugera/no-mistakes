@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -74,7 +75,9 @@ type Run struct {
 	Intent          *string
 	IntentSource    *string
 	IntentSessionID *string
-	IntentScore     *float64
+	// LaunchOwner is explicit responsibility, independent of transcript provenance.
+	LaunchOwner *string
+	IntentScore *float64
 	// LaunchNonce, LaunchValidationGeneration, and LaunchIntentDigest are
 	// nullable for ordinary and historical rows. Together they bind one opaque
 	// proof request to this run; only receipt-specific IPC exposes them.
@@ -116,7 +119,16 @@ type Run struct {
 	UpdatedAt                int64
 }
 
-const runColumns = `id, repo_id, branch, head_sha, base_sha, worktree_dir, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, launch_receipt_claimed_at, pr_base_branch, COALESCE(pr_base_branch_requested, 0), COALESCE(retarget_attempted, 0), target_advance_rewinds, pending_target_rewind_id, COALESCE(omit_intent, 0), COALESCE(external_ci_owner, ''), pi_profile, verification_plan, closing_issue_refs, closing_issue_refs_locked_at, shipping_options, created_at, updated_at`
+// Owner returns explicit launch responsibility. Legacy transcript session IDs
+// describe intent provenance, not a person responsible for answering gates.
+func (r *Run) Owner() string {
+	if r.LaunchOwner == nil {
+		return ""
+	}
+	return strings.TrimSpace(*r.LaunchOwner)
+}
+
+const runColumns = `id, repo_id, branch, head_sha, base_sha, worktree_dir, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, launch_owner, launch_nonce, launch_validation_generation, launch_intent_digest, launch_receipt_claimed_at, pr_base_branch, COALESCE(pr_base_branch_requested, 0), COALESCE(retarget_attempted, 0), target_advance_rewinds, pending_target_rewind_id, COALESCE(omit_intent, 0), COALESCE(external_ci_owner, ''), pi_profile, verification_plan, closing_issue_refs, closing_issue_refs_locked_at, shipping_options, created_at, updated_at`
 
 func scanRun(row interface {
 	Scan(...any) error
@@ -128,7 +140,7 @@ func scanRun(row interface {
 		&r.LastPushedSHA, &r.PushTargetKind, &r.PushTargetFingerprint, &r.PushRef,
 		&r.LastPushedAt, &r.PushGeneration, &r.PushActive, &r.TerminalHeadVerifiedAt,
 		&r.CustodyReturnedAt, &r.Error, &r.AwaitingAgentSince, &r.ParkedMS,
-		&r.Intent, &r.IntentSource, &r.IntentSessionID, &r.IntentScore,
+		&r.Intent, &r.IntentSource, &r.IntentSessionID, &r.IntentScore, &r.LaunchOwner,
 		&r.LaunchNonce, &r.LaunchValidationGeneration, &r.LaunchIntentDigest, &r.LaunchReceiptClaimedAt,
 		&r.PRBaseBranch, &r.PRBaseBranchRequested, &r.RetargetAttempted, &r.TargetAdvanceRewinds, &r.PendingTargetRewindID, &r.OmitIntent, &r.ExternalCIOwner, &r.PiProfile, &r.VerificationPlan,
 		&storedClosingIssues, &r.ClosingIssueRefsLockedAt, &r.Shipping,
@@ -195,7 +207,7 @@ func (d *DB) InsertRunWithShipping(repoID, branch, headSHA, baseSHA string, inte
 
 // InsertRunWithAllOptions is the shared insertion path for shipping, PR-base,
 // external CI ownership, intent, launch, and profile options.
-func (d *DB) InsertRunWithAllOptions(repoID, branch, headSHA, baseSHA string, intent *RunIntent, launchNonce, validationGeneration, intentDigest, prBaseBranch string, requested, omitIntent bool, externalCIOwner string, plan *verificationplan.Snapshot, pin *agentcfg.PiProfile, shipping *types.ShippingOptions) (*Run, error) {
+func (d *DB) InsertRunWithAllOptions(repoID, branch, headSHA, baseSHA string, intent *RunIntent, launchNonce, validationGeneration, intentDigest, prBaseBranch string, requested, omitIntent bool, externalCIOwner string, plan *verificationplan.Snapshot, pin *agentcfg.PiProfile, shipping *types.ShippingOptions, creation ...RunCreation) (*Run, error) {
 	if err := shipping.Validate(); err != nil {
 		return nil, err
 	}
@@ -240,6 +252,7 @@ func (d *DB) InsertRunWithAllOptions(repoID, branch, headSHA, baseSHA string, in
 		r.IntentSource = &intent.Source
 		r.IntentSessionID = &intent.SessionID
 		r.IntentScore = &intent.Score
+		r.LaunchOwner = &intent.Owner
 	}
 	prBaseBranch = strings.TrimSpace(prBaseBranch)
 	if prBaseBranch != "" {
@@ -251,12 +264,78 @@ func (d *DB) InsertRunWithAllOptions(repoID, branch, headSHA, baseSHA string, in
 	r.PRBaseBranchRequested = requested
 	r.OmitIntent = omitIntent
 	r.ExternalCIOwner = externalCIOwner
-	_, err := d.sql.Exec(
-		`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, status, pr_state, intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, pr_base_branch, pr_base_branch_requested, omit_intent, external_ci_owner, pi_profile, verification_plan, shipping_options, created_at, updated_at, retarget_attempted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
-		r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, headSHA, r.NoMistakesVersion, r.NoMistakesBuildSHA, r.Status, r.Intent, r.IntentSource, r.IntentSessionID, r.IntentScore, r.LaunchNonce, r.LaunchValidationGeneration, r.LaunchIntentDigest, r.PRBaseBranch, r.PRBaseBranchRequested, r.OmitIntent, r.ExternalCIOwner, r.PiProfile, r.VerificationPlan, r.Shipping, r.CreatedAt, r.UpdatedAt,
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin run admission: %w", err)
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(
+		`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, status, pr_state, intent, intent_source, intent_session_id, intent_score, launch_owner, launch_nonce, launch_validation_generation, launch_intent_digest, pr_base_branch, pr_base_branch_requested, omit_intent, external_ci_owner, pi_profile, verification_plan, shipping_options, created_at, updated_at, retarget_attempted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+		r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, headSHA, r.NoMistakesVersion, r.NoMistakesBuildSHA, r.Status, r.Intent, r.IntentSource, r.IntentSessionID, r.IntentScore, r.LaunchOwner, r.LaunchNonce, r.LaunchValidationGeneration, r.LaunchIntentDigest, r.PRBaseBranch, r.PRBaseBranchRequested, r.OmitIntent, r.ExternalCIOwner, r.PiProfile, r.VerificationPlan, r.Shipping, r.CreatedAt, r.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert run: %w", err)
+	}
+	if intent != nil && intent.OwnerAdmission != nil {
+		event := *intent.OwnerAdmission
+		event.RunID, event.Branch, event.CreatedAt = r.ID, r.Branch, ts
+		payload, err := json.Marshal(event)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec("INSERT INTO owner_admission_events(run_id,payload) VALUES (?,?)", r.ID, string(payload)); err != nil {
+			return nil, fmt.Errorf("record owner admission: %w", err)
+		}
+	}
+	if len(creation) > 0 {
+		c := creation[0]
+		if c.PRURL != "" {
+			if _, err := tx.Exec("UPDATE runs SET pr_url=? WHERE id=?", c.PRURL, r.ID); err != nil {
+				return nil, err
+			}
+			r.PRURL = &c.PRURL
+		}
+		refs, err := closingissues.Normalize(c.ClosingIssueRefs)
+		if err != nil {
+			return nil, err
+		}
+		if len(refs) > 0 {
+			raw, err := closingissues.Encode(refs)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := tx.Exec("UPDATE runs SET closing_issue_refs=? WHERE id=?", raw, r.ID); err != nil {
+				return nil, err
+			}
+			r.ClosingIssueRefs = refs
+		}
+		if c.DiagnosticError != "" {
+			if _, err := tx.Exec("UPDATE runs SET status=?,error=? WHERE id=?", types.RunFailed, c.DiagnosticError, r.ID); err != nil {
+				return nil, err
+			}
+			r.Status = types.RunFailed
+			r.Error = &c.DiagnosticError
+		}
+		if c.NotificationID != "" {
+			column := "run_id"
+			if c.DiagnosticError != "" {
+				column = "diagnostic_run_id"
+			}
+			result, err := tx.Exec("INSERT INTO push_notifications(notification_id,"+column+") VALUES (?,?) ON CONFLICT(notification_id) DO UPDATE SET "+column+"=excluded."+column+" WHERE push_notifications."+column+" IS NULL", c.NotificationID, r.ID)
+			if err != nil {
+				return nil, err
+			}
+			n, err := result.RowsAffected()
+			if err != nil {
+				return nil, err
+			}
+			if n != 1 {
+				return nil, fmt.Errorf("notification already recorded")
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit run admission: %w", err)
 	}
 	return r, nil
 }
@@ -427,23 +506,41 @@ func (d *DB) GetRunByLaunchNonce(repoID, branch, launchNonce string) (*Run, erro
 	return r, nil
 }
 
+func (r *Run) AdmissionError() error {
+	if r == nil {
+		return fmt.Errorf("admission run missing")
+	}
+	if r.Status == types.RunFailed || r.Status == types.RunCancelled && (r.Error == nil || *r.Error != types.RunCancelReasonSuperseded) {
+		reason := ""
+		if r.Error != nil {
+			reason = *r.Error
+		}
+		return fmt.Errorf("run %s %s: %s; inspect no-mistakes axi status --run %s; after correcting the fault, start a new validation with no-mistakes rerun from the repository", r.ID, r.Status, reason, r.ID)
+	}
+	return nil
+}
+
 // ClaimLaunchReceipt atomically returns the exact nonce-bound row and whether
 // this caller is its first observer. The expected immutable receipt binding,
 // including an explicit PR base branch, is part of the UPDATE predicate, so a
 // conflicting observer cannot consume `created`.
 func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch string, omitIntent bool, shipping *types.ShippingOptions, profiles ...*agentcfg.PiProfile) (*Run, bool, error) {
-	return d.ClaimLaunchReceiptWithAllOptions(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, omitIntent, shipping, "", agentcfg.OptionalPiProfile(profiles))
+	return d.ClaimLaunchReceiptWithAllOptions(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, omitIntent, shipping, "", "", agentcfg.OptionalPiProfile(profiles))
 }
 
 // ClaimLaunchReceiptWithExternalOwner refuses a mismatched owner before the
 // first-observer marker can be consumed by an incompatible proof request.
 func (d *DB) ClaimLaunchReceiptWithExternalOwner(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch string, omitIntent bool, externalCIOwner string, profiles ...*agentcfg.PiProfile) (*Run, bool, error) {
-	return d.ClaimLaunchReceiptWithAllOptions(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, omitIntent, nil, externalCIOwner, agentcfg.OptionalPiProfile(profiles))
+	return d.ClaimLaunchReceiptWithAllOptions(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, omitIntent, nil, externalCIOwner, "", agentcfg.OptionalPiProfile(profiles))
 }
 
 // ClaimLaunchReceiptWithAllOptions validates the complete immutable launch
 // binding before consuming its first-observer marker.
-func (d *DB) ClaimLaunchReceiptWithAllOptions(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch string, omitIntent bool, shipping *types.ShippingOptions, externalCIOwner string, request *agentcfg.PiProfile) (*Run, bool, error) {
+func (d *DB) ClaimLaunchReceiptWithAllOptions(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch string, omitIntent bool, shipping *types.ShippingOptions, externalCIOwner, owner string, request *agentcfg.PiProfile, validators ...func(*Run) error) (*Run, bool, error) {
+	if err := types.ValidateRunOwner(owner); err != nil {
+		return nil, false, err
+	}
+	owner = strings.TrimSpace(owner)
 	if err := shipping.Validate(); err != nil {
 		return nil, false, err
 	}
@@ -477,8 +574,12 @@ func (d *DB) ClaimLaunchReceiptWithAllOptions(repoID, branch, launchNonce, submi
 	}
 	prBaseBranch = strings.TrimSpace(prBaseBranch)
 	for {
+		tx, err := d.sql.Begin()
+		if err != nil {
+			return nil, false, fmt.Errorf("begin launch receipt claim: %w", err)
+		}
 		r := &Run{}
-		err := scanRun(d.sql.QueryRow(
+		err = scanRun(tx.QueryRow(
 			`UPDATE runs SET launch_receipt_claimed_at = ?
 			 WHERE repo_id = ? AND branch = ? AND launch_nonce = ?
 			   AND submitted_head_sha = ? AND launch_validation_generation = ? AND launch_intent_digest = ?
@@ -487,21 +588,50 @@ func (d *DB) ClaimLaunchReceiptWithAllOptions(repoID, branch, launchNonce, submi
 			   AND (? = '' OR json_extract(shipping_options, '$.mode') = ?)
 			   AND (? IS NULL OR json_extract(shipping_options, '$.draft') = ?)
 			   AND external_ci_owner = ?
+			   AND COALESCE(launch_owner, '') = ?
 			   AND (? = '' OR json_extract(pi_profile, '$.model') = ?)
 			   AND (? = '' OR json_extract(pi_profile, '$.effort') = ?)
 			   AND launch_receipt_claimed_at IS NULL
 			 RETURNING `+runColumns,
-			now(), repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, prBaseBranch, omitIntent, omitIntent, shippingMode, shippingMode, shippingDraft, shippingDraft, externalCIOwner, model, model, effort, effort,
+			now(), repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, prBaseBranch, omitIntent, omitIntent, shippingMode, shippingMode, shippingDraft, shippingDraft, externalCIOwner, owner, model, model, effort, effort,
 		), r)
 		if err == nil {
+			err = r.AdmissionError()
+			for _, validate := range validators {
+				if err != nil {
+					break
+				}
+				err = validate(r)
+			}
+			if err != nil {
+				tx.Rollback()
+				return nil, false, err
+			}
+			if err := tx.Commit(); err != nil {
+				return nil, false, fmt.Errorf("commit launch receipt claim: %w", err)
+			}
 			return r, true, nil
 		}
+		tx.Rollback()
 		if !errors.Is(err, sql.ErrNoRows) {
 			return nil, false, fmt.Errorf("claim launch receipt: %w", err)
 		}
 		r, err = d.GetRunByLaunchNonce(repoID, branch, launchNonce)
 		if err != nil {
 			return nil, false, err
+		}
+		if r != nil && r.Owner() != owner {
+			return nil, false, fmt.Errorf("conflicting launch_nonce: owner differs from run")
+		}
+		if r != nil {
+			if err := r.AdmissionError(); err != nil {
+				return nil, false, err
+			}
+			for _, validate := range validators {
+				if err := validate(r); err != nil {
+					return nil, false, err
+				}
+			}
 		}
 		if r == nil || !r.Shipping.Matches(shipping) || !r.PiProfile.Matches(request) || r.ExternalCIOwner != externalCIOwner || r.LaunchReceiptClaimedAt != nil ||
 			r.SubmittedHeadSHA == nil || *r.SubmittedHeadSHA != submittedHeadSHA ||
@@ -1039,12 +1169,15 @@ func IsAuthoritativeRunIntentSource(source string) bool {
 	return source == RunIntentSourceAgent || source == RunIntentSourceRerun
 }
 
-// RunIntent carries the four intent-related columns persisted on a run.
+// RunIntent carries intent provenance and explicit launch ownership.
+// UpdateRunIntent changes provenance only; launch ownership remains immutable.
 type RunIntent struct {
-	Summary   string
-	Source    string
-	SessionID string
-	Score     float64
+	OwnerAdmission *types.OwnerAdmissionEvent
+	Owner          string
+	Summary        string
+	Source         string
+	SessionID      string
+	Score          float64
 }
 
 // UpdateRunIntent persists the inferred user intent for a run.
