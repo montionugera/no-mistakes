@@ -30,20 +30,8 @@ func Uninstall(p *paths.Paths) (string, error) {
 		}
 		return "", fmt.Errorf("inspect managed service %s: %w", definition, err)
 	}
-	instance := captureRunningDaemon(p)
-	if err := stopLaunchAgent(p); err != nil {
-		return "", fmt.Errorf("stop managed service: %w", err)
-	}
-	if alive, _ := daemonHealthCheck(p); alive {
-		if err := stopDetachedDaemon(p); err != nil {
-			return "", fmt.Errorf("stop daemon outside the managed service: %w", err)
-		}
-	}
-	if err := waitForDaemonStop(p, instance); err != nil {
-		return "", err
-	}
-	if err := removeLaunchAgent(p); err != nil {
-		return "", fmt.Errorf("remove managed service %s: %w", definition, err)
+	if err := stopPlannedDaemon(p, func() error { return removeLaunchAgent(p) }); err != nil {
+		return "", fmt.Errorf("stop daemon before removing managed service: %w", err)
 	}
 	return definition, nil
 }

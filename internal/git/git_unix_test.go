@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -72,8 +73,13 @@ wait "$descendant"
 	cancel()
 	select {
 	case err := <-result:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Run() error = %v, want wrapped %v", err, context.Canceled)
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want original signal exit and context cancellation metadata", err)
+		}
+		status, ok := exit.Sys().(syscall.WaitStatus)
+		if !ok || !status.Signaled() || status.Signal() != syscall.SIGTERM {
+			t.Fatalf("Run() exit status = %v, want SIGTERM", exit.Sys())
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run() did not return promptly after cancellation")

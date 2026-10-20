@@ -174,6 +174,15 @@ func TestRunTestDaemonStartupError(t *testing.T) {
 // RunWithOptions to return. stopWithin only bounds how long a daemon that
 // never exits can stall the test. Register cleanup for resources that must
 // outlive the daemon (d and its root) before calling this.
+func testShutdownParams(t *testing.T, p *paths.Paths) *ipc.ShutdownParams {
+	t.Helper()
+	instance := captureRunningDaemon(p)
+	if instance.pid <= 0 || instance.startedAt.IsZero() || instance.instance == "" {
+		t.Fatal("test daemon has no complete runtime identity")
+	}
+	return &ipc.ShutdownParams{ExpectedPID: instance.pid, ExpectedStartedAt: instance.startedAt.UTC().Format(time.RFC3339Nano), ExpectedInstance: instance.instance}
+}
+
 func runTestDaemon(t *testing.T, p *paths.Paths, d *db.DB, sf StepFactory, stopWithin time.Duration) {
 	t.Helper()
 
@@ -186,7 +195,7 @@ func runTestDaemon(t *testing.T, p *paths.Paths, d *db.DB, sf StepFactory, stopW
 
 	t.Cleanup(func() {
 		if client, err := ipc.Dial(p.Socket()); err == nil {
-			_ = client.Call(ipc.MethodShutdown, &ipc.ShutdownParams{}, nil)
+			_ = client.Call(ipc.MethodShutdown, testShutdownParams(t, p), nil)
 			client.Close()
 		}
 		select {
@@ -587,7 +596,7 @@ func shutdownTestDaemonAndWaitForCleanup(t *testing.T, p *paths.Paths) {
 	if err != nil {
 		t.Fatalf("dial daemon for shutdown: %v", err)
 	}
-	if err := client.Call(ipc.MethodShutdown, &ipc.ShutdownParams{}, nil); err != nil {
+	if err := client.Call(ipc.MethodShutdown, testShutdownParams(t, p), nil); err != nil {
 		client.Close()
 		t.Fatalf("shut down daemon: %v", err)
 	}
@@ -606,4 +615,20 @@ func shutdownTestDaemonAndWaitForCleanup(t *testing.T, p *paths.Paths) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("daemon did not finish cleanup within 15s")
+}
+
+// registerTestRunCancel registers a run whose cancel handle a test drives
+// directly, as a consumed handle whose goroutine the test counts in wg.
+func registerTestRunCancel(m *RunManager, runID string, cancel context.CancelCauseFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.runs[runID] = &managedRun{state: ownershipClaimed, handle: &runHandle{cancel: cancel, done: make(chan struct{}), consumed: true}}
+}
+
+// testRunOwned reports whether the manager still owns a run's executor.
+func testRunOwned(m *RunManager, runID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	owned := m.runs[runID]
+	return owned != nil && owned.executor != nil
 }

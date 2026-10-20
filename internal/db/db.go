@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/sqlitewrite"
@@ -23,11 +24,12 @@ var (
 // Bump whenever schemaSQL or migrationStatements changes. Version zero is the
 // historical, unversioned schema; its complete upgrade runs once before the
 // stamp is committed. Current opens execute no DDL or backfill DML.
-const schemaVersion = 3
+const schemaVersion = 4
 
 // DB wraps a SQLite database connection.
 type DB struct {
-	sql *sql.DB
+	sql    *sql.DB
+	closed atomic.Bool
 	// queueClock stamps queued_at; nil means the wall clock. A test seam for
 	// proving the stored queue order does not depend on the clock.
 	queueClock func() int64
@@ -84,6 +86,14 @@ func migrateWriteAttempt(sqlDB *sql.DB) error {
 		}
 		if _, err := tx.Exec(pushNotificationSchema); err != nil {
 			return fmt.Errorf("migrate db (push_notifications): %w", err)
+		}
+		if _, err := tx.Exec(statusValidationSchema); err != nil {
+			return fmt.Errorf("migrate db (status validation): %w", err)
+		}
+		for _, stmt := range statusValidationMigrationStatements {
+			if _, err := tx.Exec(stmt); err != nil && !isDuplicateColumnErr(err) {
+				return fmt.Errorf("migrate db (%s): %w", stmt, err)
+			}
 		}
 		if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
 			return err
@@ -163,6 +173,7 @@ func isDuplicateColumnErr(err error) bool {
 
 // Close closes the database connection.
 func (d *DB) Close() error {
+	d.closed.Store(true)
 	return d.sql.Close()
 }
 
@@ -177,3 +188,5 @@ func newID() string {
 func now() int64 {
 	return time.Now().Unix()
 }
+
+func (d *DB) Closed() bool { return d.closed.Load() }

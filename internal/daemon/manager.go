@@ -52,13 +52,21 @@ type RunManager struct {
 	// beforeAnswerRespond is a test scheduling barrier, nil in production.
 	beforeAnswerRespond func()
 
-	mu           sync.Mutex
-	runs         map[string]*managedRun
-	wg           sync.WaitGroup // tracks background run goroutines
-	shuttingDown atomic.Bool    // prevents new runs during shutdown
-	db           *db.DB
-	paths        *paths.Paths
-	steps        StepFactory
+	runtimeInstance  string
+	runtimeStartedAt time.Time
+	mu               sync.Mutex
+	runs             map[string]*managedRun
+	wg               sync.WaitGroup // tracks background run goroutines
+	shutdownState    atomic.Int32   // prevents new runs during shutdown
+	db               *db.DB
+	paths            *paths.Paths
+	steps            StepFactory
+
+	// shutdownPreparation is the in-flight instance-bound planned shutdown.
+	shutdownPreparation *controlledShutdownPreparation
+	// leftForRecovery names runs a shutdown deliberately left non-terminal
+	// (parked at a gate or monitoring CI) for the next start's recovery.
+	leftForRecovery map[string]bool
 
 	notificationMu           sync.Mutex
 	afterPushRetained        func()
@@ -152,13 +160,15 @@ func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *Ru
 		stepFactory = func() []pipeline.Step { return steps.AllSteps() }
 	}
 	m := &RunManager{
-		runs:          make(map[string]*managedRun),
-		db:            database,
-		paths:         p,
-		steps:         stepFactory,
-		subscribers:   make(map[string][]*eventMailbox),
-		stateRevs:     make(map[string]int64),
-		completedRuns: make(map[string]bool),
+		runtimeInstance: newShutdownToken(),
+		runs:            make(map[string]*managedRun),
+		leftForRecovery: make(map[string]bool),
+		db:              database,
+		paths:           p,
+		steps:           stepFactory,
+		subscribers:     make(map[string][]*eventMailbox),
+		stateRevs:       make(map[string]int64),
+		completedRuns:   make(map[string]bool),
 	}
 	m.beforeAnswerRespond = defaultBeforeAnswerRespond
 	m.limitsCache = runLimits{max: config.DefaultMaxConcurrentRuns}
@@ -283,13 +293,13 @@ func (m *RunManager) SlotUsage() ipc.SlotsResult {
 }
 
 func (m *RunManager) startQueuedRun(runID string, slot *runSlot) (func(), bool) {
-	if m.shuttingDown.Load() {
+	if m.shutdownState.Load() != shutdownIdle {
 		return slot.Release, true
 	}
 	if m.beforeQueuedRegister != nil {
 		m.beforeQueuedRegister()
 	}
-	if m.shuttingDown.Load() {
+	if m.shutdownState.Load() != shutdownIdle {
 		return slot.Release, true
 	}
 	claimed, err := m.claimQueued(runID)
@@ -334,9 +344,12 @@ func (m *RunManager) launchQueuedRun(runID string, slot *runSlot, handle *runHan
 		// executor exists; any earlier exit must unregister it here.
 		if r := recover(); r != nil {
 			slog.Error("panic launching queued run", "run_id", runID, "panic", r)
-			m.failRunSetup(handle.runCtx, runID, false, fmt.Sprintf("internal panic: %v", r))
+			m.failRunSetup(handle.runCtx, runID, false, fmt.Errorf("internal panic: %v", r))
 		}
 		if !handle.consumed {
+			if !m.terminalRunSettled(runID) {
+				return
+			}
 			m.mu.Lock()
 			if owned := m.runs[runID]; owned != nil && owned.handle == handle {
 				delete(m.runs, runID)
@@ -349,82 +362,119 @@ func (m *RunManager) launchQueuedRun(runID string, slot *runSlot, handle *runHan
 		}
 	}()
 	if cause := context.Cause(handle.runCtx); cause != nil {
-		m.failRunSetup(handle.runCtx, runID, false, cause.Error())
+		m.failRunSetup(handle.runCtx, runID, false, cause)
 		return
 	}
 	run, err := m.db.GetRun(runID)
 	if err != nil || run == nil {
 		slog.Error("queued run is unreadable", "run_id", runID, "error", err)
-		m.failRunSetup(handle.runCtx, runID, false, "queued run is unreadable")
+		if err == nil {
+			err = fmt.Errorf("run is missing")
+		}
+		m.failRunSetup(handle.runCtx, runID, false, fmt.Errorf("queued run is unreadable: %w", err))
 		return
 	}
-	fail := func(msg string) {
-		slog.Error("queued run cannot start", "run_id", runID, "error", msg)
-		m.failRunSetup(handle.runCtx, runID, false, msg)
+	fail := func(err error) {
+		slog.Error("queued run cannot start", "run_id", runID, "error", err)
+		m.failRunSetup(handle.runCtx, runID, false, err)
 	}
 	repo, err := m.db.GetRepo(run.RepoID)
 	if err != nil || repo == nil {
-		fail("queued run repository is missing")
+		if err == nil {
+			err = fmt.Errorf("repository is missing")
+		}
+		fail(fmt.Errorf("queued run repository is missing: %w", err))
 		return
 	}
 	var spec queueSpec
 	raw, err := m.db.GetRunQueueSpec(runID)
 	if err != nil {
-		fail(fmt.Sprintf("read queued run spec: %s", err))
+		fail(fmt.Errorf("read queued run spec: %w", err))
 		return
 	}
 	if raw != "" {
 		if err := json.Unmarshal([]byte(raw), &spec); err != nil {
-			fail(fmt.Sprintf("decode queued run spec: %s", err))
+			fail(fmt.Errorf("decode queued run spec: %w", err))
 			return
 		}
 	}
 	globalCfg, err := config.LoadGlobal(m.paths.ConfigFile())
 	if err != nil {
-		fail(fmt.Sprintf("load config: %s", err))
+		fail(fmt.Errorf("load config: %w", err))
 		return
 	}
 	_, _ = m.launchRun(handle.runCtx, repo, run, globalCfg, spec.Trigger, spec.SkipSteps, slot, handle)
 }
 
-// failRunSetup preserves cancellation over the error from interrupted setup.
 // Its conditional write leaves terminal outcomes alone, and subscribers see
 // the saved verdict rather than a competing local failure reason.
 // started must become true once worktree creation succeeds: only failures before
 // that boundary can release custody without inspecting a managed worktree head.
-func (m *RunManager) failRunSetup(ctx context.Context, runID string, started bool, reason string) {
-	m.mu.Lock()
-	status := types.RunFailed
-	cause := context.Cause(ctx)
-	if owned := m.runs[runID]; owned != nil && owned.handle != nil {
-		if original := context.Cause(owned.handle.runCtx); original != nil {
-			cause = original
+func (m *RunManager) failRunSetup(ctx context.Context, runID string, started bool, setupErr error) error {
+	err := pipeline.SettleTerminalWrite(m.db, func() error {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		status, message := types.RunFailed, setupErr.Error()
+		cause := context.Cause(ctx)
+		if owned := m.runs[runID]; owned != nil && owned.handle != nil {
+			if original := context.Cause(owned.handle.runCtx); original != nil {
+				cause = original
+			}
 		}
-	}
-	if cause != nil {
-		status, reason = types.RunCancelled, cause.Error()
-	}
-	terminate := m.db.TerminateActiveRun
-	if !started {
-		terminate = m.db.TerminateUnstartedRun
-	}
-	_, err := terminate(runID, reason, status)
-	run, readErr := m.db.GetRun(runID)
-	m.mu.Unlock()
+		cancelled := pipeline.CancellationOnly(setupErr, cause)
+		if cancelled {
+			status, message = types.RunCancelled, cause.Error()
+			var planned *pipeline.ControlledShutdownCause
+			if errors.Is(cause, pipeline.ErrDaemonShutdown) && !errors.As(cause, &planned) {
+				status = types.RunFailed
+			}
+		}
+		revoked, err := m.db.RawShutdownSuperseded(runID)
+		if err != nil {
+			return err
+		}
+		if revoked && cancelled {
+			status, message = types.RunFailed, db.RawShutdownReason
+		}
+		terminate := m.db.TerminateActiveRun
+		if !started {
+			terminate = m.db.TerminateUnstartedRun
+		}
+		if _, err := terminate(runID, message, status); err != nil {
+			return err
+		}
+		return nil
+	})
 	if err != nil {
-		slog.Warn("failed to persist run setup failure", "run_id", runID, "error", err)
+		slog.Error("setup terminal outcome unsettled; retaining run custody", "run_id", runID, "error", err)
+		return err
 	}
-	if readErr != nil {
-		slog.Warn("failed to read run setup outcome", "run_id", runID, "error", readErr)
-		return
+	run, err := pipeline.ReadSettledRun(m.db, runID)
+	if err != nil {
+		return fmt.Errorf("read setup terminal outcome for run %s: %w", runID, err)
 	}
-	if run != nil && !run.Status.Active() {
-		reason = ""
-		if run.Error != nil {
-			reason = *run.Error
-		}
-		m.broadcastTerminal(run, run.Status, reason)
+	if run == nil || !run.Status.Terminal() {
+		return fmt.Errorf("setup terminal outcome unavailable for run %s", runID)
 	}
+	reason := ""
+	if run.Error != nil {
+		reason = *run.Error
+	}
+	m.broadcastTerminal(run, run.Status, reason)
+	return nil
+}
+
+func (m *RunManager) failUnadmittedRunSetup(ctx context.Context, run *db.Run, setupErr error) error {
+	m.mu.Lock()
+	m.runs[run.ID] = &managedRun{run: run, state: ownershipFinishing}
+	m.mu.Unlock()
+	if err := m.failRunSetup(ctx, run.ID, false, setupErr); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	delete(m.runs, run.ID)
+	m.mu.Unlock()
+	return nil
 }
 
 // claimRetryDelay spaces retries of a queued run whose claim failed, so a
@@ -668,6 +718,17 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	if err != nil {
 		return nil, fmt.Errorf("resolve forge profile: %w", err)
 	}
+	var obsolete bool
+	if err := pipeline.WithCommitStatusLock(ctx, func() error {
+		var err error
+		obsolete, err = m.db.ReconcileRecoveredRun(run.ID, m.runtimeInstance)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	if obsolete {
+		return nil, fmt.Errorf("unsettled shutdown from previous daemon runtime")
+	}
 	ag, err := newPipelineAgent(ctx, cfg, m.paths.EvidenceRoot(cfg.Test.Evidence.LocalRoot), exec.LookPath, forgeEnvironment(forgeCtx))
 	if err != nil {
 		return nil, err
@@ -901,7 +962,7 @@ func hasRebaseCoreStep(plan []pipeline.Step) bool {
 }
 
 func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
-	if m.shuttingDown.Load() {
+	if m.shutdownState.Load() != shutdownIdle {
 		_ = plan.agent.Close()
 		return
 	}
@@ -909,6 +970,7 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 	slot := &runSlot{s: m.sched, runID: plan.run.ID}
 	executor := pipeline.NewExecutor(m.db, m.paths, plan.cfg, plan.agent, plan.steps, m.broadcast)
 	executor.SetRunSlot(slot)
+	executor.SetRuntimeInstance(m.runtimeInstance)
 	executor.SetOnPRMerged(func(_ context.Context, runID string) {
 		m.wg.Add(1)
 		go func() {
@@ -920,33 +982,63 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 	if hasRebaseCoreStep(plan.steps) {
 		executor.SetPRContextGuard(steps.GuardPRContext)
 	}
-	registerErr := executor.RegisterRecoveredGate(plan.run)
+	// Registration inspects step implementations before the background panic
+	// handler owns this run. Convert a panic here into the same durable failure
+	// path as a registration error instead of crashing daemon recovery.
+	registerErr := func() (err error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				err = fmt.Errorf("internal panic: %v", recovered)
+			}
+		}()
+		return executor.RegisterRecoveredGate(plan.run)
+	}()
 	if registerErr == nil {
 		slot.Reserve()
 	}
 	done := make(chan struct{})
 	m.mu.Lock()
+	// Shutdown admission is fenced under m.mu: once shutdown began, a parked
+	// run that has not been registered stays parked for the next start, and
+	// one that has is counted in wg before shutdown can wait on it.
+	if m.shutdownState.Load() != shutdownIdle {
+		m.mu.Unlock()
+		cancel(pipeline.ErrDaemonShutdown)
+		_ = plan.agent.Close()
+		return
+	}
 	m.runs[plan.run.ID] = &managedRun{run: plan.run, state: ownershipRecoveringGate, handle: &runHandle{runCtx: runCtx, cancel: cancel, done: done}, executor: executor}
+	m.wg.Add(1)
 	m.mu.Unlock()
 
-	m.wg.Add(1)
 	go func() {
 		startedAt := time.Now()
 		defer m.wg.Done()
-		defer close(done)
 		parkedAtShutdown := false
 		defer slot.Release()
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				errMsg := fmt.Sprintf("internal panic: %v", recovered)
-				plan.run.Status = types.RunFailed
-				plan.run.Error = &errMsg
-				if err := m.db.UpdateRunErrorStatus(plan.run.ID, errMsg, types.RunFailed); err != nil {
+				if err := pipeline.RecordRunFailure(context.Background(), m.db, plan.run.ID, errMsg, nil); err != nil {
 					slog.Error("failed to update recovered run after panic", "run_id", plan.run.ID, "error", err)
+				} else {
+					plan.run.Status = types.RunFailed
+					plan.run.Error = &errMsg
+					if err := executor.ReportSettledRunFailure(context.Background(), plan.run, plan.repo); err != nil {
+						slog.Error("recovered terminal notification failed", "run_id", plan.run.ID, "error", err)
+					}
 				}
-			}
-			if plan.run.Status == types.RunFailed || plan.run.Status == types.RunCancelled {
+			} else if plan.run.Status == types.RunFailed || plan.run.Status == types.RunCancelled {
 				executor.ReportPublishedHeadFailure(context.Background(), plan.run, plan.repo)
+			}
+			// A run left for recovery keeps its non-terminal record by design;
+			// any other run keeps custody until its terminal outcome settles.
+			if parkedAtShutdown {
+				if !m.releaseShutdownForRecovery(plan.run.ID) {
+					return
+				}
+			} else if !m.terminalRunSettled(plan.run.ID) {
+				return
 			}
 			cancel(nil)
 			_ = plan.agent.Close()
@@ -962,6 +1054,7 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 			m.mu.Lock()
 			delete(m.runs, plan.run.ID)
 			m.mu.Unlock()
+			close(done)
 		}()
 
 		if registerErr == nil {
@@ -970,7 +1063,10 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 		m.mu.Lock()
 		m.runs[plan.run.ID].state = ownershipClaimed
 		m.mu.Unlock()
-		resumeErr := executor.Resume(runCtx, plan.run, plan.repo, plan.workDir)
+		resumeErr := registerErr
+		if resumeErr == nil {
+			resumeErr = executor.Resume(runCtx, plan.run, plan.repo, plan.workDir)
+		}
 		// Mark finishing before releasing: Release dispatches queued runs
 		// synchronously, and a push landing in that window must not treat
 		// this already-decided run as a claimed one to cancel and wait on.
@@ -982,14 +1078,9 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 			return
 		} else if err := resumeErr; err != nil {
 			if plan.run.Status == types.RunRunning {
-				errMsg := err.Error()
-				plan.run.Status = types.RunFailed
-				if runCtx.Err() != nil {
-					plan.run.Status = types.RunCancelled
-				}
-				plan.run.Error = &errMsg
-				if dbErr := m.db.UpdateRunErrorStatus(plan.run.ID, errMsg, plan.run.Status); dbErr != nil {
-					slog.Error("failed to mark recovered run failed", "run_id", plan.run.ID, "error", dbErr)
+				if failureErr := executor.FailRun(plan.run, plan.repo, err, runCtx); pipeline.LeftForRecoveryAtShutdown(failureErr) {
+					parkedAtShutdown = true
+					return
 				}
 			}
 			if sqlitewrite.IsContention(err) {
@@ -2097,7 +2188,7 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		})
 	}
 
-	if m.shuttingDown.Load() {
+	if m.shutdownState.Load() != shutdownIdle {
 		trackStartFailure("daemon_shutdown")
 		return "", fmt.Errorf("daemon is shutting down")
 	}
@@ -2306,9 +2397,9 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		return "", fmt.Errorf("create run: %w", err)
 	}
 	if err := m.cancelRunIDs(predecessors); err != nil {
-		m.failRunSetup(ctx, run.ID, false, fmt.Sprintf("supersede predecessor: %s", err))
+		settlementErr := m.failUnadmittedRunSetup(ctx, run, fmt.Errorf("supersede predecessor: %w", err))
 		trackStartFailure("supersede_predecessor")
-		return "", fmt.Errorf("supersede predecessor for replacement run %s: %w; inspect no-mistakes axi status --run %s and correct the fault before no-mistakes rerun", run.ID, err, run.ID)
+		return "", fmt.Errorf("supersede predecessor for replacement run %s: %w; inspect no-mistakes axi status --run %s and correct the fault before no-mistakes rerun", run.ID, errors.Join(err, settlementErr), run.ID)
 	}
 
 	// Admission. The run row is durable from here on. A run that fits under
@@ -2321,9 +2412,9 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		// The row exists but is neither queued nor owned: end it through the
 		// shared setup-failure path (conditional, and it tells subscribers), so no
 		// orphan is left to block the branch's active-run lookup.
-		m.failRunSetup(ctx, run.ID, false, fmt.Sprintf("queue run: %s", err))
+		settlementErr := m.failUnadmittedRunSetup(ctx, run, fmt.Errorf("queue run: %w", err))
 		trackStartFailure("queue_run")
-		return "", fmt.Errorf("queue run: %w", err)
+		return "", fmt.Errorf("queue run: %w", errors.Join(err, settlementErr))
 	}
 	if m.afterPushCommitted != nil && retained != nil {
 		m.afterPushCommitted()
@@ -2408,6 +2499,9 @@ func (m *RunManager) launchRun(ctx context.Context, repo *db.Repo, run *db.Run, 
 		m.mu.Unlock()
 		defer func() {
 			if !handle.consumed {
+				if !m.terminalRunSettled(run.ID) {
+					return
+				}
 				m.mu.Lock()
 				delete(m.runs, run.ID)
 				m.mu.Unlock()
@@ -2436,13 +2530,20 @@ func (m *RunManager) launchRun(ctx context.Context, repo *db.Repo, run *db.Run, 
 	}
 	bgOwnsSlot := false
 	started := false
+	var cleanupWorktree func()
 	defer func() {
 		if !bgOwnsSlot {
 			if r := recover(); r != nil {
 				err = fmt.Errorf("internal panic: %v", r)
 			}
 			if err != nil {
-				m.failRunSetup(setupCtx, run.ID, started, err.Error())
+				err = errors.Join(err, m.failRunSetup(setupCtx, run.ID, started, err))
+			}
+			if !m.terminalRunSettled(run.ID) {
+				return
+			}
+			if cleanupWorktree != nil {
+				cleanupWorktree()
 			}
 			slot.Release()
 		}
@@ -2477,17 +2578,9 @@ func (m *RunManager) launchRun(ctx context.Context, repo *db.Repo, run *db.Run, 
 
 	started = true
 
-	// The worktree exists from here on, so cleanup ownership is armed from here
-	// on: every later setup failure returns through this defer, and the
-	// background goroutine takes ownership only once it is running. Arming it any
-	// later would leave the directory behind - in the operator's own worktree
-	// root, unswept - for whichever failures happen in between.
-	bgOwnsWorktree := false
-	defer func() {
-		if !bgOwnsWorktree {
-			m.removeRunWorktree(repo.ID, run.ID, gateDir, wtDir, "run_setup_failed")
-		}
-	}()
+	cleanupWorktree = func() {
+		m.removeRunWorktree(repo.ID, run.ID, gateDir, wtDir, "run_setup_failed")
+	}
 
 	if err := git.CopyLocalUserIdentity(ctx, repo.WorkingPath, wtDir); err != nil {
 		trackStartFailure("configure_worktree_identity")
@@ -2617,6 +2710,7 @@ func (m *RunManager) launchRun(ctx context.Context, repo *db.Repo, run *db.Run, 
 	runCtx, cancel := handle.runCtx, handle.cancel
 	executor := pipeline.NewExecutor(m.db, m.paths, cfg, ag, execSteps, m.broadcast)
 	executor.SetRunSlot(slot)
+	executor.SetRuntimeInstance(m.runtimeInstance)
 	executor.SetForgeContext(forgeCtx)
 	if hasRebaseCoreStep(execSteps) {
 		executor.SetPRContextGuard(steps.GuardPRContext)
@@ -2634,20 +2728,31 @@ func (m *RunManager) launchRun(ctx context.Context, repo *db.Repo, run *db.Run, 
 	// keeps the same owner as setup hands off to background execution.
 	done := handle.done
 	m.mu.Lock()
+	// Shutdown admission is fenced under m.mu: a run whose setup raced a
+	// shutdown ends through the setup-failure path instead of starting an
+	// executor the shutdown can no longer wait for.
+	if m.shutdownState.Load() != shutdownIdle {
+		m.mu.Unlock()
+		handle.cancel(pipeline.ErrDaemonShutdown)
+		trackStartFailure("daemon_shutdown")
+		return "", context.Cause(runCtx)
+	}
+	if cause := context.Cause(runCtx); cause != nil {
+		m.mu.Unlock()
+		return "", cause
+	}
 	m.runs[run.ID].executor = executor
 	handle.consumed = true
+	m.wg.Add(1)
 	m.mu.Unlock()
 
 	// Background goroutine now owns worktree cleanup and the run's slot.
-	bgOwnsWorktree = true
 	bgOwnsSlot = true
 
 	// Launch pipeline in background.
-	m.wg.Add(1)
 	go func() {
 		startedAt := time.Now()
 		defer m.wg.Done()
-		defer close(done)
 		parkedAtShutdown := false
 		// Registered before the recover handler below so it runs after it:
 		// whether the pipeline completed, failed, was cancelled or panicked,
@@ -2677,16 +2782,26 @@ func (m *RunManager) launchRun(ctx context.Context, repo *db.Repo, run *db.Run, 
 				verifiedHead, verified := preserveRunHead(m.db, wtDir, run)
 				var dbErr error
 				if verified {
-					dbErr = m.db.UpdateRunErrorStatusWithVerifiedHead(run.ID, errMsg, types.RunFailed, verifiedHead)
+					dbErr = pipeline.RecordRunFailure(context.Background(), m.db, run.ID, errMsg, &verifiedHead)
 				} else {
-					dbErr = m.db.UpdateRunErrorStatus(run.ID, errMsg, types.RunFailed)
+					dbErr = pipeline.RecordRunFailure(context.Background(), m.db, run.ID, errMsg, nil)
 				}
 				if dbErr != nil {
 					slog.Error("failed to update run after panic", "run_id", run.ID, "error", dbErr)
+				} else if err := executor.ReportSettledRunFailure(context.Background(), run, repo); err != nil {
+					slog.Error("terminal notification failed", "run_id", run.ID, "error", err)
 				}
-			}
-			if run.Status == types.RunFailed || run.Status == types.RunCancelled {
+			} else if run.Status == types.RunFailed || run.Status == types.RunCancelled {
 				executor.ReportPublishedHeadFailure(context.Background(), run, repo)
+			}
+			// A run left for recovery keeps its non-terminal record by design;
+			// any other run keeps custody until its terminal outcome settles.
+			if parkedAtShutdown {
+				if !m.releaseShutdownForRecovery(run.ID) {
+					return
+				}
+			} else if !m.terminalRunSettled(run.ID) {
+				return
 			}
 			cancel(nil)
 			ag.Close()
@@ -2700,6 +2815,7 @@ func (m *RunManager) launchRun(ctx context.Context, repo *db.Repo, run *db.Run, 
 			m.mu.Lock()
 			delete(m.runs, run.ID)
 			m.mu.Unlock()
+			close(done)
 		}()
 
 		err := executor.Execute(runCtx, run, repo, wtDir)
@@ -3247,40 +3363,69 @@ func (m *RunManager) HandleAnswerReviewQuestion(runID, questionID, answer, answe
 // Shutdown cancels all active runs. Called during daemon shutdown to prevent
 // orphaned goroutines from continuing agent calls and git operations.
 func (m *RunManager) Shutdown() {
-	m.shuttingDown.Store(true)
-	m.watchOnce.Do(func() {}) // no watcher may start after shutdown begins
-	if m.watchStop != nil {
-		select {
-		case <-m.watchStop:
-		default:
-			close(m.watchStop)
-		}
-	}
+	m.shutdownState.Store(shutdownRaw)
+	m.stopLimitWatcher() // no watcher may start after shutdown begins
 
 	m.mu.Lock()
+	cancels := m.runCancelsLocked()
+	ids := make([]string, 0, len(cancels))
+	for id := range cancels {
+		ids = append(ids, id)
+	}
+	m.mu.Unlock()
+
+	// A raw shutdown durably supersedes any uncommitted preservation before the
+	// cancellations it races with can terminalize a run.
+	if err := pipeline.RecordRawShutdown(context.Background(), m.db, ids, m.runtimeInstance, func() {
+		for id, cancel := range cancels {
+			cancel(pipeline.ErrDaemonShutdown)
+			slog.Info("cancelled run on shutdown", "run_id", id)
+		}
+	}); err != nil {
+		slog.Error("raw shutdown terminal outcome unsettled", "error", err)
+	}
+
+	m.wg.Wait()
+}
+
+// runCancelsLocked snapshots the cancel handle of every run that has one.
+// Queued runs have none: they stay queued across a shutdown.
+func (m *RunManager) runCancelsLocked() map[string]context.CancelCauseFunc {
 	cancels := make(map[string]context.CancelCauseFunc, len(m.runs))
 	for id, owned := range m.runs {
 		if owned.handle != nil {
 			cancels[id] = owned.handle.cancel
 		}
 	}
+	return cancels
+}
+
+// terminalRunSettled reports whether a run's terminal outcome is durable.
+// Until it is, the run goroutine keeps custody of the run.
+func (m *RunManager) terminalRunSettled(runID string) bool {
+	run, err := pipeline.ReadSettledRun(m.db, runID)
+	if err != nil || run == nil || !run.Status.Terminal() {
+		slog.Error("terminal outcome unsettled; retaining run custody", "run_id", runID, "error", err)
+		return false
+	}
+	return true
+}
+
+// releaseShutdownForRecovery settles the shutdown intent of a run the
+// shutdown deliberately left non-terminal (parked at a gate or monitoring CI).
+// Such a run follows startup recovery, so its shutdown record must
+// not make the next start treat it as an unsettled, obsolete shutdown.
+func (m *RunManager) releaseShutdownForRecovery(runID string) bool {
+	if err := pipeline.SettleTerminalWrite(m.db, func() error {
+		return m.db.ReleaseShutdownForRecovery(runID)
+	}); err != nil {
+		slog.Error("failed to settle shutdown intent for a run left for recovery", "run_id", runID, "error", err)
+		return false
+	}
+	m.mu.Lock()
+	m.leftForRecovery[runID] = true
 	m.mu.Unlock()
-
-	for id, cancel := range cancels {
-		cancel(pipeline.ErrDaemonShutdown)
-		slog.Info("cancelled run on shutdown", "run_id", id)
-	}
-
-	done := make(chan struct{})
-	go func() {
-		m.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		slog.Warn("timed out waiting for runs to finish during shutdown")
-	}
+	return true
 }
 
 // HandleCancel stops an active run and propagates cancellation to the executor.
@@ -3298,8 +3443,8 @@ func (m *RunManager) HandleCancel(runID string) error {
 // cancelActiveRuns cancels any in-progress runs for the given repo+branch
 // and waits for their goroutines to finish before returning, preventing
 // concurrent pushes to upstream.
-// The cancellation cause is propagated to the executor via context.Cause,
-// which uses it as the run's error message in the DB.
+// The cancellation cause is propagated via context.Cause; Executor.FailRun
+// keeps an independent execution failure rather than replacing it with that cause.
 func (m *RunManager) cancelActiveRuns(repoID, branch string) error {
 	return m.cancelRunIDs(m.activeRunIDs(repoID, branch))
 }

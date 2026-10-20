@@ -1476,7 +1476,7 @@ func TestPushReceivedTracksRunTelemetryAfterPanic(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	finished := recorder.find("run", "action", "finished")
+	finished := waitForTelemetryEvent(t, recorder, "run", "action", "finished")
 	if finished == nil {
 		t.Fatal("expected run finished telemetry event after panic")
 	}
